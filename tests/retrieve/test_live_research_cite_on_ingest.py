@@ -82,7 +82,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.ingest_endpoint import IngestEndpoint
 from fin.host import compile_graph
-from fin.host.citation_gate import (
+from fin.host.grounded.citation_gate import (
     _LOCATOR_REGEX,  # noqa: PLC2701 - the gate's own token shape is the SSOT
 )
 from fin.host.state import reset_input_state

@@ -22,13 +22,13 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-import fin.host.search_mode_decision as smd
+import fin.host.grounded.search_mode_decision as smd
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.named_failures import (
     LASTING_RETRIEVE_TIERS,
     TIER_LABELS,
 )
-from fin.host.search_mode_decision import clarify_options, decide_search_mode
+from fin.host.grounded.search_mode_decision import decide_search_mode
 from fin.host.state import reset_input_state
 from jev_fake import FakeJevChoice
 
@@ -105,7 +105,7 @@ def test_choice_instructions_teach_each_operator_label() -> None:
 def test_rules_naming_skips_the_judge() -> None:
     """When the rules tier can name the 档, the judge never runs — that
     short-circuit holds for either rules outcome. 综述 is open (fin task
-    4) and 真数据库 too since the tracked change T7 (commit 6e8ed97, which flipped the
+    4) and 真数据库 too since T7 (commit 6e8ed97, which flipped the
     old sql pin from a rules typed_fail to a rules assignment): naming
     either assigns at the rules tier; BOTH paths skip the judge because
     the rules already read the utterance and returned a decided value."""
@@ -157,27 +157,50 @@ def test_choice_criteria_carry_one_gloss_per_lasting_tier() -> None:
         assert criteria[mode] == smd._JEV_MODE_TIER_GLOSSES[mode]
 
 
+def test_the_criteria_speak_about_enterprise_material_not_filings() -> None:
+    """The judge must see ORDINARY enterprise material — policies,
+    handbooks, product guides, meeting notes, reports, contracts,
+    structured records — not a financial-filings-only corpus (spec
+    "Model-facing enterprise language").
+
+    A filings-only corpus in the criteria is a routing bug, not a
+    preference: the 档 the judge picks is decided by what the ANSWER
+    needs, so the corpus it is told about must be the one the operator
+    actually asks about.
+    """
+    glosses = " ".join(smd._JEV_MODE_TIER_GLOSSES.values()).lower()
+    instructions = smd._JEV_MODE_INSTRUCTIONS.lower()
+    for banned in ("filing", "10-q", "10-k", "issuer"):
+        assert banned not in glosses, banned
+        assert banned not in instructions, banned
+    # And the corpus it is told about is the enterprise one.
+    for expected in ("policy", "handbook", "contract"):
+        assert expected in glosses or expected in instructions, expected
+
+
 def test_missing_client_names_the_judge_as_the_reason() -> None:
-    """No key wired → no judge: the residual is clarify, never a silent
-    综述 — and the audit row NAMES why, exactly as ``decide_track`` names
-    ``jev_exit="no_jev_client"`` for its own gray zone. Without it a
-    client-less 档 clarify turn is indistinguishable on the audit from one
-    the judge was asked and abstained on, which is the silent branch this
+    """No key wired → no judge: the recorded default takes over — never a
+    silent 综述 — and the audit row NAMES why, exactly as ``decide_track``
+    names ``jev_exit="no_jev_client"`` for its own gray zone. Without it a
+    client-less 档 turn is indistinguishable on the audit from one the
+    judge was asked and abstained on, which is the silent branch this
     repo's 具名失败 doctrine forbids."""
     decision = decide_search_mode(_msgs(AMBIGUOUS), jev_client=None)
 
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.decision_tier == "fallback"
+    assert decision.search_mode == "graph"
+    assert decision.confidence == 0.0
     assert decision.signals["mode_jev_exit"] == "no_jev_client"
     # Nothing was asked, so nothing was answered: the EXIT is the whole
     # diagnostic, with no fabricated label or confidence beside it.
     assert "mode_jev_label" not in decision.signals
     assert "mode_jev_confidence" not in decision.signals
-    assert decision.options == clarify_options()
+    # A routing residual never offers a mode window: the options are empty.
+    assert decision.options == []
 
 
 def test_judge_naming_the_real_db_tier_is_now_assigned_at_the_jev_tier() -> None:
-    """Flipped by the tracked change T7 (commit 6e8ed97): the old pin asserted the
+    """Flipped by T7 (commit 6e8ed97): the old pin asserted the
     judge naming sql exited 「真库未接」 (``real_db_not_wired``) with no
     assignment — a 「档未开」-distinct named failure. The 档 is open now,
     so a judge answer of ``sql`` assigns exactly like ``global`` does
@@ -317,8 +340,8 @@ def test_a_model_shaped_injection_cannot_drive_the_cascade() -> None:
         _msgs(AMBIGUOUS), jev_client=_ModelShapedWithoutChoose()
     )
 
-    assert decision.decision_tier == "clarify" == absent.decision_tier
-    assert decision.search_mode is None
-    assert decision.options == absent.options
+    assert decision.decision_tier == "fallback" == absent.decision_tier
+    assert decision.search_mode == "graph"
+    assert decision.options == absent.options == []
     assert decision.signals["mode_jev_exit"] == "unexpected_error"
     assert decision.signals["mode_jev_error_type"] == "AttributeError"

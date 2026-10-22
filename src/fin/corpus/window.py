@@ -45,7 +45,7 @@ EXTRACT_WINDOW_TOKENS: Final[int] = 1200
 
 # Character-per-token estimate, v1 deterministic: ``len(text) // 4``.
 # The same 4-chars-per-token convention as
-# ``fin.host.session_compaction.CHARS_PER_TOKEN`` (this corpus module is
+# ``fin.host.session.session_compaction.CHARS_PER_TOKEN`` (this corpus module is
 # the authority for the切分 layer and deliberately does not import the
 # host module to share the number — an import would point the corpus
 # dependency outward).

@@ -16,7 +16,7 @@ from fin.corpus.ocr_writeback_errors import (
     OCRWriteBackEmptyTextError,
     OCRWriteBackEngineError,
 )
-from fin.host.citation_gate import DoneResult, EvidenceItem, verify_citations
+from fin.host.grounded.citation_gate import DoneResult, EvidenceItem, verify_citations
 
 
 class FakeOCREngine:

@@ -1,5 +1,5 @@
 // The task-door refusal vocabulary is a CROSS-LANGUAGE contract: the
-// Python host decides refusals with ``fin.host.task_runtime_types.
+// Python host decides refusals with ``fin.host.task.task_runtime_types.
 // TASK_FAILURE_KINDS`` and the SPA branches on ``TASK_FAILURE_KINDS``
 // in web/src/types.ts. The two sets are mirrored BY HAND, so the real
 // risk is drift: a token added on one side only makes the other side
@@ -60,7 +60,7 @@ describe("TASK_FAILURE_KINDS mirrors the Python vocabulary", () => {
 
   it("names the Python symbol the fixture was generated from", () => {
     expect(golden().source).toBe(
-      "fin.host.task_runtime_types.TASK_FAILURE_KINDS",
+      "fin.host.task.task_runtime_types.TASK_FAILURE_KINDS",
     );
   });
 });

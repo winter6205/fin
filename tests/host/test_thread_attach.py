@@ -50,7 +50,7 @@ from pydantic import Field
 
 from fin.corpus.extracted import load_extracted_tree
 from fin.corpus.object_store import InMemoryObjectStore
-from fin.host.attachment_budgets import AttachmentBudgets
+from fin.host.attachment.attachment_budgets import AttachmentBudgets
 from fin.host.scripted_model import ScriptedChatModel
 
 from fin.retrieve import FakeRetrievePort
@@ -136,8 +136,8 @@ def client(http_app: FastAPI) -> TestClient:
 
 @pytest.fixture
 def fresh_store(http_app: FastAPI):
-    from fin.host.attachment_prepare import AttachmentPreparationService
-    from fin.host.attachment_store import InMemoryAttachmentStore
+    from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+    from fin.host.attachment.attachment_store import InMemoryAttachmentStore
     from fin.host.http import (
         get_attachment_budgets,
         get_attachment_service,
@@ -1300,8 +1300,8 @@ def test_delete_door_maps_a_store_rejection_to_a_named_exit(
     The door must not answer success for an attachment whose cleanup
     obligation could not be recorded, and must not answer a bare 500.
     """
-    from fin.host.attachment_prepare import AttachmentPreparationService
-    from fin.host.attachment_store import (
+    from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+    from fin.host.attachment.attachment_store import (
         AttachmentStoreError,
         InMemoryAttachmentStore,
     )

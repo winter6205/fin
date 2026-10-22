@@ -22,9 +22,9 @@ from typing import Any, Final
 
 import pytest
 
-from fin.host import attachment_vision
+from fin.host.attachment import attachment_vision
 from fin.host import compile as host_compile
-from fin.host.attachment_vision import (
+from fin.host.attachment.attachment_vision import (
     VISION_CALL_FAILED,
     VISION_EMPTY_TEXT,
     ChatModelVisionAdapter,
@@ -412,12 +412,24 @@ def test_model_and_base_url_come_from_configuration() -> None:
     assert resolve_vision_model_config(env={"FIN_MODEL": "  m2  "}).model_id == "m2"
 
 
-def test_unset_configuration_falls_back_to_the_hosts_defaults() -> None:
-    """The vision port reuses the host's own model settings, so an operator
-    who configured only the chat model gets the same model here."""
-    config = resolve_vision_model_config(env={})
-    assert config.model_id == host_compile.DEFAULT_MODEL
-    assert config.base_url == host_compile.DEFAULT_BASE_URL
+@pytest.mark.parametrize("env", [{}, {"FIN_MODEL": " \t "}])
+def test_missing_model_is_a_typed_permanent_vision_failure(
+    env: dict[str, str],
+) -> None:
+    clients: list[VisionModelConfig] = []
+    adapter = ChatModelVisionAdapter(
+        env=env,
+        client_factory=lambda config: clients.append(config),
+    )
+
+    with pytest.raises(VisionCallFailedError) as excinfo:
+        adapter.inspect(image=b"rendered-page", target=target())
+
+    assert "FIN_MODEL" in str(excinfo.value)
+    assert excinfo.value.code == VISION_CALL_FAILED
+    assert excinfo.value.error_class is VisionErrorClass.PERMANENT
+    assert excinfo.value.retryable is False
+    assert clients == [], "missing configuration must not build a vision client"
 
 
 def test_no_model_or_endpoint_literal_and_no_extra_credential() -> None:
@@ -480,45 +492,20 @@ LIVE_OPT_IN_ENV: Final[str] = "FIN_VISION_LIVE_ROUNDTRIP"
 
 
 def _live_credentials() -> dict[str, str]:
-    """Shell values first, then the operator ``.env``.
+    """Process values captured before the hermetic strip.
 
-    A git worktree has no ``.env`` of its own and ``find_env_file`` stops at
-    its ``pyproject.toml``, so the main checkout — the directory the worktree's
-    git common dir sits in — is the second place to look. Values are never
-    logged.
+    This opt-in case does not open ``~/.fin/settings.yaml``. A missing
+    credential is a named failure. Values are never logged.
     """
-    env = {
-        key: os.environ[key]
-        for key in ("FIN_MODEL", "FIN_BASE_URL", attachment_vision.FIN_API_KEY_ENV)
-        if key in os.environ
-    }
-    candidates = [REPO_ROOT / ".env"]
-    common = _git_common_dir()
-    if common is not None:
-        candidates.append(common.parent / ".env")
-    for path in candidates:
-        if path.is_file():
-            from fin.host.operator_env import parse_env_file
+    from tests.conftest import _PROCESS_SNAPSHOT
 
-            for key, value in parse_env_file(path.read_text(encoding="utf-8")).items():
-                env.setdefault(key, value)
-            break
-    return env
-
-
-def _git_common_dir() -> Path | None:
-    import subprocess
-
-    result = subprocess.run(
-        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    return Path(result.stdout.strip())
+    keys = ("FIN_MODEL", "FIN_BASE_URL", attachment_vision.FIN_API_KEY_ENV)
+    projected = {key: _PROCESS_SNAPSHOT[key] for key in keys if key in _PROCESS_SNAPSHOT}
+    for key in keys:
+        current = (os.environ.get(key) or "").strip()
+        if current:
+            projected[key] = current
+    return projected
 
 
 def test_live_round_trip_against_the_configured_provider() -> None:
@@ -536,8 +523,8 @@ def test_live_round_trip_against_the_configured_provider() -> None:
     env = _live_credentials()
     if not (env.get(attachment_vision.FIN_API_KEY_ENV) or "").strip():
         pytest.fail(
-            "vision_live_blocked: no credential — set "
-            f"{attachment_vision.FIN_API_KEY_ENV} in the repo .env, then run "
+            "vision_live_blocked: no credential — export "
+            f"{attachment_vision.FIN_API_KEY_ENV}, then run "
             f"`{LIVE_OPT_IN_ENV}=1 uv run pytest -q "
             "tests/host/test_attachment_vision.py -k live_round_trip`",
             pytrace=False,
@@ -546,8 +533,6 @@ def test_live_round_trip_against_the_configured_provider() -> None:
         pytest.fail(
             f"vision_live_blocked: gold image absent: {GOLD_IMAGE}", pytrace=False
         )
-
-    from fin.host.compile import DEFAULT_MODEL
 
     adapter = ChatModelVisionAdapter(env=env)
     result = adapter.inspect(
@@ -558,10 +543,9 @@ def test_live_round_trip_against_the_configured_provider() -> None:
 
     # A model slug is configuration, not a secret; the endpoint path and any
     # key value never appear here.
-    suffix = " (=host default)" if result.model_id == DEFAULT_MODEL else ""
     print(
         "\n[vision-live] model="
-        f"{result.model_id}{suffix} "
+        f"{result.model_id} "
         f"chars={len(result.text)} usage={result.usage} cost={result.cost}"
     )
     assert result.text

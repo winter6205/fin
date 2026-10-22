@@ -4,7 +4,7 @@ The in-process suite (``test_structured_evidence_replay.py``) proves the chain's
 decisions. It cannot prove the boundary, because a fixture holds no database and
 no child. This lane does, in the shape T13 established: a **real built iknow
 child process** over stdio, driven through the **real**
-:class:`~fin.host.evidence_session_registry.EvidenceSessionRegistry`, against
+:class:`~fin.host.evidence.evidence_session_registry.EvidenceSessionRegistry`, against
 **real PostgreSQL** in a per-run schema.
 
 What crosses a real boundary here, and would not cross one in a fixture:
@@ -43,17 +43,17 @@ from typing import Any, Iterator
 import psycopg
 import pytest
 
-from fin.host.evidence_contract import (
+from fin.host.evidence.evidence_contract import (
     ACCESS_DENIED,
     EVIDENCE_EXPIRED,
     EVIDENCE_UNAVAILABLE,
     MALFORMED_EVIDENCE_CONTRACT,
     UNSUPPORTED_SOURCE_BINDING,
 )
-from fin.host.evidence_session_registry import EvidenceSessionRegistry
-from fin.host.structured_evidence import build_stored_record
-from fin.host.structured_evidence_admission import admit_structured_evidence
-from fin.host.structured_evidence_replay import (
+from fin.host.evidence.evidence_session_registry import EvidenceSessionRegistry
+from fin.host.evidence.structured_evidence import build_stored_record
+from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
+from fin.host.evidence.structured_evidence_replay import (
     find_replayable_record,
     replay_stored_evidence,
 )

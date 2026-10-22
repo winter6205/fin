@@ -22,7 +22,7 @@ into the shapes downstream code renders:
   ``answer`` event never see the model's private scratchpad
   (SC60 binding).
 * :func:`reasoning_delta_from_chunk` /
-  :func:`split_stream_delta` - the T1 (#33) token-delta mapping:
+  :func:`split_stream_delta` - the T1 token-delta mapping:
   the first pulls a thinking delta off a chunk's reasoning
   channel; the second classifies streamed content deltas into
   thinking vs answer with an inline-block filter that survives
@@ -58,10 +58,10 @@ formatters share one wire contract and the same callers
 (``graph.model_node`` builds summaries from ``ToolMessage``s,
 ``workspace_http.send_message`` maps chunks to SSE frames,
 ``scripted_model`` reuses the assembly primitive). Keeping them in
-one module keeps the contract single-sourced (Standards #14) and
-matches the spec reviewer's note that "stream mapping, thinking
-converter, turn persistence, and graph nodes stay separate modules"
-- this is THE stream-mapping module.
+one module keeps the contract single-sourced and matches the spec
+reviewer's note that "stream mapping, thinking converter, turn
+persistence, and graph nodes stay separate modules" - this is THE
+stream-mapping module.
 """
 
 from __future__ import annotations
@@ -80,6 +80,8 @@ from fin.host.named_failures import (
     SQL_QUERY_DENIED,
     SQL_QUERY_TIMEOUT,
 )
+from fin.host.grounded.readable_projection import DEGRADATION_SAFE_COPY
+from fin.host.run_call_supervisor import register_native_async_stream
 from fin.host.tools.issuer_fanout import ISSUER_FANOUT_TOOL
 from fin.retrieve.degradation import degraded_reasons_for_display
 
@@ -138,6 +140,7 @@ def assemble_final_ai_message(
         content=accumulator.content,
         tool_calls=list(accumulator.tool_calls),
         additional_kwargs=additional_kwargs,
+        response_metadata=dict(accumulator.response_metadata),
     )
 
 
@@ -278,7 +281,7 @@ def strip_thinking_from_answer(answer: str) -> str:
     return _THINKING_BLOCK_RE.sub("", answer)
 
 
-# ----- token-delta mapping (T1, #33) -----
+# ----- token-delta mapping (T1) -----
 
 
 @dataclass(frozen=True)
@@ -594,6 +597,21 @@ def replay_reasoning_into_payload(
 _REASONING_CONVERTERS: dict[type, type] = {}
 
 
+def _provider_refusal_from_raw_chunk(chunk: dict[str, Any]) -> str | None:
+    """Read an explicit provider disposition without interpreting answer prose."""
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    delta = first.get("delta")
+    if not isinstance(delta, dict):
+        return None
+    refusal = delta.get("refusal")
+    return refusal if isinstance(refusal, str) and refusal.strip() else None
+
+
 def reasoning_preserving_chat_openai() -> type:
     """Return a ``ChatOpenAI`` subclass that keeps provider reasoning.
 
@@ -628,6 +646,22 @@ def reasoning_preserving_chat_openai() -> type:
     class ReasoningPreservingChatOpenAI(ChatOpenAI):  # type: ignore[misc]
         """``ChatOpenAI`` plus the provider's split reasoning channel."""
 
+        def _astream(
+            self,
+            messages: Any,
+            stop: list[str] | None = None,
+            run_manager: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            stream = super()._astream(
+                messages,
+                stop=stop,
+                run_manager=run_manager,
+                **kwargs,
+            )
+            register_native_async_stream(stream)
+            return stream
+
         def _convert_chunk_to_generation_chunk(
             self,
             chunk: dict,
@@ -641,6 +675,9 @@ def reasoning_preserving_chat_openai() -> type:
             # (e.g. beta-stream ``content.delta`` events).
             if generated is None:
                 return None
+            refusal = _provider_refusal_from_raw_chunk(chunk)
+            if refusal is not None:
+                generated.message.additional_kwargs["refusal"] = refusal
             entries = reasoning_entries_from_raw_chunk(chunk)
             if entries:
                 kwargs = generated.message.additional_kwargs
@@ -673,7 +710,7 @@ def reasoning_preserving_chat_openai() -> type:
     return ReasoningPreservingChatOpenAI
 
 
-# ----- thinking duration clock (T4, #37) -----
+# ----- thinking duration clock (T4) -----
 
 
 def _monotonic() -> float:
@@ -836,20 +873,31 @@ def _retrieve_error_line(args: dict[str, Any], error: str) -> str:
 def _degradation_clause(result: dict[str, Any] | None) -> str:
     """The visible degradation note for one ``retrieve`` row (T20 / SC39).
 
-    Prefers the notice the host already rendered; falls back to expanding
-    the verbatim ``degraded_reasons`` so a result that reached this
-    renderer another way still names every reason rather than passing as
-    an ordinary hit count.
+    Prefers the notice the host already rendered. When the field is
+    ABSENT the fallback is the SAME safe sentence, never the reasons
+    themselves: T10 says the default view must not forward a raw
+    degradation reason, and the tool fold is a default view. A reason
+    names the backend capability that failed — an operator-UNACTIONABLE
+    detail that belongs beside the access-controlled ledger, which
+    already recorded every one of them (see
+    :func:`fin.host.degradation_notice.degradation_notice_line`, whose
+    rule this mirrors).
+
+    What the fallback still owes the reader is the FACT of degradation:
+    a degraded row rendered as a plain hit count reads as an ordinary
+    result, so the clause stays and carries the copy instead of the
+    reasons. :func:`degraded_reasons_for_display` is kept as the
+    predicate rather than re-reading ``degraded`` — it is the
+    best-effort, never-raising reader for exactly this shape.
     """
     if not isinstance(result, dict):
         return ""
     notice = result.get(DEGRADATION_NOTICE_FIELD)
     if isinstance(notice, str) and notice:
         return f" | {notice}"
-    reasons = degraded_reasons_for_display(result)
-    if not reasons:
+    if not degraded_reasons_for_display(result):
         return ""
-    return f" | degraded: {'; '.join(reasons)}"
+    return f" | {DEGRADATION_SAFE_COPY}"
 
 
 def summarize_retrieve(

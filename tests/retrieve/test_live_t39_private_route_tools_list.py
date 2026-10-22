@@ -132,7 +132,7 @@ pytestmark = [pytest.mark.mcp, pytest.mark.sql_live]
 # re-bind must be a deliberate one-edit act recorded in the ticket record, not
 # something a stray environment variable can do silently.
 #
-# The matching worktree is ``/home/winner/projects/iknow-memory-wt-s0-authority``
+# The matching worktree is ``/home/operator/projects/iknow-memory-wt-s0-authority``
 # (the S0 candidate); export ``FIN_LIVE_IKNOW_ROOT`` to that path when running
 # this driver. ``live_iknow_support.IKNOW_ROOT`` falls back to the main IK
 # checkout at ``eea1e07`` when that variable is unset, and the two builds answer
@@ -289,7 +289,7 @@ def _require_bound_iknow_build() -> None:
             f"confirmed to be the bound commit {BOUND_IKNOW_COMMIT}. T39 is "
             f"bound to {BOUND_IKNOW_COMMIT}; export FIN_LIVE_IKNOW_ROOT to the "
             "worktree that holds it "
-            "(/home/winner/projects/iknow-memory-wt-s0-authority) and confirm "
+            "(/home/operator/projects/iknow-memory-wt-s0-authority) and confirm "
             "its dist/index.js is built. Observed: no readable HEAD at "
             f"{IKNOW_ROOT}. This is a named failure on purpose, not a skip."
         )

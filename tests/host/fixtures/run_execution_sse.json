@@ -1,0 +1,19 @@
+{
+  "_provenance": {
+    "captured_from": "40fa0ba2",
+    "captured_from_subject": "test(host): stub the boot seam the deployed composition actually calls",
+    "extraction_commit": "67594f8b",
+    "extraction_subject": "refactor(host): one execution owner behind typed run events",
+    "why": "The frames below were captured from the pipeline BEFORE the typed executor existed, so this golden is evidence the extraction left the wire byte-identical rather than a recording of the bytes it produced. Every key except this one is the captured payload; the comparison reads them by name, so this record never enters an assertion."
+  },
+  "finalized": [],
+  "raise_finalized": [
+    [
+      "91b61500-94d5-4102-98d1-3851ba5e1292",
+      "refuse",
+      "stream raised mid-flight: TimeoutError: provider read timed out after 120.0 s (kind=timeout)"
+    ]
+  ],
+  "raise_sse": "event: thinking\ndata: {\"text\": \"weighing the quarter\"}\n\nevent: answer\ndata: {\"text\": \"AAPL net sales were 81.8 billion dollars.\"}\n\nevent: tool_call\ndata: {\"name\": \"read_source\", \"args\": {\"document_id\": \"AAPL-2023Q1\", \"unit\": 1}, \"tool_call_id\": \"call-1\"}\n\nevent: tool_result\ndata: {\"name\": \"read_source\", \"summary\": \"read_source\", \"tool_call_id\": \"call-1\"}\n\nevent: status\ndata: {\"run_id\": \"<run_id>\", \"status\": \"refuse\", \"reason\": \"stream raised mid-flight: TimeoutError: provider read timed out after 120.0 s (kind=timeout)\", \"assistant_message\": \"模型调用超时（默认 120s）。可重试，或调高 ChatOpenAI timeout。\", \"status_classified\": \"timeout\", \"thinking_ms\": <ms>, \"evidence_schema\": \"fin.evidence.citation\", \"schema_version\": 1}\n\nevent: answer\ndata: {\"text\": \"\"}\n\nevent: citations\ndata: []\n\n",
+  "sse": "event: thinking\ndata: {\"text\": \"weighing the quarter\"}\n\nevent: answer\ndata: {\"text\": \"AAPL net sales were 81.8 billion dollars.\"}\n\nevent: tool_call\ndata: {\"name\": \"read_source\", \"args\": {\"document_id\": \"AAPL-2023Q1\", \"unit\": 1}, \"tool_call_id\": \"call-1\"}\n\nevent: tool_result\ndata: {\"name\": \"read_source\", \"summary\": \"read_source\", \"tool_call_id\": \"call-1\"}\n\nevent: status\ndata: {\"run_id\": \"<run_id>\", \"status\": \"done\", \"reason\": null, \"assistant_message\": \"\", \"evidence_schema\": \"fin.evidence.citation\", \"schema_version\": 1, \"search_mode_decision\": {\"search_mode\": \"global\", \"confidence\": 0.9, \"decision_tier\": \"rule\", \"signals\": {}, \"options\": [], \"failure_code\": null}, \"thinking_type\": \"adaptive\", \"thinking_ms\": <ms>}\n\nevent: answer\ndata: {\"text\": \"AAPL net sales were 81.8 billion dollars.\"}\n\nevent: visual_claims\ndata: {\"visual_claims\": [{\"kind\": \"visual_observation\", \"attachment_id\": \"att-visual-1\", \"version\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"unit\": 3, \"page\": 3, \"observation_version\": 2, \"scope\": null, \"provider\": \"stub-vision\", \"model_version\": \"stub-vision-1\", \"page_image_sha256\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"detail\": \"A generated observation about the quarter.\", \"filename\": \"aapl-10q.pdf\", \"reused\": false, \"outbound_calls\": 1, \"schema\": \"fin.evidence.visual_claim\", \"schema_version\": 1}]}\n\nevent: evidence_refusals\ndata: {\"refusals\": [{\"citation_index\": 1, \"error\": \"malformed_evidence_contract\"}]}\n\nevent: citations\ndata: [{\"kind\": \"company\", \"document_id\": \"AAPL-2023Q1\", \"attachment_id\": \"\", \"version\": \"v1\", \"unit\": 1, \"display\": \"page\", \"filename\": \"\", \"quote\": \"Net sales for the quarter were 81.8 billion dollars.\", \"section\": \"Section 2\"}]\n\n"
+}

@@ -24,7 +24,7 @@ import re
 
 from fin.corpus.extracted import Locator
 from fin.corpus.facts import Fact, fact_matches_value
-from fin.host.numeric_gate import (
+from fin.host.grounded.numeric_gate import (
     ClaimedNumber,
     NumericGateResult,
     evaluate_numeric_gate,

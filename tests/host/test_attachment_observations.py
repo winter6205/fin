@@ -28,7 +28,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from fin.host.attachment_observations import (
+from fin.host.attachment.attachment_observations import (
     COVERAGE_SCHEMA_VERSION,
     CoveredDetail,
     DetailKey,
@@ -40,13 +40,13 @@ from fin.host.attachment_observations import (
     observations_jointly_cover,
     plotted_value_key,
 )
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     AttachmentStoreError,
     AttachmentThreadGoneError,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
 )
-from fin.host.attachment_vision import (
+from fin.host.attachment.attachment_vision import (
     VisionCallResult,
     VisionCost,
     VisionCrop,
@@ -706,7 +706,7 @@ def postgres_store_url() -> str:
 def pg(postgres_store_url: str) -> Iterator[tuple[Any, Any]]:
     import psycopg
 
-    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.attachment.attachment_store import PostgresAttachmentStore
     from fin.host.thread_store import PostgresThreadStore
 
     threads = PostgresThreadStore(postgres_store_url)
@@ -801,7 +801,7 @@ def test_postgres_stale_observation_version_is_refused(pg: tuple[Any, Any]) -> N
 def test_observation_methods_are_on_both_protocol_implementations(
     postgres_store_url: str,
 ) -> None:
-    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.attachment.attachment_store import PostgresAttachmentStore
 
     memory = InMemoryAttachmentStore(InMemoryThreadStore())
     durable = PostgresAttachmentStore(postgres_store_url)

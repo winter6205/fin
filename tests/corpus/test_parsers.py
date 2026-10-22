@@ -39,7 +39,7 @@ from fin.corpus.parsers import (
     SUPPORTED_FORMATS,
     parse_document,
 )
-from fin.host.citation_gate import DoneResult, EvidenceItem, verify_citations
+from fin.host.grounded.citation_gate import DoneResult, EvidenceItem, verify_citations
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 

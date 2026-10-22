@@ -55,10 +55,20 @@ PARAMS_TABLE_VERSION: Final[str] = TABLE_VERSION
 # ---------------------------------------------------------------------------
 
 # Document types (T10 dataset vocabulary).
+#
+# ``unknown`` (T6) is a MEMBER of the closed vocabulary, not a sentinel
+# outside it: it is the honest answer for an upload whose text yields no
+# reliable type, and a metadata-free document must still be able to name
+# one. Because it is a member, ``lookup_chunk_params`` resolves it on the
+# fixed global-default row rather than raising, and an explicit override
+# of ``unknown`` is accepted by the same closed-vocabulary check as the
+# other three — so the axis stays closed on both the ingest and the
+# filter side.
 DOC_TYPES: Final[tuple[str, ...]] = (
     "narrative",
     "table_dense",
     "clause_list",
+    "unknown",
 )
 
 # Sections (板块) of a document a block can belong to.

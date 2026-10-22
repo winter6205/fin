@@ -1,13 +1,13 @@
 """TypeSafe Jev operator config (host judge; not the agent-loop LLM).
 
 Pytest stays Fake / unset. Product boot reads these vars after
-``apply_dotenv``; a missing key does not fail-start until the judge
+``apply_operator_settings``; a missing key does not fail-start until the judge
 adapter is the production default.
 """
 
 from __future__ import annotations
 
-from fin.host.jev_config import (
+from fin.host.question.jev_config import (
     DEFAULT_JEV_BASE_URL,
     DEFAULT_JEV_MODEL,
     FIN_JEV_API_KEY_ENV,

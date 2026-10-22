@@ -117,7 +117,7 @@ class LiveEvalSeamWrapper:
           :class:`RetrieveUnavailableError` (``code=retrieve_unavailable``).
         * ``degraded: true`` envelope with **no** chunks →
           :class:`RetrieveDegradedFailureError`
-          (``code=retrieve_degraded_failure``) per ADR 0041 §B2 第 2 条.
+          (``code=retrieve_degraded``) per ADR 0041 §B2 第 2 条.
           The envelope's :attr:`signal` is preserved on the exception so
           the runner surfaces the reasons rather than a bare unavailable.
         * ``degraded: true`` envelope with chunks → returned with the
@@ -128,7 +128,7 @@ class LiveEvalSeamWrapper:
         payload = self.adapter.retrieve(query, limit=limit)
         if isinstance(payload, dict) and payload.get("error"):
             code = str(payload["error"])
-            if code == "retrieve_degraded_failure":
+            if code == "retrieve_degraded":
                 # The MCP adapter already raises this internally, but a
                 # user-patched ``retrieve`` may return the dict. Build
                 # the typed exception so the runner sees a single
@@ -409,7 +409,7 @@ def live_eval_set(
             "live path: 图臂命中率 derives from the per-class rule "
             "(honest statement), not from a live arm-attribution measurement",
             "live path: degraded:true with chunks returns a partial-failure "
-            "result; degraded:true with no chunks raises retrieve_degraded_failure",
+            "result; degraded:true with no chunks raises retrieve_degraded",
         ],
         "t1_scene_counts": t1_scene_counts,
         "t1_min_query_per_scene": T1_MIN_QUERY_PER_SCENE,

@@ -8,7 +8,7 @@ row contract and the host's propose window need this closed set.
 
 This module is the SSOT: the corpus layer sits below the host (host
 modules already import ``fin.corpus``; corpus never imports host), so
-:mod:`fin.host.extract_method_proposal` imports the vocabulary from
+:mod:`fin.host.question.extract_method_proposal` imports the vocabulary from
 here rather than redefining it. Fast/standard are extract methods,
 never 检索档 tokens — this shared vocabulary deliberately stays apart
 from the ``search_mode`` token space (spec SC3).

@@ -8,3 +8,6 @@
 /** The product route patterns, mirroring the ``<Route>`` table in
  * ``App.tsx`` (``:thread_id`` is the React Router param token). */
 export const PRODUCT_ROUTE_PATHS = ["/", "/t/:thread_id"] as const;
+
+/** Demo-only location viewer; it is gated by the host's demo status. */
+export const DEMO_SOURCE_ROUTE_PATH = "/demo/source";

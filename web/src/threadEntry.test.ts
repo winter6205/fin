@@ -13,7 +13,12 @@ import {
   PENDING_QUESTION_UNAVAILABLE_DETAIL,
   PendingQuestionUnavailableError,
 } from "./api";
-import { classifyThreadOpenFailure, threadEntryView } from "./threadEntry";
+import {
+  classifyThreadOpenFailure,
+  threadEntryIsLive,
+  threadEntryView,
+} from "./threadEntry";
+import { decideThreadEntryRoute } from "./App";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -215,5 +220,78 @@ describe("threadEntryView", () => {
         threadLoaded: false,
       }),
     ).toBe("loading");
+  });
+});
+
+// T2 (plans/2026-10-20-qa-design-correction.md, task 2; the demo
+// amendment's "Streaming entry" bullet): the ONE in-flight rule.
+//
+// A thread THIS client is streaming on keeps its live answer — the live
+// send owns it, and a loader over it would cover an answer that is
+// already arriving. It is live only while the pane STILL HOLDS it:
+// when the operator left the thread, the live state is gone and the
+// entry read is required.
+//
+// The store's entry guard, the route's entry decision and the thread
+// page's re-sync all ask this one predicate, so they cannot disagree
+// about what "live" means.
+describe("threadEntryIsLive", () => {
+  it("is live while the pane holds the streaming thread", () => {
+    expect(
+      threadEntryIsLive({
+        threadId: "t1",
+        sendingThreadId: "t1",
+        activeThreadId: "t1",
+      }),
+    ).toBe(true);
+  });
+
+  it("is not live for a thread this client is not sending on", () => {
+    expect(
+      threadEntryIsLive({
+        threadId: "t1",
+        sendingThreadId: null,
+        activeThreadId: "t1",
+      }),
+    ).toBe(false);
+    expect(
+      threadEntryIsLive({
+        threadId: "t1",
+        sendingThreadId: "t2",
+        activeThreadId: "t1",
+      }),
+    ).toBe(false);
+  });
+
+  it("is not live once the operator left the streaming thread", () => {
+    // The pane holds another thread: the live state is gone, so the
+    // entry read is REQUIRED.
+    expect(
+      threadEntryIsLive({
+        threadId: "t1",
+        sendingThreadId: "t1",
+        activeThreadId: "t2",
+      }),
+    ).toBe(false);
+  });
+
+  it("agrees with the route about a thread the operator left", () => {
+    const route = decideThreadEntryRoute({
+      threadId: "t1",
+      sendingThreadId: "t1",
+      activeThreadId: "t2",
+      reading: true,
+      fault: null,
+    });
+    // The route shows its loader (the read is required) and the shared
+    // rule says the thread is not live — the same answer, from one rule.
+    expect(route.view).toBe("loading");
+    expect(
+      threadEntryIsLive({
+        threadId: "t1",
+        sendingThreadId: "t1",
+        activeThreadId: "t2",
+      }),
+    ).toBe(false);
   });
 });

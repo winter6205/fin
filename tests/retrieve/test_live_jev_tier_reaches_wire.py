@@ -11,7 +11,7 @@ to name.
 
 The utterance deliberately does NOT name a 档, so the rules tier abstains at
 that tier; the track itself is still decided by the ``filing_ask`` rule in
-``fin.host.track_decision``, which keeps exactly one non-deterministic step in
+``fin.host.grounded.track_decision``, which keeps exactly one non-deterministic step in
 the run — the 档 cascade's judge call. Everything else is the real stack:
 ``compile_graph`` runs its normal scripted model, the cascade's judge is the
 client the ``jev_live`` gate builds, and the only retrieve adapter in the run
@@ -49,12 +49,12 @@ import pytest
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-import fin.host.search_mode_decision as smd
+import fin.host.grounded.search_mode_decision as smd
 from fin.corpus.chunking import split_unit
 from fin.corpus.parsers._common import build_unit
 from fin.corpus.push import envelope_of_unit
 from fin.host.graph import compile_graph
-from fin.host.jev_choice import JEV_CHOICE_EXIT_TRANSPORT, JevChoiceClient
+from fin.host.question.jev_choice import JEV_CHOICE_EXIT_TRANSPORT, JevChoiceClient
 from fin.host.named_failures import LASTING_RETRIEVE_TIERS, TIER_UNAVAILABLE_CODE
 from fin.host.scripted_model import ScriptedChatModel
 from fin.host.state import reset_input_state

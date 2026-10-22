@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from fin.host.evidence_contract import (
+from fin.host.evidence.evidence_contract import (
     AdmissionContext,
     compute_snapshot_digest,
     seed_context_from_rows,
@@ -1108,8 +1108,8 @@ def test_seed_context_from_rows_never_hashes_a_non_string() -> None:
 
 import re as _re
 
-from fin.host.citation_gate import QUOTABLE_EVIDENCE_KINDS
-from fin.host.evidence_contract import (
+from fin.host.grounded.citation_gate import QUOTABLE_EVIDENCE_KINDS
+from fin.host.evidence.evidence_contract import (
     BUSINESS_FIELD_SCHEMA,
     CITATION_CHANNEL_SCHEMA,
     CITATION_SNAPSHOT_KEY,

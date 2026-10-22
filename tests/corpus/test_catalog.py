@@ -35,9 +35,155 @@ from pathlib import Path
 
 import pytest
 
-from fin.corpus.catalog import DEFAULT_CATALOG_PATH, list_filings, record_filings
+from fin.corpus.catalog import (
+    DEFAULT_CATALOG_PATH,
+    list_filings,
+    record_filings,
+    replace_filings,
+    switch_extract_method,
+)
 from fin.corpus.errors import CatalogCorruptError, CatalogRowError
 from fin.host.tools.list_files import list_files
+
+
+# ---------- legacy rows on the read path ----------
+
+
+def _legacy_row() -> dict[str, object]:
+    """A row the pre-T6 financial writer stored: no ``title``/``doc_type``."""
+    return {
+        "document_id": "AAPL-2023Q3",
+        "company": "AAPL",
+        "period": "2023 Q3",
+        "version": "a" * 64,
+        "page_count": 3,
+        "cik": "0000320193",
+        "form": "10-Q",
+        "ticker": "AAPL",
+    }
+
+
+def test_a_legacy_row_without_title_or_doc_type_is_readable(tmp_path: Path) -> None:
+    """The read path tolerates a row with no ``title``/``doc_type``.
+
+    T6 required those fields on NEW rows; the rows the earlier financial
+    writer already stored never had them, and the compatibility read
+    must not turn the existing library into ``CatalogCorruptError``.
+    """
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(json.dumps({"filings": [_legacy_row()]}))
+
+    filings = list_filings(catalog_path=catalog_path)["filings"]
+
+    assert len(filings) == 1
+    assert set(filings[0]) == {
+        "document_id",
+        "company",
+        "period",
+        "version",
+        "page_count",
+        "form",
+    }
+    assert filings[0]["document_id"] == "AAPL-2023Q3"
+    assert filings[0]["form"] == "10-Q"
+
+
+def test_a_legacy_row_keeps_a_present_but_wrong_typed_field_corrupt(
+    tmp_path: Path,
+) -> None:
+    """Absence is tolerated; a present bad value is still corruption."""
+    catalog_path = tmp_path / "catalog.json"
+    row = _legacy_row()
+    row["title"] = 7
+    catalog_path.write_text(json.dumps({"filings": [row]}))
+
+    with pytest.raises(CatalogCorruptError):
+        list_filings(catalog_path=catalog_path)
+
+
+def test_a_legacy_row_with_a_blank_title_is_still_corrupt(
+    tmp_path: Path,
+) -> None:
+    """The read contract only forgives ABSENCE, not emptiness."""
+    catalog_path = tmp_path / "catalog.json"
+    row = _legacy_row()
+    row["title"] = ""
+    catalog_path.write_text(json.dumps({"filings": [row]}))
+
+    with pytest.raises(CatalogCorruptError):
+        list_filings(catalog_path=catalog_path)
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        pytest.param({"document_id": 7}, id="document_id_not_a_string"),
+        pytest.param({"version": None}, id="version_none"),
+        pytest.param({"page_count": "3"}, id="page_count_not_int"),
+        pytest.param({"page_count": True}, id="page_count_bool"),
+        pytest.param({"page_count": -1}, id="page_count_negative"),
+        pytest.param({"extract_method": "psychic"}, id="extract_method_out_of_set"),
+        pytest.param({"source_sha256": 9}, id="source_sha256_not_a_string"),
+    ],
+)
+def test_a_legacy_row_that_is_genuinely_corrupt_stays_corrupt(
+    tmp_path: Path, broken: dict[str, object]
+) -> None:
+    """Every read-side constraint except ``title``/``doc_type`` absence
+    stays at write strength: a broken row is ``CatalogCorruptError``."""
+    catalog_path = tmp_path / "catalog.json"
+    row = _legacy_row()
+    row.update(broken)
+    catalog_path.write_text(json.dumps({"filings": [row]}))
+
+    with pytest.raises(CatalogCorruptError):
+        list_filings(catalog_path=catalog_path)
+
+
+def test_a_write_over_a_legacy_table_keeps_the_legacy_row(tmp_path: Path) -> None:
+    """The legacy row survives an upsert onto its table.
+
+    The upsert reads through the tolerant validation; the row it does
+    not touch is rewritten verbatim, and the legacy row itself must not
+    silently grow invented ``title`` / ``doc_type`` values.
+    """
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(json.dumps({"filings": [_legacy_row()]}))
+
+    record_filings(
+        [
+            {
+                "document_id": "doc_" + "b" * 64,
+                "version": "b" * 64,
+                "title": "Vendor onboarding checklist",
+                "doc_type": "narrative",
+                "page_count": 1,
+            }
+        ],
+        catalog_path=catalog_path,
+    )
+
+    stored = json.loads(catalog_path.read_text())["filings"]
+    legacy = next(row for row in stored if row["document_id"] == "AAPL-2023Q3")
+    assert legacy == _legacy_row()
+    assert [row["document_id"] for row in stored] == [
+        "AAPL-2023Q3",
+        "doc_" + "b" * 64,
+    ]
+
+
+def test_a_row_missing_title_is_still_rejected_on_the_write_path(
+    tmp_path: Path,
+) -> None:
+    """The write contract is unchanged: a NEW row without ``title`` is
+    ``CatalogRowError`` — the read tolerance never leaks onto writes."""
+    catalog_path = tmp_path / "catalog.json"
+
+    with pytest.raises(CatalogRowError) as exc_info:
+        record_filings([_legacy_row()], catalog_path=catalog_path)
+
+    assert "title" in str(exc_info.value)
+    assert not catalog_path.exists()
 
 
 # ---------- paths ----------
@@ -112,6 +258,13 @@ def _valid_row(**overrides: object) -> dict[str, object]:
         "period": "2023 Q1",
         "version": "a" * 64,
         "page_count": 3,
+        # T6 added ``title`` / ``doc_type`` to the physical row contract;
+        # the missing-required-field cases live in
+        # ``test_catalog_generic.py`` (which also pins that ``company``
+        # and ``period`` became OPTIONAL, so this file's negative class
+        # is about the fields that are still required).
+        "title": "Test filing",
+        "doc_type": "narrative",
     }
     row.update(overrides)
     return row
@@ -120,9 +273,9 @@ def _valid_row(**overrides: object) -> dict[str, object]:
 @pytest.mark.parametrize(
     "bad_row",
     [
-        pytest.param({"company": "TEST", "period": "2023 Q1", "version": "a" * 64, "page_count": 1}, id="missing_document_id"),
-        pytest.param({"document_id": "TEST-2023Q1", "period": "2023 Q1", "version": "a" * 64, "page_count": 1}, id="missing_company"),
-        pytest.param({"document_id": "TEST-2023Q1", "company": "TEST", "period": "2023 Q1", "page_count": 1}, id="missing_version"),
+        pytest.param({"company": "TEST", "period": "2023 Q1", "version": "a" * 64, "page_count": 1, "title": "t", "doc_type": "narrative"}, id="missing_document_id"),
+        pytest.param({"document_id": "TEST-2023Q1", "period": "2023 Q1", "version": "a" * 64, "page_count": 1, "title": "t", "doc_type": "narrative"}, id="missing_company_is_not_required"),
+        pytest.param({"document_id": "TEST-2023Q1", "company": "TEST", "period": "2023 Q1", "page_count": 1, "title": "t", "doc_type": "narrative"}, id="missing_version"),
         pytest.param(_valid_row(page_count="3"), id="page_count_not_int"),
         pytest.param(_valid_row(page_count=True), id="page_count_bool"),
         pytest.param(_valid_row(page_count=-1), id="page_count_negative"),
@@ -140,6 +293,23 @@ def test_record_filings_rejects_bad_rows_with_named_failure(
     Never a silent skip-as-success: the write does not happen and the
     existing table is untouched.
     """
+    if bad_row == "not-a-mapping":
+        # A non-mapping is still refused; keep it out of the
+        # write-then-compare path below, which needs a table on disk.
+        catalog_path = tmp_path / "catalog.json"
+        with pytest.raises(CatalogRowError):
+            record_filings([bad_row], catalog_path=catalog_path)
+        return
+    if _is_accepted_row(bad_row):
+        # ``company`` became optional in T6, so this case is a positive
+        # one: it must NOT raise. Asserted here so the parametrize id
+        # keeps pointing at the contract change rather than silently
+        # dropping the case.
+        catalog_path = tmp_path / "catalog.json"
+        assert record_filings([bad_row], catalog_path=catalog_path) == 1
+        stored = json.loads(catalog_path.read_text())["filings"][0]
+        assert "company" not in stored
+        return
     catalog_path = tmp_path / "catalog.json"
     assert record_filings([_valid_row()], catalog_path=catalog_path) == 1
     before = catalog_path.read_bytes()
@@ -153,13 +323,26 @@ def test_record_filings_rejects_bad_rows_with_named_failure(
     assert len(list_filings(catalog_path=catalog_path)["filings"]) == 1
 
 
+def _is_accepted_row(bad_row: object) -> bool:
+    """The one negative case that became positive: no ``company``."""
+    return (
+        isinstance(bad_row, dict)
+        and "document_id" in bad_row
+        and "company" not in bad_row
+    )
+
+
 def test_record_filings_names_the_offending_row(tmp_path: Path) -> None:
     """The error message names the row index and the offending field."""
     catalog_path = tmp_path / "catalog.json"
 
     with pytest.raises(CatalogRowError) as exc_info:
         record_filings(
-            [_valid_row(), _valid_row(document_id="OTHER"), {"company": "X"}],
+            [
+                _valid_row(),
+                _valid_row(document_id="OTHER"),
+                {"company": "X", "title": "t", "doc_type": "narrative"},
+            ],
             catalog_path=catalog_path,
         )
 
@@ -278,6 +461,8 @@ def test_large_table_round_trips_completely(tmp_path: Path) -> None:
             "period": "2023 Q1",
             "version": f"{index:064d}",
             "page_count": index % 13,
+            "title": f"Document {index:04d}",
+            "doc_type": "narrative",
         }
         for index in range(300)
     ]
@@ -314,6 +499,86 @@ def test_upsert_same_document_new_version_keeps_both_rows(
     assert [f["version"] for f in filings] == ["a" * 64, "b" * 64]
 
 
+def test_replace_filings_replaces_the_rows_of_the_documents_it_is_given(
+    tmp_path: Path,
+) -> None:
+    """A writer that owns a document replaces its rows instead of adding to them.
+
+    The upsert keys on ``(document_id, version)``, so a new version is a
+    second row. A writer that owns the whole document -- the demo seed --
+    must not leave the previous version's row behind.
+    """
+    catalog_path = tmp_path / "catalog.json"
+    record_filings([_valid_row(version="a" * 64)], catalog_path=catalog_path)
+
+    written = replace_filings(
+        [_valid_row(version="b" * 64)],
+        document_ids=["TEST-2023Q1"],
+        catalog_path=catalog_path,
+    )
+
+    assert written == 1
+    filings = list_filings(catalog_path=catalog_path)["filings"]
+    assert [(f["document_id"], f["version"]) for f in filings] == [
+        ("TEST-2023Q1", "b" * 64)
+    ]
+
+
+def test_replace_filings_keeps_the_rows_of_documents_it_does_not_own(
+    tmp_path: Path,
+) -> None:
+    catalog_path = tmp_path / "catalog.json"
+    record_filings(
+        [_valid_row(document_id="OTHER-2023Q1", version="a" * 64)],
+        catalog_path=catalog_path,
+    )
+    record_filings([_valid_row(version="a" * 64)], catalog_path=catalog_path)
+
+    replace_filings(
+        [_valid_row(version="b" * 64)],
+        document_ids=["TEST-2023Q1"],
+        catalog_path=catalog_path,
+    )
+
+    filings = list_filings(catalog_path=catalog_path)["filings"]
+    assert [(f["document_id"], f["version"]) for f in filings] == [
+        ("OTHER-2023Q1", "a" * 64),
+        ("TEST-2023Q1", "b" * 64),
+    ]
+
+
+def test_replace_filings_keeps_the_recorded_extract_method(tmp_path: Path) -> None:
+    """Replacing a row is not a method switch (ADR 0068)."""
+    catalog_path = tmp_path / "catalog.json"
+    record_filings([_valid_row()], catalog_path=catalog_path)
+    switch_extract_method(
+        "TEST-2023Q1", "a" * 64, "fast", catalog_path=catalog_path
+    )
+
+    replace_filings(
+        [_valid_row()],
+        document_ids=["TEST-2023Q1"],
+        catalog_path=catalog_path,
+    )
+
+    stored = json.loads(catalog_path.read_text())["filings"][0]
+    assert stored["extract_method"] == "fast"
+
+
+def test_replace_filings_refuses_a_row_outside_the_documents_it_replaces(
+    tmp_path: Path,
+) -> None:
+    """A row the caller does not own is a named failure, not a silent write."""
+    catalog_path = tmp_path / "catalog.json"
+
+    with pytest.raises(CatalogRowError, match="OTHER-2023Q1"):
+        replace_filings(
+            [_valid_row(document_id="OTHER-2023Q1")],
+            document_ids=["TEST-2023Q1"],
+            catalog_path=catalog_path,
+        )
+
+
 def test_optional_source_sha256_is_stored_but_not_emitted(
     tmp_path: Path,
 ) -> None:
@@ -324,11 +589,11 @@ def test_optional_source_sha256_is_stored_but_not_emitted(
     """
     catalog_path = tmp_path / "catalog.json"
     record_filings(
-        [_valid_row(source_sha256="c" * 64)], catalog_path=catalog_path
+        [_valid_row(source_sha256="a" * 64)], catalog_path=catalog_path
     )
     # The stored row keeps it...
     stored = json.loads(catalog_path.read_text())["filings"][0]
-    assert stored["source_sha256"] == "c" * 64
+    assert stored["source_sha256"] == "a" * 64
     # ...the emitted hit does not.
     filings = list_filings(catalog_path=catalog_path)["filings"]
     assert filings[0] == {
@@ -365,6 +630,8 @@ def test_concurrent_record_filings_do_not_corrupt_or_lose_rows(
                 "period": "2023 Q1",
                 "version": f"{worker:02d}" * 32,
                 "page_count": index,
+                "title": f"W{worker} doc {index}",
+                "doc_type": "narrative",
             }
             for index in range(10)
         ]
@@ -555,6 +822,8 @@ def test_list_files_form_filter_accepts_non_demo_form(tmp_path: Path) -> None:
                 "period": "2023 Q1",
                 "version": "a" * 64,
                 "page_count": 1,
+                "title": "10-K test",
+                "doc_type": "narrative",
                 "form": "10-K",
             },
             {
@@ -563,6 +832,8 @@ def test_list_files_form_filter_accepts_non_demo_form(tmp_path: Path) -> None:
                 "period": "2023 Q1",
                 "version": "a" * 64,
                 "page_count": 1,
+                "title": "10-Q test",
+                "doc_type": "narrative",
                 "form": "10-Q",
             },
         ],

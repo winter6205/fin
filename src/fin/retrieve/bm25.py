@@ -73,15 +73,22 @@ from rank_bm25 import BM25Okapi  # type: ignore[import-untyped]
 
 
 from fin.corpus.extracted import ExtractedPage, Locator
+from fin.retrieve.metadata_filters import (
+    InvalidFilterError,
+    invalid_filter,
+    normalized_metadata_filters,
+)
 from fin.retrieve.input_validation import (
     InputValidationLedger,
     validate_filters,
     validate_query,
 )
 from fin.retrieve.port import (
+    DocumentScope,
     STRUCTURED_SEARCH_UNAVAILABLE_CODE,
     Chunk,
     _structured_query_refusal_code,
+    prepare_document_scope,
     resolve_search_mode,
 )
 
@@ -266,6 +273,8 @@ class BM25Adapter:
         structured_request: Mapping[str, Any] | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
+        filters: Mapping[str, Any] | None = None,
+        document_scope: DocumentScope | None = None,
     ) -> dict[str, Any]:
         """Return ``{"chunks": [...]}`` ranked descending by BM25 score.
 
@@ -303,6 +312,16 @@ class BM25Adapter:
             ``MCPRetrieveAdapter``). The sql 档 on BM25 answers with
             this lexical ranking, exactly as every other open 档 does
             here.
+        filters
+            Accepted for port-signature parity: the generic metadata
+            filter (spec ``qa-chain-corpus-retrieval``) binds against
+            catalog fields this archived adapter never reads, so it
+            validates at the same boundary as the product adapters and
+            then narrows nothing — the same no-op the legacy financial
+            filters are without a ``manifest_docs`` table. It must still
+            be validated: an out-of-contract map is the named
+            ``invalid_filter`` refusal here too, never a silent
+            "unfiltered search".
 
         Returns
         -------
@@ -314,7 +333,19 @@ class BM25Adapter:
         # on the adapter's ledger, and never the miss shape.
         ledger = self.input_validation_failures
         validate_query(query, ledger=ledger)
+        # The generic metadata filter is validated at the same public
+        # boundary as on every other port implementation; this adapter
+        # then narrows nothing (it reads no catalog fields).
+        try:
+            normalized_filters = normalized_metadata_filters(filters)
+        except InvalidFilterError:
+            return invalid_filter()
         effective_search_mode = resolve_search_mode(search_mode)
+        effective_document_scope, scope_refusal = prepare_document_scope(
+            document_scope, document_id, effective_search_mode
+        )
+        if scope_refusal is not None:
+            return {"error": scope_refusal}
         refusal = _structured_query_refusal_code(
             structured_request,
             search_mode=effective_search_mode,
@@ -330,6 +361,9 @@ class BM25Adapter:
                     sql_window_end,
                 )
             ),
+            has_generic_filters=normalized_filters is not None,
+            has_scope_locator=document_id is not None,
+            has_document_scope=effective_document_scope is not None,
         )
         if refusal is not None:
             return {"error": refusal}
@@ -376,6 +410,7 @@ class BM25Adapter:
             {"document_id": document_id, "cik": cik, "form": form,
              "ticker": ticker, "filing_date": filing_date},
             effective_limit,
+            effective_document_scope,
         )}
 
     def _ranked_chunks(
@@ -383,9 +418,18 @@ class BM25Adapter:
         raw_scores: _ScoreValues,
         filters: Mapping[str, str | None],
         limit: int,
+        document_scope: DocumentScope | None,
     ) -> list[Chunk]:
         """Rank only corpus entries that satisfy the validated exact filters."""
         document_id = filters.get("document_id")
+        allowed_sources = (
+            None
+            if document_scope is None
+            else {
+                (entry.document_id, entry.version)
+                for entry in document_scope
+            }
+        )
 
         # Enumerate (index, score) pairs, drop the document_id filter
         # case, AND-evaluate the EDGAR-shaped metadata filters, and
@@ -398,6 +442,11 @@ class BM25Adapter:
                 document_id is not None
                 and indexed.document_id != document_id
             ):
+                continue
+            if allowed_sources is not None and (
+                indexed.chunk.source_ref.document_id,
+                indexed.chunk.source_ref.version,
+            ) not in allowed_sources:
                 continue
             if not self._passes_metadata(
                 indexed.document_id,

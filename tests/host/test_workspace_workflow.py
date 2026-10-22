@@ -1,4 +1,4 @@
-"""Workspace "work after the answer" routes (T4, the tracked change).
+"""Workspace "work after the answer" routes (T4).
 
 Spec Focus 3 / SC4-SC6 on the HTTP surface:
 
@@ -38,7 +38,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import Citation, ScriptedChatModel, compile_graph
-from fin.host.citation_gate import COMPANY_KIND
+from fin.host.grounded.citation_gate import COMPANY_KIND
 from fin.host.thread_store import InMemoryThreadStore, RunRecord
 from fin.host.tools.compare_facts import COMPARISON_SCHEMA, COMPARISON_SCHEMA_VERSION
 from fin.host.watchlist import JsonFileWatchlistStore
@@ -398,6 +398,129 @@ def test_stop_with_no_run_in_flight_is_a_204_no_op(
     r = client.post(f"/api/threads/{tid}/stop")
     assert r.status_code == 204
     assert r.content == b""
+
+
+def test_stop_during_send_preflight_cancels_that_admitted_run(
+    client: TestClient,
+    http_app: FastAPI,
+    stores,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop while send preflight is blocked follows its admission into the run."""
+    from fin.host import workspace_http
+
+    graph, model_entered, release_model = _blocking_graph(http_app)
+    original_read = workspace_http._accepted_task_runtime_state
+    preflight_entered = threading.Event()
+    release_preflight = threading.Event()
+
+    def blocked_read(graph: Any, thread_id: str):
+        preflight_entered.set()
+        assert release_preflight.wait(timeout=5.0), "preflight was not released"
+        return original_read(graph, thread_id)
+
+    monkeypatch.setattr(
+        workspace_http, "_accepted_task_runtime_state", blocked_read
+    )
+    tid = client.post("/api/threads", json={"first_message": "q"}).json()["id"]
+    sent: dict[str, Any] = {}
+
+    def send() -> None:
+        with client.stream(
+            "POST", f"/api/threads/{tid}/messages", json={"question": "first"}
+        ) as response:
+            sent["status_code"] = response.status_code
+            sent["body"] = "".join(response.iter_text())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(send)
+        stop = None
+        try:
+            assert preflight_entered.wait(timeout=5.0), "send did not enter preflight"
+            stop = client.post(f"/api/threads/{tid}/stop")
+        finally:
+            release_preflight.set()
+            release_model.set()
+        future.result(timeout=10.0)
+
+    assert stop is not None
+    assert stop.status_code == 202
+    assert stop.json() == {"stopped": True, "pending": True, "run_id": None}
+    assert model_entered.is_set() is False
+
+    events = _parse_sse_events(sent["body"])
+    status = next(payload for name, payload in events if name == "status")
+    assert status["status"] == "refuse"
+    assert status["reason"] == "stopped"
+    assert sent["status_code"] == 200
+    receipt_response = client.get(
+        f"/api/threads/{tid}/turns/{status['run_id']}/receipt"
+    )
+    assert receipt_response.status_code == 200
+    receipt = receipt_response.json()
+    assert receipt["technical_result"] == "stopped"
+    assert receipt["cancellation_reason"] == "user_stop"
+
+
+def test_stop_during_resume_preflight_cancels_that_admitted_run(
+    client: TestClient,
+    http_app: FastAPI,
+    stores,
+) -> None:
+    """A stop while resume inspects its checkpoint follows that claim."""
+    from fin.host.http import get_graph
+
+    pending_entered = threading.Event()
+    release_pending = threading.Event()
+
+    class ResumePreflightGraph:
+        stream_entered = threading.Event()
+
+        def is_locked(self, thread_id: str) -> bool:
+            return False
+
+        def pending_nodes(self, thread_id: str) -> tuple[str, ...]:
+            pending_entered.set()
+            assert release_pending.wait(timeout=5.0), "resume preflight was not released"
+            return ("resume_node",)
+
+        def checkpoint_run_id(self, thread_id: str) -> str:
+            return "resume-run"
+
+        def stream(self, input_value: Any, *, config: dict, stream_mode: Any):
+            self.stream_entered.set()
+            if False:
+                yield "values", {}
+
+    graph = ResumePreflightGraph()
+    http_app.dependency_overrides[get_graph] = lambda: graph
+    tid = client.post("/api/threads", json={"first_message": "q"}).json()["id"]
+    response_body: dict[str, Any] = {}
+
+    def resume() -> None:
+        with client.stream("POST", f"/api/threads/{tid}/resume") as response:
+            response_body["status_code"] = response.status_code
+            response_body["body"] = "".join(response.iter_text())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(resume)
+        stop = None
+        try:
+            assert pending_entered.wait(timeout=5.0), "resume did not inspect its checkpoint"
+            stop = client.post(f"/api/threads/{tid}/stop")
+        finally:
+            release_pending.set()
+        future.result(timeout=10.0)
+
+    assert stop is not None
+    assert stop.status_code == 202
+    assert stop.json() == {"stopped": True, "pending": True, "run_id": None}
+    assert graph.stream_entered.is_set() is False
+    assert response_body["status_code"] == 200
+    events = _parse_sse_events(response_body["body"])
+    status = next(payload for name, payload in events if name == "status")
+    assert status["status"] == "refuse"
+    assert status["reason"] == "stopped"
 
 
 def test_stop_on_an_unknown_thread_is_a_typed_404(

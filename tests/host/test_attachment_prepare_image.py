@@ -34,13 +34,13 @@ from fin.corpus.parsers import (
     PageRegionParser,
     Region,
 )
-from fin.host.attachment_budgets import AttachmentBudgets, required_run_calls
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_budgets import AttachmentBudgets, required_run_calls
+from fin.host.attachment.attachment_prepare import (
     ATTACHMENT_EMPTY_TEXT,
     ATTACHMENT_TYPE_UNSUPPORTED,
     AttachmentPreparationService,
 )
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,

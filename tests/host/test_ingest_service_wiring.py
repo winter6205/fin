@@ -13,8 +13,11 @@ Contract asserted here:
   * a same-version re-ingest triggers no invalidation;
   * new store instances over the same paths (a restart) still have the
     records the replacement closure needs;
-  * catalog semantics are unchanged: the on_ingested hook keeps the
-    catalog_record_failed warning path exactly.
+  * a catalog failure during a durable run is a TYPED, AUDIT-DERIVED
+    warning on poll (T6): the hook propagates, the endpoint records
+    ``catalog_publication_failed``, the job stays ``cataloging``, and
+    ``GET /api/corpus/ingest/{id}`` surfaces it — never a thread-local
+    transport.
 """
 
 from __future__ import annotations
@@ -79,10 +82,38 @@ def _fresh_durable() -> tuple[Any, Any, Any]:
     return InMemoryObjectStore(), InMemoryMetadataStore(), InMemoryIngestStateStore()
 
 
-def _submit(service: IngestEndpoint, data: bytes, document_id: str = "DOC-1") -> Any:
-    return service.submit_durable(
-        data, document_id=document_id, declared_format="txt"
+def _submit(service: IngestEndpoint, data: bytes) -> Any:
+    return service.submit_durable(data, declared_format="txt")
+
+
+def _document_id(scope: str, data: bytes) -> str:
+    """The public upload's content-derived id, written out longhand."""
+    digest = hashlib.sha256(data).digest()
+    preimage = (
+        b"fin-corpus-document-v1\x00" + scope.encode("utf-8") + b"\x00" + digest
     )
+    return "doc_" + hashlib.sha256(preimage).hexdigest()
+
+
+def _seed_ready_generation(
+    service: IngestEndpoint, *, document_id: str, data: bytes
+) -> None:
+    """Install the durable generation a replacement upload supersedes.
+
+    The public flow derives its id from the submitted bytes, so two
+    different byte strings can never name one document through the
+    accept door alone. A replacement is still the settled lifecycle for
+    an id an internal/legacy caller already owns, and this seeds that
+    state directly so the wiring can be exercised without a second
+    public mode.
+    """
+    version = hashlib.sha256(data).hexdigest()
+    pointer = service._object_store.put(  # type: ignore[union-attr]
+        f"filings/{document_id}/{version}", data, content_type="text/plain"
+    )
+    service._metadata_store.put_pointer(document_id, pointer)  # type: ignore[union-attr]
+    service._state_store.create_job(document_id)  # type: ignore[union-attr]
+    _advance(service._state_store, document_id)  # type: ignore[arg-type]
 
 
 def _advance(states: InMemoryIngestStateStore, document_id: str) -> None:
@@ -127,6 +158,7 @@ def _wired(
         object_store=objects,
         metadata_store=pointers,
         state_store=states,
+        corpus_scope_id=service._corpus_scope_id,
     )
     store = getattr(service, "_pushed_records_store", None)
     if store is not None:
@@ -281,13 +313,22 @@ def test_replacement_upload_closes_superseded_blocks_at_the_accept_door(
     fake = FakePushPort()
     wired = _wired(service, fake, durable=_fresh_durable())
 
+    replacement_doc = _document_id(wired._corpus_scope_id, _V2_TEXT)
     first = _submit(wired, _V1_TEXT)
-    result = wired.ingest(_V1_TEXT, document_id="DOC-1", declared_format="txt")
+    result = wired.ingest(
+        _V1_TEXT, document_id=replacement_doc, declared_format="txt"
+    )
     assert result.invalidation is None  # nothing stale against an empty store
-    _advance(wired._state_store, "DOC-1")
+    _seed_ready_generation(
+        wired, document_id=replacement_doc, data=_V1_TEXT
+    )
 
     second = _submit(wired, _V2_TEXT)
 
+    # different bytes are a different public document, never a silent
+    # replacement of the first upload
+    assert second.job_id == replacement_doc
+    assert second.job_id != first.job_id
     # the accept door closed every block the replaced version pushed
     closed = fake.invalidation_records()
     assert sorted(row["block_id"] for row in closed) == sorted(
@@ -305,18 +346,19 @@ def test_replacement_upload_closes_superseded_blocks_at_the_accept_door(
     assert settled and {event["event"] for event in settled} == {"settled"}
     # reopen semantics untouched: one job, READY -> PENDING with the
     # supersede audit row, pointer moved to exactly one logical version
-    assert second.job_id == first.job_id
     assert second.state is IngestState.PENDING
-    assert wired._state_store.get_job("DOC-1").state is IngestState.PENDING
+    assert wired._state_store.get_job(replacement_doc).state is (
+        IngestState.PENDING
+    )
     superseded = [
         row
-        for row in wired._state_store.list_audit("DOC-1")
+        for row in wired._state_store.list_audit(replacement_doc)
         if row.action == "job_superseded"
     ]
     assert [(row.from_state, row.to_state) for row in superseded] == [
         (IngestState.READY, IngestState.PENDING)
     ]
-    assert _pointer_sha_of(wired._metadata_store, "DOC-1") == second.version
+    assert _pointer_sha_of(wired._metadata_store, replacement_doc) == second.version
 
 
 def test_ready_generation_record_is_not_lost_by_the_closure(
@@ -329,19 +371,24 @@ def test_ready_generation_record_is_not_lost_by_the_closure(
     fake = FakePushPort()
     wired = _wired(service, fake, durable=_fresh_durable())
 
-    _submit(wired, _V1_TEXT)
-    wired.ingest(_V1_TEXT, document_id="DOC-1", declared_format="txt")
-    _advance(wired._state_store, "DOC-1")
+    replacement_doc = _document_id(wired._corpus_scope_id, _V2_TEXT)
+    wired.ingest(_V1_TEXT, document_id=replacement_doc, declared_format="txt")
+    _seed_ready_generation(
+        wired, document_id=replacement_doc, data=_V1_TEXT
+    )
 
     _submit(wired, _V2_TEXT)
 
-    actions = [row.action for row in wired._state_store.list_audit("DOC-1")]
+    actions = [
+        row.action
+        for row in wired._state_store.list_audit(replacement_doc)
+    ]
     assert actions.count("job_superseded") == 1
     assert len(actions) > 1  # the reopen added a row; it replaced none
     # the document still names exactly one logical version after reopen
-    assert _pointer_sha_of(wired._metadata_store, "DOC-1") == hashlib.sha256(
-        _V2_TEXT
-    ).hexdigest()
+    assert _pointer_sha_of(
+        wired._metadata_store, replacement_doc
+    ) == hashlib.sha256(_V2_TEXT).hexdigest()
 
 
 def test_same_version_resubmit_and_reingest_trigger_no_invalidation(
@@ -353,12 +400,13 @@ def test_same_version_resubmit_and_reingest_trigger_no_invalidation(
     fake = FakePushPort()
     wired = _wired(service, fake, durable=_fresh_durable())
 
+    doc = _document_id(wired._corpus_scope_id, _V1_TEXT)
     first = _submit(wired, _V1_TEXT)
-    pushed = wired.ingest(_V1_TEXT, document_id="DOC-1", declared_format="txt")
-    _advance(wired._state_store, "DOC-1")
+    pushed = wired.ingest(_V1_TEXT, document_id=doc, declared_format="txt")
+    _advance(wired._state_store, doc)
 
     joined = _submit(wired, _V1_TEXT)  # duplicate: joins, no supersede
-    again = wired.ingest(_V1_TEXT, document_id="DOC-1", declared_format="txt")
+    again = wired.ingest(_V1_TEXT, document_id=doc, declared_format="txt")
 
     assert joined.job_id == first.job_id
     assert joined.state is IngestState.READY
@@ -382,11 +430,13 @@ def test_replacement_closure_survives_a_restart(tmp_path, monkeypatch) -> None:
     fake = FakePushPort()
     first_wired = _wired(first_boot, fake, durable=durable)
 
-    _submit(first_wired, _V1_TEXT)
+    replacement_doc = _document_id(first_wired._corpus_scope_id, _V2_TEXT)
     pushed = first_wired.ingest(
-        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+        _V1_TEXT, document_id=replacement_doc, declared_format="txt"
     )
-    _advance(first_wired._state_store, "DOC-1")
+    _seed_ready_generation(
+        first_wired, document_id=replacement_doc, data=_V1_TEXT
+    )
 
     # process restart: fresh service — fresh path-backed store, journal,
     # and ledger over the same paths
@@ -404,12 +454,20 @@ def test_replacement_closure_survives_a_restart(tmp_path, monkeypatch) -> None:
     assert {row["reason"] for row in closed} == {"unit_version_changed"}
 
 
-# ----- catalog semantics through the new hook --------------------------------
+# ----- catalog publication semantics through the durable run -----------------
 
 
-def test_catalog_warning_semantics_survive_the_new_hook(
+def test_a_catalog_failure_is_a_typed_warning_derived_from_the_audit(
     tmp_path, monkeypatch
 ) -> None:
+    """A catalog outage is durable, typed, and pollable — never swallowed.
+
+    The hook propagates the failure, the endpoint records the typed
+    ``catalog_publication_failed`` event, the job stays ``cataloging``
+    (pushed and searchable, but not ready), and polling surfaces the
+    warning. Nothing travels through thread-local state, so a poll
+    after a restart sees the same warning.
+    """
     _journal_env(monkeypatch, tmp_path)
     service = _build_default_ingest_service()
     wired = _wired(service, FakePushPort(), durable=_fresh_durable())
@@ -418,16 +476,47 @@ def test_catalog_warning_semantics_survive_the_new_hook(
         raise OSError("catalog disk full")
 
     monkeypatch.setattr(werkplace_http, "record_filings", boom)
-    werkplace_http._catalog_hook_slot.__dict__.clear()
 
-    result = wired.ingest(
-        _V1_TEXT, document_id="DOC-9", declared_format="txt"
-    )
+    submitted = _submit(wired, _V1_TEXT)
+    outcome = wired.run_durable(submitted.document_id)
 
-    warning = getattr(werkplace_http._catalog_hook_slot, "warning", None)
-    assert warning is not None
-    assert warning.startswith("catalog_record_failed")
-    # the push stands and the records persist despite the catalog failure
-    assert wired._previous_records() == list(result.records)
+    # The push stands; the catalog write did not.
+    assert outcome.state is IngestState.CATALOGING
+    status = wired.job_status(submitted.document_id)
+    assert status.state is IngestState.CATALOGING
+    assert status.catalog_warning is not None
+    assert status.catalog_warning.code == "catalog_publication_failed"
+    assert status.catalog_warning.failure_code == "catalog_unavailable"
+    assert status.catalog_warning_count == 1
+    # The push landed despite the catalog failure, so the replacement
+    # closure still has the records to close.
+    assert wired._previous_records()
 
-    werkplace_http._catalog_hook_slot.__dict__.clear()
+
+def test_the_poll_body_carries_no_raw_exception_text(
+    tmp_path, monkeypatch
+) -> None:
+    """The route's warning body is a closed vocabulary, never a message."""
+    from fin.host.workspace_http import _catalog_warning_body
+
+    _journal_env(monkeypatch, tmp_path)
+    service = _build_default_ingest_service()
+    wired = _wired(service, FakePushPort(), durable=_fresh_durable())
+
+    def boom(*rows, **kwargs):
+        raise OSError("/home/secret/only/here/catalog.json is unwritable")
+
+    monkeypatch.setattr(werkplace_http, "record_filings", boom)
+
+    submitted = _submit(wired, _V1_TEXT)
+    wired.run_durable(submitted.document_id)
+    body = _catalog_warning_body(wired.job_status(submitted.document_id).catalog_warning)
+
+    assert body is not None
+    assert body["code"] == "catalog_publication_failed"
+    assert body["failure_code"] == "catalog_unavailable"
+    assert body["attempts"] == 1
+    assert "failure_stage" in body
+    rendered = json.dumps(body)
+    assert "/home/secret" not in rendered
+    assert "unwritable" not in rendered

@@ -162,7 +162,7 @@ def test_live_wrapper_calls_mcp_retrieve_with_question_and_limit() -> None:
 def test_live_wrapper_translates_a_degraded_envelope_without_chunks_to_unavailable() -> None:
     """ADR 0041 §B2 第 2 条: degraded + no chunks is a named failure, NOT
     a legal empty hit. The wrapper raises ``RetrieveUnavailableError``
-    with ``code=retrieve_degraded_failure`` so the runner counts the
+    with ``code=retrieve_degraded`` so the runner counts the
     query as errored rather than as a clean zero hit (SC4)."""
 
     class _DegradedEmptyAdapter:
@@ -178,7 +178,7 @@ def test_live_wrapper_translates_a_degraded_envelope_without_chunks_to_unavailab
     )
     with pytest.raises(RetrieveUnavailableError) as excinfo:
         wrapper.retrieve_for_eval_with_arms("q", capabilities={}, limit=8)
-    assert excinfo.value.code == "retrieve_degraded_failure"
+    assert excinfo.value.code == "retrieve_degraded"
 
 
 def test_live_wrapper_raises_named_failure_when_degraded_reasons_are_empty() -> None:
@@ -203,7 +203,7 @@ def test_live_wrapper_raises_named_failure_when_degraded_reasons_are_empty() -> 
     )
     with pytest.raises(RetrieveUnavailableError) as excinfo:
         wrapper.retrieve_for_eval_with_arms("q", capabilities={}, limit=8)
-    assert excinfo.value.code == "retrieve_degraded_failure"
+    assert excinfo.value.code == "retrieve_degraded"
     message = str(excinfo.value)
     assert "degraded_reasons_missing_or_invalid" in message
 
@@ -226,7 +226,7 @@ def test_live_wrapper_raises_named_failure_when_degraded_reasons_are_not_a_list(
     )
     with pytest.raises(RetrieveUnavailableError) as excinfo:
         wrapper.retrieve_for_eval_with_arms("q", capabilities={}, limit=8)
-    assert excinfo.value.code == "retrieve_degraded_failure"
+    assert excinfo.value.code == "retrieve_degraded"
 
 
 def test_live_wrapper_preserves_degraded_signal_with_legitimate_reasons() -> None:

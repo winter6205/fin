@@ -113,14 +113,23 @@ def test_messages_for_model_ignores_slots_off_the_clarify_track() -> None:
 # ----- SC13: the graph's clarify leaf injects the turn's gaps -----
 
 
-def test_clarify_leaf_prompt_names_only_the_period_gap(recording_model):
-    """Company given, period missing → the call-scoped prompt asks
-    for the period and does not re-ask for the company."""
+def test_filing_gap_with_company_never_injects_the_slot_prompt(
+    recording_model,
+):
+    """A clarify-labelled filing ask is retrieval-first, never a slot ask.
+
+    The clarify leaf's slot prompt is model-facing internal vocabulary;
+    the correction replaces it with corpus-backed scope discovery. With
+    no adapter there is no scope to prove, so the gate records
+    ``unavailable`` and the turn continues grounded — the slot prompt is
+    never composed, even though the company is known.
+    """
     model, seen = recording_model
     graph = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
     )
     out = graph.invoke(
         {
@@ -131,27 +140,34 @@ def test_clarify_leaf_prompt_names_only_the_period_gap(recording_model):
         },
         config=_thread_config("t-clarify-slots-period"),
     )
-    assert out["track"] == "clarify"
-
-    assert seen
-    system_prompt = str(seen[0][0].content)
-    assert CLARIFY_INSTRUCTIONS_MARKER in system_prompt
-    assert system_prompt != CLARIFY_SYSTEM_PROMPT
-    assert system_prompt == clarify_prompt(["period"])
-    injected = system_prompt.rsplit("\n", 1)[-1]
-    assert "period" in injected
-    assert "company" not in injected
+    assert out["track"] == "grounded"
+    assert out["track_decision"]["signals"]["clarify_scope"]["outcome"] == (
+        "unavailable"
+    )
+    assert (out.get("task_runtime") or {}).get("pending_question") is None
+    assert CLARIFY_INSTRUCTIONS_MARKER not in "".join(
+        str(messages[0].content) for messages in seen
+    )
 
 
-def test_clarify_leaf_prompt_names_both_gaps(recording_model):
-    """Neither company nor period given → both are named."""
+def test_filing_gap_without_company_never_injects_the_slot_prompt(
+    recording_model,
+):
+    """The same rule holds when neither slot is named.
+
+    "What was revenue?" used to ask the operator to fill company and
+    period through the clarify leaf. It now enters the retrieval-first
+    gate and, without a proven scope, continues grounded without ever
+    publishing or prompting with the internal slot names.
+    """
     model, seen = recording_model
     graph = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
     )
-    graph.invoke(
+    out = graph.invoke(
         {
             "messages": [HumanMessage(content="What was revenue?")],
             "evidence": [],
@@ -160,17 +176,29 @@ def test_clarify_leaf_prompt_names_both_gaps(recording_model):
         },
         config=_thread_config("t-clarify-slots-both"),
     )
-    system_prompt = str(seen[0][0].content)
-    assert system_prompt == clarify_prompt(["company", "period"])
-    injected = system_prompt.rsplit("\n", 1)[-1]
-    assert "company" in injected
-    assert "period" in injected
+    assert out["track"] == "grounded"
+    assert out["track_decision"]["signals"]["clarify_scope"]["outcome"] == (
+        "unavailable"
+    )
+    assert (out.get("task_runtime") or {}).get("pending_question") is None
+    assert CLARIFY_INSTRUCTIONS_MARKER not in "".join(
+        str(messages[0].content) for messages in seen
+    )
 
 
-def test_clarify_leaf_falls_back_to_the_latest_snapshot_gap(recording_model):
-    """Clarify reached via the Jev gray-zone tier records no slots on
-    the decision, so the gap comes from the latest status snapshot:
-    company already known, period still empty → ask for period."""
+def test_snapshot_gap_alone_no_longer_opens_a_slot_clarification(
+    recording_model,
+):
+    """QA design correction: a clarify label with no filing ask is decided
+    by retrieval, never by a status-snapshot gap.
+
+    The old path read the latest snapshot, found ``period`` empty, and put
+    ``请补充：期间`` in front of the operator even though the utterance was
+    not about a period. No accepted input/task exists in this direct
+    invocation, so the retrieval-first gate cannot bind a question and
+    continues on the grounded lane; what matters here is that the
+    snapshot gap no longer selects the clarify leaf or its slot prompt.
+    """
 
     model, seen = recording_model
     graph = compile_graph(
@@ -202,12 +230,11 @@ def test_clarify_leaf_falls_back_to_the_latest_snapshot_gap(recording_model):
         },
         config=_thread_config("t-clarify-slots-snapshot"),
     )
-    assert out["track"] == "clarify"
-    assert not out["track_decision"]["signals"].get("missing_slots")
-
-    system_prompt = str(seen[0][0].content)
-    assert system_prompt == clarify_prompt(["period"])
-    assert system_prompt != CLARIFY_SYSTEM_PROMPT
+    assert out["track"] == "grounded"
+    assert out["clarify_scope_note"] == ""
+    assert (out.get("task_runtime") or {}).get("pending_question") is None
+    assert seen
+    assert CLARIFY_INSTRUCTIONS_MARKER not in str(seen[0][0].content)
 
 
 def test_clarify_prompt_stays_out_of_the_checkpoint(recording_model):

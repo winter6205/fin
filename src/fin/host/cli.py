@@ -57,16 +57,24 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from fin.corpus.errors import IngestMissingError
 from fin.host import ConcurrentRunError, WorkspaceRootMissingError
-from fin.host.citation_gate import strip_hidden_bounce_marker
-from fin.host.evidence_session_registry import EvidenceSessionBinding, EvidenceSessionRegistry
-from fin.host.operator_env import apply_dotenv
-from fin.host.structured_evidence_identity import (
+from fin.host.grounded.citation_gate import strip_hidden_bounce_marker
+from fin.host.evidence.evidence_session_registry import EvidenceSessionBinding, EvidenceSessionRegistry
+from fin.host.fin_home import FinHomeError, resolve_fin_home
+from fin.host.operator_settings import (
+    OperatorSettingsConfigError,
+    apply_operator_settings,
+    format_config_show,
+)
+from fin.host.evidence.structured_evidence_identity import (
     StructuredEvidenceIdentityConfigError,
     load_structured_evidence_identity,
 )
 from fin.host.run_payload import ordinary_person_copy
 from fin.host.state import EVIDENCE_RESET, reset_input_state
-from fin.host.workspace_registry import default_workspace_root
+from fin.host.workspace_registry import (
+    default_workspace_root,
+    workspace_root_for_fin_home,
+)
 
 
 # ----- typed errors -----
@@ -263,8 +271,8 @@ def run(
         value is echoed on stderr.
     home
         Injected home directory for resolving the default 工作区
-        (``$HOME/.fin/default``). ``None`` (the default) reads
-        ``$HOME`` at call time. Tests pass an explicit ``tmp_path``
+        (``$HOME/.fin/default``). ``None`` follows the resolved fin
+        home. Tests pass an explicit ``tmp_path``
         so the suite never touches the real home. spec Focus 3 / SC8:
         the CLI is the workspace-inject seam for the ask path.
 
@@ -285,10 +293,10 @@ def run(
         thread_id = str(uuid.uuid4())
     print(f"thread_id: {thread_id}", file=sys.stderr)
 
-    resolved_home = home if home is not None else (
-        os.environ.get("HOME") or str(Path.home())
-    )
-    workspace_root = default_workspace_root(resolved_home)
+    if home is not None:
+        workspace_root = default_workspace_root(home)
+    else:
+        workspace_root = workspace_root_for_fin_home(resolve_fin_home())
     config: dict[str, Any] = {
         "configurable": {
             "thread_id": thread_id,
@@ -381,36 +389,105 @@ def _structured_evidence_binding() -> Any | None:
 # ----- prod graph resolution (lazy) -----
 
 
+_COMPILER_UNAVAILABLE = (
+    "production graph compiler not available: "
+    "fin.host.compile.compile_for_runtime (ticket T8) is "
+    "required to build the durable graph"
+)
+
+
 def _default_graph_factory() -> Any:
     """Resolve the production compiled graph (T8 provides this).
 
     The import is LAZY — neither LLM-provider nor Postgres-checkpointer
     modules are touched unless this function is actually called. The
     ``--help`` path therefore never instantiates an LLM, a graph, or a
-    checkpointer (ADR 0013 + ADR 0015). A local ``.env`` is applied
-    here (not at argparse) so ``--help`` stays import-light.
+    checkpointer (ADR 0013 + ADR 0015). ``~/.fin/settings.yaml`` is
+    applied here (not at argparse) so ``--help`` stays import-light.
+
+    The graph itself comes from the application boundary, which owns
+    the host-graph composition the HTTP surface reaches as well; this
+    module does not call the product compiler itself.
     """
-    apply_dotenv()
+    apply_operator_settings()
     try:
-        from fin.host.compile import compile_for_runtime  # type: ignore[import-not-found]
+        from fin.host.application.composition import (
+            ProductCompilerUnavailableError,
+            product_graph_factory,
+        )
     except ModuleNotFoundError as exc:
-        raise RuntimeGraphUnavailableError(
-            "production graph compiler not available: "
-            "fin.host.compile.compile_for_runtime (ticket T8) is "
-            "required to build the durable graph"
-        ) from exc
+        raise RuntimeGraphUnavailableError(_COMPILER_UNAVAILABLE) from exc
     # Same identity the serve path gets, for the same reason: an operator-configured
     # structured-evidence identity applies to the product graph wherever it is
     # built, and a graph compiled without it silently loses structured evidence
     # while every other signal still works. Misconfigured is reported, not fatal —
     # the CLI must still answer `--help` and its other subcommands.
-    evidence = _structured_evidence_binding()
-    if evidence is None:
-        return compile_for_runtime()
-    return compile_for_runtime(evidence=evidence)
+    try:
+        return product_graph_factory(evidence_factory=_structured_evidence_binding)
+    except ProductCompilerUnavailableError as exc:
+        raise RuntimeGraphUnavailableError(_COMPILER_UNAVAILABLE) from exc
 
 
 # ----- main -----
+
+
+def _checkpoint_url() -> str:
+    bag = dict(os.environ)
+    apply_operator_settings(environ=bag)
+    return (bag.get("FIN_CHECKPOINT_URL") or "").strip()
+
+
+def backup_main(argv: list[str] | None = None) -> int:
+    """Dump the checkpoint database under ``<FIN_HOME>/backups``."""
+    from fin.host.backup import BackupError, backup_checkpoint
+
+    argparse.ArgumentParser(prog="fin backup").parse_args([] if argv is None else argv)
+    try:
+        url = _checkpoint_url()
+        if url == "":
+            raise BackupError("FIN_CHECKPOINT_URL is missing")
+        path = backup_checkpoint(source_url=url, fin_home=resolve_fin_home())
+    except (BackupError, FinHomeError, OperatorSettingsConfigError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(f"{path}\n")
+    return 0
+
+
+def restore_main(argv: list[str] | None = None) -> int:
+    """Restore one backup into an explicit destination URL."""
+    from fin.host.backup import BackupError, restore_checkpoint
+
+    parser = argparse.ArgumentParser(prog="fin restore")
+    parser.add_argument("backup_dir")
+    parser.add_argument("--destination-url", required=True)
+    args = parser.parse_args([] if argv is None else argv)
+    try:
+        url = _checkpoint_url()
+        if url == "":
+            raise BackupError("FIN_CHECKPOINT_URL is missing")
+        restore_checkpoint(
+            backup_dir=Path(args.backup_dir),
+            source_url=url,
+            destination_url=args.destination_url,
+            fin_home=resolve_fin_home(),
+        )
+    except (BackupError, FinHomeError, OperatorSettingsConfigError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("restored")
+    return 0
+
+
+def config_show_main() -> int:
+    """Print effective ``FIN_*`` values. Secret text stays off stdout."""
+    try:
+        text = format_config_show(environ=os.environ)
+    except (FinHomeError, OperatorSettingsConfigError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(text)
+    return 0
 
 
 def main(
@@ -470,8 +547,11 @@ def main(
 __all__ = [
     "CliError",
     "RuntimeGraphUnavailableError",
+    "backup_main",
+    "config_show_main",
     "main",
     "render_result",
+    "restore_main",
     "run",
     "strip_hidden_bounce_marker",
 ]

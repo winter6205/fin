@@ -1,0 +1,20 @@
+{
+  "source_ref": "zeus-aegis-installation",
+  "title": "ZEUS AEGIS Installation Card",
+  "content": "ZEUS AEGIS Installation Card · Page 1\nSection 1: Rack installation and first boot\nThe AEGIS Edge Gateway occupies 1U in a standard 19-inch rack. Leave 80 mm of clearance at the front and rear for airflow. Connect both power supplies before attaching the management cable. On first boot, the status ring flashes amber for up to 4 minutes, then turns steady blue when the device is ready. Initial setup requires firmware 4.1.0 or later; see zeus-product-guide, Section 2, for the compatibility rule. The package contains two power leads, four rack screws, and one printed safety card.",
+  "chunks": [
+    {
+      "content": "ZEUS AEGIS Installation Card · Page 1\nSection 1: Rack installation and first boot\nThe AEGIS Edge Gateway occupies 1U in a standard 19-inch rack. Leave 80 mm of clearance at the front and rear for airflow. Connect both power supplies before attaching the management cable. On first boot, the status ring flashes amber for up to 4 minutes, then turns steady blue when the device is ready. Initial setup requires firmware 4.1.0 or later; see zeus-product-guide, Section 2, for the compatibility rule. The package contains two power leads, four rack screws, and one printed safety card.",
+      "index": 0
+    }
+  ],
+  "metadata": {
+    "document_type": "product_description",
+    "page_count": 1,
+    "company": "ZEUS",
+    "form": "8-K",
+    "period": "2024-04-02",
+    "filing_date": "2024-04-02"
+  },
+  "valid_from": "2024-04-02T00:00:00Z"
+}

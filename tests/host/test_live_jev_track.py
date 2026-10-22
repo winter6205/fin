@@ -27,8 +27,8 @@ import warnings
 import pytest
 from langchain_core.messages import HumanMessage
 
-from fin.host.jev_choice import JevChoiceClient
-from fin.host.track_decision import (
+from fin.host.question.jev_choice import JevChoiceClient
+from fin.host.grounded.track_decision import (
     _JEV_TRACK_INSTRUCTIONS,
     _JEV_TRACK_LEAF_CRITERIA,
     _JEV_TRACK_OPTIONS,

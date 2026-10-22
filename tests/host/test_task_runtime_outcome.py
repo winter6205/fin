@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import pytest
 
-from fin.host.task_runtime import accept_input, apply_assessment, decide, record_cancellation
-from fin.host.task_runtime_types import (
+from fin.host.task.task_runtime import accept_input, apply_assessment, decide, record_cancellation
+from fin.host.task.task_runtime_types import (
     INPUT_MESSAGE,
     TASK_ACTIVE,
     TASK_CAPABILITY_UNSUPPORTED,

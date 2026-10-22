@@ -30,13 +30,18 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.http import app
-from fin.host.session_compaction import (
+from fin.host.session.session_compaction import (
     SESSION_TOKEN_BUDGET,
     OccupancyCompactor,
     count_tokens_approximately,
 )
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_fin_home(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("FIN_HOME", str(tmp_path / ".fin"))
 
 
 @pytest.fixture
@@ -102,13 +107,18 @@ def test_thread_detail_occupancy_matches_compactor_figure(
     created = client.post("/api/threads", json={"first_message": "q"}).json()
     _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
 
-    messages = (
+    values = (
         g._graph.get_state({"configurable": {"thread_id": created["id"]}}).values
         or {}
-    ).get("messages") or []
+    )
+    messages = values.get("messages") or []
     assert messages, "test precondition: the run must have checkpointed messages"
-    expected = OccupancyCompactor().occupancy(messages)
-    expected_tokens = count_tokens_approximately(messages)
+    overhead = g._compaction_overhead_tokens(values)
+    expected = OccupancyCompactor().occupancy(
+        messages,
+        overhead_tokens=overhead,
+    )
+    expected_tokens = count_tokens_approximately(messages) + overhead
 
     detail = client.get(f"/api/threads/{created['id']}").json()
     occ = detail["occupancy"]
@@ -150,12 +160,15 @@ def test_status_has_no_occupancy_field(client: TestClient, fresh_store) -> None:
     r = client.get("/api/status")
     assert r.status_code == 200
     body = r.json()
+    # The three lifecycle counts are aggregates with no identity, so they
+    # are admitted here; every other key still has to reopen this set.
     assert set(body.keys()) == {
         "knowledge_mcp",
         "retrieve_adapter_kind",
         "model_identity",
         "corpus_filing_count",
         "bound_collection_name",
+        "run_counts",
     }
     assert "occupancy" not in body
     assert "context_window_pct" not in body

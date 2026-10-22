@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from fin.host.jev_choice import (
+from fin.host.question.jev_choice import (
     JEV_CHOICE_EXIT_INVALID_LABEL,
     JEV_CHOICE_EXIT_INVALID_SEARCH_MODE,
     JEV_CHOICE_EXIT_LOW_CONFIDENCE,
@@ -26,8 +26,8 @@ from fin.host.jev_choice import (
     JevChoiceError,
     build_jev_client,
 )
-from fin.host.jev_config import FIN_JEV_API_KEY_ENV, JevConfig
-from fin.host.track_decision import (
+from fin.host.question.jev_config import FIN_JEV_API_KEY_ENV, JevConfig
+from fin.host.grounded.track_decision import (
     _JEV_TRACK_INSTRUCTIONS,
     _JEV_TRACK_LEAF_CRITERIA,
 )
@@ -256,7 +256,7 @@ def test_injected_transport_never_touches_urllib(
     def forbid(*args: object, **kwargs: object) -> None:
         raise AssertionError("network transport must not run")
 
-    monkeypatch.setattr("fin.host.jev_choice.urllib.request.urlopen", forbid)
+    monkeypatch.setattr("fin.host.question.jev_choice.urllib.request.urlopen", forbid)
     client = JevChoiceClient(_config(), transport=lambda payload: _answer_payload())
     choice = client.choose(utterance="q", options=OPTIONS, criteria=CRITERIA)
     assert choice.label == "clarify"

@@ -28,6 +28,7 @@ the contract-fake index-job port: the default suite stays hermetic.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Mapping
@@ -43,13 +44,25 @@ from fin.corpus.object_store import InMemoryObjectStore
 from fin.retrieve.fake_index_job_port import FakeIndexJobPort
 from fin.retrieve.fake_push_port import FakePushPort
 
-DOC = "DOC-1"
+_SCOPE = "fin-index-job-wiring"
 
 _TXT_V1 = (
     "Quarterly results overview.\n\n"
     "Revenue grew across every segment this quarter.\n\n"
     "The company reaffirmed its full-year guidance."
 ).encode("utf-8")
+
+
+def _document_id(scope: str, data: bytes) -> str:
+    """The public upload's content-derived id, written out longhand."""
+    digest = hashlib.sha256(data).digest()
+    preimage = (
+        b"fin-corpus-document-v1\x00" + scope.encode("utf-8") + b"\x00" + digest
+    )
+    return "doc_" + hashlib.sha256(preimage).hexdigest()
+
+
+DOC = _document_id(_SCOPE, _TXT_V1)
 
 
 class _CountingPushPort:
@@ -102,6 +115,7 @@ class _Stack:
             object_store=self.objects,
             metadata_store=self.pointers,
             state_store=self.states,
+            corpus_scope_id=_SCOPE,
         )
         self.journal_dir = tmp_path / "push-journal"
         self.index_port = FakeIndexJobPort()
@@ -110,9 +124,7 @@ class _Stack:
         self.tracker = IndexJobTracker(self.index_port, self.ledger)
 
     def submit(self) -> Any:
-        return self.endpoint.submit_durable(
-            _TXT_V1, declared_format="txt", document_id=DOC
-        )
+        return self.endpoint.submit_durable(_TXT_V1, declared_format="txt")
 
     def worker(self, *, tracked: bool = True) -> IngestWorker:
         kwargs: dict[str, Any] = {}

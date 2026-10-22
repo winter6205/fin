@@ -74,7 +74,7 @@ Quoted from `docs/CONTEXT.md`:
 
 ## Inherits / Changes
 
-**Inherits:** Python 3.12 + uv + pytest; `src/fin/corpus`, `src/fin/retrieve`, `src/fin/host` capability slices; retrieve port empty-miss contract; ADR 0001 port, 0013 same graph, 0020 extracted SSOT, 0021 citation gate, 0027 Soft-Track, 0028 HTML cite unit, 0029 product/eval trees, 0030 MCP retrieve, 0031 filters + fact tool; `FIN_EDGAR_USER_AGENT` recorded on the tracked change; sibling iknow-memory MCP `retrieve` tool; default pytest marks `eval` and `soft_track`.
+**Inherits:** Python 3.12 + uv + pytest; `src/fin/corpus`, `src/fin/retrieve`, `src/fin/host` capability slices; retrieve port empty-miss contract; ADR 0001 port, 0013 same graph, 0020 extracted SSOT, 0021 citation gate, 0027 Soft-Track, 0028 HTML cite unit, 0029 product/eval trees, 0030 MCP retrieve, 0031 filters + fact tool; `FIN_EDGAR_USER_AGENT` recorded in the upstream project; sibling iknow-memory MCP `retrieve` tool; default pytest marks `eval` and `soft_track`.
 
 **Changes this spec adds:** MCP retrieve adapter + BM25 archive from product path; additive catalog/retrieve filters; ingest CLI (local + gated live HTML); algorithmic OCR write-back; fact table + `get_xbrl_fact` + numeric gate; contract coverage for the new APIs.
 

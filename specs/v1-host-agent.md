@@ -47,7 +47,7 @@ Historical glossary excerpt (v1 planning):
 - Scripted final payload that cites a locator not in this run's evidence (and not in the historical fixture set) ends `refuse` with reason `unknown_locator` on the first failure (no repair).
 - A run that executes 32 agent-loop steps without `done`/`refuse` ends with status `step_cap` (not `refuse`); LangGraph `recursion_limit` is > 32 so this fuse fires first.
 - `python -m fin --help` exits 0; `python -m fin "q"` with scripted model and `InMemorySaver` prints `status` then answer then citations.
-- `docker compose config` exits 0 and defines a Postgres service whose URL matches the `FIN_CHECKPOINT_URL` example in `.env.example`.
+- `docker compose config` exits 0 and defines a Postgres service whose URL matches the `checkpoint.url` example in `settings.example.yaml`.
 - HTTP POST to the v1 ask route uses the same compiled graph object as the CLI (identity or equivalent compile helper); the handler calls sync `invoke`, not `ainvoke`.
 - With maintainer-supplied fixtures, `uv run pytest -q -m eval` collects ≥9 cases (3 fact, 3 cross-period 2023 Q1–Q3, 3 refuse) and is selected only with `-m eval`.
 

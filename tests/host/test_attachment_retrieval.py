@@ -1,4 +1,4 @@
-"""``fin.host.attachment_retrieval.ThreadAttachmentRetriever`` (G4 T3).
+"""``fin.host.attachment.attachment_retrieval.ThreadAttachmentRetriever`` (G4 T3).
 
 Behavior pinned from specs/thread-attachment-source-read.md (source-selection
 and typed-exit items) and plans/thread-attachment-source-read.md item 8:
@@ -17,7 +17,7 @@ and typed-exit items) and plans/thread-attachment-source-read.md item 8:
   address a unit ordinal the frozen rows do not carry, is a typed
   ``attachment_index_unavailable`` for the whole branch — never an empty
   success;
-* ranking is :func:`fin.host.attachment_index.search` per candidate, merged
+* ranking is :func:`fin.host.attachment.attachment_index.search` per candidate, merged
   with the deterministic key (score desc, unit asc) and clamped limit.
 
 Seeding goes through ``InMemoryAttachmentStore``'s public doors
@@ -35,9 +35,9 @@ import uuid
 import pytest
 
 from fin.corpus.object_store import InMemoryObjectStore
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_prepare import AttachmentPreparationService
-from fin.host.attachment_retrieval import (
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+from fin.host.attachment.attachment_retrieval import (
     AttachmentIndexUnavailableError,
     AttachmentLocator,
     AttachmentNotReadyError,
@@ -45,7 +45,7 @@ from fin.host.attachment_retrieval import (
     AttachmentUnknownLocatorError,
     ThreadAttachmentRetriever,
 )
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,

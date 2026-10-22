@@ -427,7 +427,7 @@ def test_refuse_01_unknown_locator_no_repair(scripted_graph_factory):
 
     Why ``AAPL-2099Q4`` and not a fully fictional ticker like
     ``FOO-2023Q1`` (the original wording pre-Soft-Track):
-    Soft-Track classifier (``fin.host.track_decision``) routes a
+    Soft-Track classifier (``fin.host.grounded.track_decision``) routes a
     filing-ask with no recognized company (``_COMPANY_CANON`` knows
     only AAPL/MSFT/AMZN) to ``clarify`` instead of ``research``, so
     the citation gate never runs. The spec intent — ``unknown_locator``

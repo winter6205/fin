@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from fin.host.compaction import (
+from fin.host.session.compaction import (
     CompactionConfigError,
     CompactionResult,
     SessionCompactor,

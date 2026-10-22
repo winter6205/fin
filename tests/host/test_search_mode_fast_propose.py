@@ -22,15 +22,17 @@ SPA renders it with zero web changes — but must never silent-apply:
   ``False``: there is no silent Fast.
 * the string ``Fast`` is NEVER a 检索档: it is not an option id in the
   mode window, an out-of-list pick there reopens (no crash), and
-  ``search_mode`` after every flow here stays ``None`` or a member of
-  ``fin.retrieve.tiers.LASTING_RETRIEVE_TIERS``.
+  ``search_mode`` after every flow here stays a member of
+  ``fin.retrieve.tiers.LASTING_RETRIEVE_TIERS`` (the routing residual
+  records ``graph`` at the ``fallback`` tier).
 * default grounded flow (no seed) and the lane-off factory default
   never open the window.
 
 Five boundary classes map to: empty -> ``test_empty_pick_reopens_window_and_keeps_standard``;
 negative -> ``test_out_of_list_pick_reopens_then_resolves``;
-overflow -> ``test_mode_window_rejects_fast_then_operator_pick_assigns_real_tier``
-(repeated cross-window picks never accumulate a Fast 档);
+overflow -> ``test_propose_window_opens_and_no_mode_window_follows``
+(the propose window is the only window: a routing residual never opens a
+second, 档 window);
 concurrent -> the 409 guard is the run-level lock already locked in
 ``test_search_mode_choice_window.py`` (this ticket adds no new HTTP
 surface); exception -> ``test_lane_off_seed_never_opens_window`` (no
@@ -50,7 +52,7 @@ from langgraph.types import Command
 
 from fin.corpus.catalog import record_filings
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.extract_method_proposal import DEFAULT_EXTRACT_METHOD
+from fin.host.question.extract_method_proposal import DEFAULT_EXTRACT_METHOD
 from fin.host.state import reset_input_state
 from fin.retrieve.tiers import LASTING_RETRIEVE_TIERS
 
@@ -59,7 +61,8 @@ pytestmark = [pytest.mark.soft_track]
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
 # Grounded by the track rules tier, unnamed by the 档 rules tier, no
-# inherit on a fresh thread -> the cascade residual ``clarify``.
+# inherit on a fresh thread -> the cascade residual records the default
+# (``graph`` at the ``fallback`` tier).
 AMBIGUOUS = "What was AAPL net sales in 2023 Q3?"
 
 _ANSWER = [AIMessage(content="Net sales grew year over year.")]
@@ -247,12 +250,17 @@ def test_out_of_list_pick_reopens_then_resolves() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_propose_then_mode_window_chain_never_yields_fast_mode() -> None:
+def test_propose_window_opens_and_no_mode_window_follows() -> None:
     """SC3 "host state does not set 检索档 to Fast" (strong form): on an
-    unpinned clarify ask the propose window opens FIRST, then the 档
-    window. A 档 id is invalid in the method window and ``fast`` is
-    invalid in the 档 window — both reopen without crashing, and the
-    final ``search_mode`` is the operator-picked 档, never Fast."""
+    unpinned ask the propose window opens FIRST and stays the ONLY window —
+    a 档 id is invalid in the method window and reopens it, and once the
+    proposal is resolved the routing residual takes the recorded default
+    instead of opening a SECOND (档) window.
+
+    The chain the old contract had (propose window → 档 window) is gone:
+    a routing uncertainty is a policy default now, never a question for
+    the operator. ``search_mode`` is the recorded default, never Fast.
+    """
     g = _compile(_ANSWER)
     tid = "fp-chain"
     out = g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid))
@@ -268,28 +276,14 @@ def test_propose_then_mode_window_chain_never_yields_fast_mode() -> None:
     # The method proposal is recorded...
     assert resolved["extract_method_proposal"]["picked"] == "fast"
     assert resolved["extract_method_proposal"]["applied"] is False
-    # ...and the run then pauses on the SECOND window: the 档 clarify
-    # window, whose option ids are the SSOT's lasting tokens
-    # (``LASTING_RETRIEVE_TIERS``), in operator order. Fast is not among
-    # them.
-    mode_payload = _interrupt_payload(resolved)
-    assert mode_payload is not None
-    assert _option_ids(mode_payload) == list(LASTING_RETRIEVE_TIERS)
+    # ...and the run does NOT pause on a 档 window: the routing residual
+    # assigns the recorded default and opens nothing.
+    assert not resolved.get("__interrupt__")
+    assert resolved["search_mode_decision"]["decision_tier"] == "fallback"
+    assert resolved["search_mode_decision"]["search_mode"] == "graph"
+    assert resolved["search_mode_decision"]["search_mode"] in LASTING_RETRIEVE_TIERS
     assert resolved["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
-
-    # "fast" is NOT a 档 id: the mode window reopens, never crash.
-    reopened = g.invoke(Command(resume="fast"), config=_cfg(tid))
-    mode_payload = _interrupt_payload(reopened)
-    assert mode_payload is not None
-    assert "fast" in mode_payload["rejected_picks"]
-    assert reopened["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
-
-    final = g.invoke(Command(resume="graph"), config=_cfg(tid))
-    assert not final.get("__interrupt__")
-    assert final["search_mode_decision"]["search_mode"] == "graph"
-    assert final["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
-    assert final["extract_method_proposal"]["picked"] == "fast"
-    assert final["extract_method_proposal"]["applied"] is False
+    assert resolved["search_mode_decision"]["options"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +336,12 @@ def test_lane_off_seed_never_opens_window() -> None:
 
 
 def _catalog_row(**overrides: object) -> dict[str, object]:
+    # ``title`` and ``doc_type`` are required non-empty fields of the T6
+    # row contract.
     row: dict[str, object] = {
         "document_id": "AAPL-2022Q3",
+        "title": "Apple filing",
+        "doc_type": "narrative",
         "company": "Apple",
         "period": "2022 Q3",
         "version": "a" * 64,

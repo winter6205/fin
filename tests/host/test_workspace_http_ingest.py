@@ -7,9 +7,11 @@ are durable (raw object, metadata pointer, ``pending`` job record,
 The outcome is polled at ``GET /api/corpus/ingest/{job_id}``, which returns the
 persisted state, never a constant. Coverage follows the boundary classes:
 
-* accept happy path — supported upload -> 200 accepted, state pending, no push;
-* identity — ``company``+``period`` derive ``{TICKER}-{FYQ}``; missing both is
-  the named ``document_id_missing`` 422; the filename never names the document;
+* accept happy path — a file-only upload -> 200 accepted, state pending, no
+  parse or push;
+* identity — the trusted scope plus the content digest derive the id; optional
+  ``title``/``company``/``period`` metadata never changes it; a caller-supplied
+  ``document_id`` is the named ``document_id_not_allowed`` 422;
 * empty class — missing file part is a named 4xx;
 * negative class — unsupported format is a named 415 refused BEFORE any write;
 * overflow class — one byte over the pinned 50 MiB cap is a named 413, exact
@@ -46,6 +48,7 @@ from fin.corpus.object_store import (
     ObjectPointer,
     ObjectStoreUnavailableError,
 )
+from fin.corpus.upload_metadata import derive_document_identity
 from fin.retrieve.fake_index_job_port import FakeIndexJobPort
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.host.workspace_http import get_index_job_tracker, get_ingest_service
@@ -138,6 +141,7 @@ def _install(
     pointers: Any = None,
     states: Any = None,
     max_bytes: int | None = None,
+    on_ingested: Any = None,
 ) -> _Stack:
     objects = objects if objects is not None else _RecordingObjectStore()
     pointers = (
@@ -147,9 +151,11 @@ def _install(
         states if states is not None else InMemoryIngestStateStore()
     )
     push = FakePushPort()
-    kwargs: dict[str, Any] = {}
+    kwargs: dict[str, Any] = {"corpus_scope_id": "test-scope"}
     if max_bytes is not None:
         kwargs["max_bytes"] = max_bytes
+    if on_ingested is not None:
+        kwargs["on_ingested"] = on_ingested
     endpoint = IngestEndpoint(
         push_port=push,
         invalidation_port=push,
@@ -183,8 +189,14 @@ def _post(
     return client.post(
         "/api/corpus/ingest",
         files={"file": (name, data, content_type)},
-        data=form if form is not None else {"company": "AAPL", "period": "2023Q3"},
+        data=form if form is not None else {},
     )
+
+
+def _expected_id(data: bytes = _MD_BYTES) -> str:
+    return derive_document_identity(
+        data, corpus_scope_id="test-scope", filename=None
+    ).document_id
 
 
 # ----- accept happy path --------------------------------------------------
@@ -200,7 +212,8 @@ def test_accepted_upload_persists_the_four_items_and_pushes_nothing(
     body = response.json()
     assert body["status"] == "accepted"
     assert body["state"] == "pending"
-    assert body["document_id"] == "AAPL-2023Q3"
+    assert body["document_id"] == _expected_id()
+    assert body["document_id"].startswith("doc_")
     assert body["job_id"] == body["document_id"]
     assert body["version"]
 
@@ -211,42 +224,60 @@ def test_accepted_upload_persists_the_four_items_and_pushes_nothing(
     assert stack.states.get_job(body["document_id"]).state is IngestState.PENDING
 
 
-def test_document_id_is_ticker_plus_fiscal_period_and_case_normalizing(
-    http_app: FastAPI, client: TestClient
-) -> None:
-    _install(http_app)
-    response = _post(
-        client, form={"company": "aapl", "period": "2022q3"}
-    )
-    assert response.status_code == 200
-    assert response.json()["document_id"] == "AAPL-2022Q3"
-
-
-def test_explicit_document_id_wins_over_metadata(
+def test_optional_metadata_never_changes_the_identity(
     http_app: FastAPI, client: TestClient
 ) -> None:
     _install(http_app)
     response = _post(
         client,
-        form={"document_id": "0000950123-22-000100", "company": "AAPL", "period": "2022Q3"},
+        form={
+            "company": "aapl",
+            "period": "2022q3",
+            "title": "Quarterly report",
+            "doc_type": "narrative",
+        },
     )
     assert response.status_code == 200
-    assert response.json()["document_id"] == "0000950123-22-000100"
+    assert response.json()["document_id"] == _expected_id()
+
+
+def test_explicit_document_id_is_rejected_before_any_write(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    """A caller-chosen id is refused before writes, legacy flag or not."""
+    stack = _install(http_app)
+    for legacy in ({}, {"generic": "true"}, {"generic": "false"}):
+        response = _post(
+            client,
+            form={
+                "document_id": "0000950123-22-000100",
+                "company": "AAPL",
+                "period": "2022Q3",
+                **legacy,
+            },
+        )
+
+        assert response.status_code == 422
+        assert response.json()["error"] == "document_id_not_allowed"
+        assert stack.objects.puts == []
+        assert stack.push.written_total() == 0
 
 
 # ----- identity failures (nothing persisted) ------------------------------
 
 
-def test_missing_metadata_pair_is_document_id_missing_422(
+def test_the_legacy_generic_field_cannot_select_another_path(
     http_app: FastAPI, client: TestClient
 ) -> None:
-    stack = _install(http_app)
-    response = _post(client, form={})
-
-    assert response.status_code == 422
-    assert response.json()["error"] == "document_id_missing"
-    assert stack.objects.puts == []
-    assert stack.push.written_total() == 0
+    """An old client's ``generic`` field is ignored: both values (and its
+    absence) accept the same bytes under the same content-derived id."""
+    _install(http_app)
+    absent = _post(client)
+    for value in ("true", "false"):
+        response = _post(client, form={"generic": value})
+        assert response.status_code == 200
+        assert response.json()["document_id"] == absent.json()["document_id"]
+        assert response.json()["version"] == absent.json()["version"]
 
 
 # ----- empty class --------------------------------------------------------
@@ -300,7 +331,7 @@ def test_unsupported_declared_format_is_a_named_415(
         name="blob.bin",
         data=b"some bytes",
         content_type="application/octet-stream",
-        form={"company": "AAPL", "period": "2023Q3", "format": "rtf"},
+        form={"format": "rtf"},
     )
     assert response.status_code == 415
     assert response.json()["error"] == "unsupported_format"
@@ -312,7 +343,7 @@ def test_unknown_doc_type_is_a_named_422(
 ) -> None:
     stack = _install(http_app)
     response = _post(
-        client, form={"company": "AAPL", "period": "2023Q3", "doc_type": "bogus"}
+        client, form={"doc_type": "bogus"}
     )
     assert response.status_code == 422
     assert response.json()["error"] == "invalid_doc_type"
@@ -382,28 +413,33 @@ def test_same_version_resubmission_joins_the_job_without_a_second_write(
     assert len(stack.objects.puts) == 1
 
 
-def test_different_version_while_in_flight_is_a_typed_conflict(
+def test_different_bytes_are_a_separate_document_not_a_conflict(
     http_app: FastAPI, client: TestClient
 ) -> None:
+    """Content identity makes different bytes a different document: the
+    public door has no way to claim a second version of one document."""
     stack = _install(http_app)
-    accepted = _post(client)
-    doc_id = accepted.json()["document_id"]
-    before = list(stack.objects.puts)
+    first = _post(client)
+    second = _post(client, data=b"different bytes entirely for the door\n")
 
-    conflict = _post(client, data=b"different bytes entirely for the door\n")
-    assert conflict.status_code == 409
-    assert conflict.json()["error"] == "concurrent_run"
-    assert stack.objects.puts == before
-    assert stack.states.get_job(doc_id).state is IngestState.PENDING
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["document_id"] != first.json()["document_id"]
+    assert second.json()["version"] != first.json()["version"]
+    assert len(stack.objects.puts) == 2
+    assert stack.states.get_job(first.json()["document_id"]).state is (
+        IngestState.PENDING
+    )
+    assert stack.states.get_job(second.json()["document_id"]).state is (
+        IngestState.PENDING
+    )
 
 
-def test_replacing_a_ready_document_is_accepted_and_reopens_the_job(
+def test_a_ready_document_and_a_new_version_coexist_as_separate_documents(
     http_app: FastAPI, client: TestClient
 ) -> None:
-    # The settled replacement: a different version of a ``ready`` source is
-    # accepted, the document's one job reopens as a fresh ``pending``
-    # generation, and the status poll reports the new version — never a
-    # second logical version coexisting with the replaced one.
+    """Existing records are never renamed or merged: new bytes land under
+    their own content-derived id while the ready document stays ready."""
     stack = _install(http_app)
     accepted = _post(client)
     doc_id = accepted.json()["document_id"]
@@ -419,15 +455,13 @@ def test_replacing_a_ready_document_is_accepted_and_reopens_the_job(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["job_id"] == accepted.json()["job_id"] == doc_id
+    assert body["document_id"] != doc_id
     assert body["state"] == "pending"
     assert body["version"] != accepted.json()["version"]
-    assert stack.states.get_job(doc_id).state is IngestState.PENDING
     polled = client.get(f"/api/corpus/ingest/{doc_id}")
     assert polled.status_code == 200
-    assert polled.json()["version"] == body["version"]
-    assert polled.json()["state"] == "pending"
-    assert polled.json()["text_ready"] is False
+    assert polled.json()["state"] == "ready"
+    assert polled.json()["text_ready"] is True
 
 
 # ----- accept-time persistence outages -----------------------------------
@@ -442,7 +476,7 @@ def test_object_store_outage_is_a_typed_503_with_no_accepted_job(
     assert response.status_code == 503
     assert response.json()["error"] == "durable_commit_failed"
     with pytest.raises(Exception):
-        states.get_job("AAPL-2023Q3")
+        states.get_job(_expected_id())
 
 
 def test_pointer_commit_failure_leaves_no_accepted_job_and_deletes_the_object(
@@ -457,7 +491,7 @@ def test_pointer_commit_failure_leaves_no_accepted_job_and_deletes_the_object(
     assert len(objects.puts) == 1
     assert objects.deletes == objects.puts
     with pytest.raises(Exception):
-        states.get_job("AAPL-2023Q3")
+        states.get_job(_expected_id())
 
 
 def test_state_record_failure_rolls_back_and_deletes_the_object(
@@ -706,3 +740,142 @@ def test_default_ingest_service_wires_the_durable_ports_in_both_kinds(
         service = _build_default_ingest_service()
         assert service.state_store is not None
         assert service._on_ingested is not None
+
+
+def test_the_default_service_injects_a_nonempty_corpus_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identity needs a scope; the product assembly never leaves it blank."""
+    from fin.host.workspace_http import _build_default_ingest_service
+
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
+    monkeypatch.delenv("FIN_CORPUS_SCOPE_ID", raising=False)
+    service = _build_default_ingest_service()
+
+    assert service._corpus_scope_id
+    assert service._corpus_scope_id == "fin-default"
+
+
+# ----- single public flow -------------------------------------------------
+
+
+def test_a_file_only_upload_needs_no_metadata(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    stack = _install(http_app)
+    response = _post(client, name="Team Handbook.md")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "accepted"
+    assert body["document_id"] == _expected_id()
+    assert "team" not in body["document_id"]
+    assert len(stack.objects.puts) == 1
+
+
+def test_blank_optional_metadata_is_absent_not_an_error(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    _install(http_app)
+    response = _post(
+        client,
+        form={"title": "", "company": "   ", "period": ""},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["document_id"] == _expected_id()
+
+
+def test_wildcard_metadata_is_refused_before_any_write(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    stack = _install(http_app)
+    response = _post(client, name="a.md", form={"company": "Acme*"})
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_upload_metadata"
+    assert stack.objects.puts == []
+
+
+def test_acceptance_returns_before_execution_and_status_reads_do_not_execute(
+    http_app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The request only accepts: parse/chunk/push run off it, and a status
+    poll is observational rather than the thing that starts the work."""
+    stack = _install(http_app)
+    ran: list[str] = []
+    monkeypatch.setattr(
+        stack.endpoint, "run_durable", lambda doc_id: ran.append(doc_id)
+    )
+
+    accepted = _post(client)
+    assert accepted.status_code == 200
+    assert ran == []
+    assert stack.push.written_total() == 0
+
+    polled = client.get(f"/api/corpus/ingest/{accepted.json()['document_id']}")
+    assert polled.status_code == 200
+    assert ran == []
+    assert stack.push.written_total() == 0
+
+
+def test_an_unconfigured_scope_refuses_rather_than_minting(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    """The route's service is always built with a scope; a service built
+    without one refuses the upload rather than minting an identity.
+
+    The refusal is a ``ValueError`` from the identity derivation, which is
+    a wiring bug rather than a named upload failure, so it is an unhandled
+    500 — the assertion is that it never becomes a silent 200 with an
+    unscoped identity."""
+    push = FakePushPort()
+    endpoint = IngestEndpoint(
+        push_port=push,
+        object_store=InMemoryObjectStore(),
+        metadata_store=InMemoryMetadataStore(),
+        state_store=InMemoryIngestStateStore(),
+    )
+    http_app.dependency_overrides[get_ingest_service] = lambda: endpoint
+
+    with pytest.raises(ValueError):
+        _post(client, name="a.md")
+
+
+# ----- warning on poll ----------------------------------------------------
+
+
+def test_a_catalog_failure_polls_a_typed_warning_over_http(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    from fin.corpus.errors import CatalogRowError
+
+    def boom(doc: Any) -> None:
+        raise CatalogRowError("title is empty")
+
+    stack = _install(http_app, on_ingested=boom)
+    accepted = _post(client).json()
+    doc_id = accepted["document_id"]
+    stack.endpoint.run_durable(doc_id)
+
+    body = client.get(f"/api/corpus/ingest/{doc_id}").json()
+    assert body["state"] == "cataloging"
+    assert body["catalog_warning"] == {
+        "code": "catalog_publication_failed",
+        "attempts": 1,
+        "failure_code": "catalog_row_invalid",
+        "failure_stage": "validate",
+    }
+    assert body["catalog_warning_count"] == 1
+
+
+def test_a_healthy_poll_carries_no_catalog_warning(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    _install(http_app)
+    accepted = _post(client).json()
+
+    body = client.get(f"/api/corpus/ingest/{accepted['document_id']}").json()
+
+    assert body["catalog_warning"] is None
+    assert body["catalog_warning_count"] == 0

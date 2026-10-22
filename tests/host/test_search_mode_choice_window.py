@@ -1,17 +1,26 @@
-"""Choice-window HITL after grounded clarify (spec search-mode-host, Ticket 2).
+"""Choice-window HITL after the grounded routing residual (spec
+search-mode-host, ADR 0104).
 
 Opt-in only (``uv run pytest -q -m soft_track``; deselected by default —
 ``tests/host/conftest.py``). ScriptedChatModel + InMemorySaver only, no
 live LLM (mirrors ``test_search_mode_cascade.py``).
 
-Contract covered here (ADR 0062 HITL, spec SC2 "clarify window" + SC4):
+Contract covered here (ADR 0062 HITL, ADR 0104, spec SC2 "choice window"
++ SC4):
 
-* grounded + ``decision_tier == "clarify"`` pauses the run BEFORE any
-  model / retrieve call on a LangGraph ``interrupt`` whose payload is
-  the choice window (``kind`` + non-empty ``options`` of ``{id,label}``;
-  since the tracked change T7 (6e8ed97) opened sql every lasting 档 renders marked
-  opened — the ``opened`` flag reads the emptied ``TIER_UNAVAILABLE_CODE``
-  SSOT and nothing else).
+* a routing residual NEVER opens a 档 window: the cascade assigns the
+  recorded default (``graph``) at the ``fallback`` tier with
+  ``confidence=0.0`` and NO options, so no client can render a picker
+  out of it. The window machinery itself is unchanged and still exercised
+  by the windows that DO open: the Fast 抽图 propose window and a window
+  opened by an EARLIER build (a checkpoint still carrying a
+  ``decision_tier="clarify"`` audit).
+* a window opened by an earlier build pauses the run BEFORE any model /
+  retrieve call on a LangGraph ``interrupt`` whose payload is the choice
+  window (``kind`` + non-empty ``options`` of ``{id,label}``; since T7
+  (6e8ed97) opened sql every lasting 档 renders marked opened — the
+  ``opened`` flag reads the emptied ``TIER_UNAVAILABLE_CODE`` SSOT and
+  nothing else).
 * ``Command(resume=pick)`` assigns the picked 档 (auditable
   ``decision_tier="operator_pick"`` + ``signals.resume_pick``) and the
   grounded leaf then proceeds (retrieve runs).
@@ -33,7 +42,7 @@ Contract covered here (ADR 0062 HITL, spec SC2 "clarify window" + SC4):
   this is what keeps the default-collected suites green.
 
 Five boundary classes (spec Boundaries "Test classes") map to:
-empty -> ``test_ambiguous_grounded_ask_opens_choice_window`` (an ask
+empty -> ``test_ambiguous_grounded_ask_never_opens_a_mode_window`` (an ask
 the cascade cannot name IS the empty/residual input here);
 negative -> ``test_invalid_pick_reopens_window_then_valid_pick_resolves``
 (out-of-list picks and retired letters name no option and assign
@@ -43,7 +52,7 @@ overflow -> ``test_invalid_pick_reopens_window_then_valid_pick_resolves``
 (repeated picks never accumulate a 档 — no silent default under any
 number of retries);
 concurrent -> ``test_send_while_choice_pending_returns_409``;
-exception -> ``test_choice_window_off_by_default_grounded_clarify_completes``
+exception -> ``test_choice_window_off_by_default_grounded_fallback_completes``
 (no interrupt machinery runs when the lane is off).
 """
 
@@ -72,6 +81,16 @@ AMBIGUOUS = "What was AAPL net sales in 2023 Q3?"
 PENDING_TURN_UNAVAILABLE_DETAIL = (
     "Pending question is temporarily unavailable. Retry opening the thread."
 )
+
+# The choice-window payload the 409 stand-in below runs on. A choice
+# window carries ``kind`` plus a NON-EMPTY ``options`` of ``{id, label}``
+# — the payload contract this file pins in the graph lane — so the
+# unattended surface is proven against a payload a production path can
+# actually emit.
+PENDING_CHOICE_WINDOW_PAYLOAD: dict[str, Any] = {
+    "kind": "choice_window",
+    "options": [{"id": "graph", "label": "知识问答", "opened": True}],
+}
 
 
 def _cfg(thread_id: str, **configurable: Any) -> dict:
@@ -119,27 +138,71 @@ _RETRIEVE_CALL = AIMessage(
 
 
 # ---------------------------------------------------------------------------
-# graph lane: the clarify residual pauses on the choice window
+# graph lane: the routing residual NEVER opens a mode window
 # ---------------------------------------------------------------------------
 
+# A window opened by an EARLIER build: the cascade no longer emits
+# ``clarify``, but a checkpoint written before the fallback policy still
+# carries one, and the pick/resume node must keep serving it (ADR 0104
+# keeps the node for exactly this case).
+_LEGACY_MODE_WINDOW_AUDIT: dict[str, Any] = {
+    "search_mode": None,
+    "confidence": 0.0,
+    "decision_tier": "clarify",
+    "signals": {"clarify": True, "utterance_len": 33},
+    "options": [
+        {"id": "lexical", "label": "查找", "opened": True},
+        {"id": "graph", "label": "知识问答", "opened": True},
+        {"id": "global", "label": "综述", "opened": True},
+        {"id": "sql", "label": "真数据库", "opened": True},
+    ],
+    "failure_code": None,
+}
 
-def test_ambiguous_grounded_ask_opens_choice_window() -> None:
+
+def _seed_legacy_mode_window(g: Any, thread_id: str) -> None:
+    """Write the pre-fallback pending window into the thread's checkpoint
+    (as a classify node's output) so the pick/resume lane is exercised on
+    a state an earlier build could really have left behind."""
+    g._graph.update_state(
+        _cfg(thread_id),
+        {"track": "grounded", "search_mode_decision": _LEGACY_MODE_WINDOW_AUDIT},
+        as_node="classify",
+    )
+
+
+def test_ambiguous_grounded_ask_never_opens_a_mode_window() -> None:
+    """A grounded ask the cascade cannot name is a POLICY decision, not a
+    question for the operator: the run does NOT pause, the recorded
+    default is assigned, and the decision carries no options — so no
+    client can render a mode picker out of it."""
     g = _compile(_ANSWER)
     out = g.invoke(_input(AMBIGUOUS), config=_cfg("cw-ambiguous"))
-    payload = _interrupt_payload(out)
-    assert payload is not None
+    assert not out.get("__interrupt__")
     assert out["track"] == "grounded"
-    assert out["search_mode_decision"]["decision_tier"] == "clarify"
-    # The pause happens BEFORE the grounded leaf ever runs.
-    assert out["step_count"] == 0
+    audit = out["search_mode_decision"]
+    assert audit["decision_tier"] == "fallback"
+    assert audit["search_mode"] == "graph"
+    assert audit["confidence"] == 0.0
+    assert audit["options"] == []
+    # The run PROCEEDED past the former pause point: ``step_count``
+    # counts model-node entries, so a run that stopped at a window never
+    # reaches one. The counter is therefore at least 1 here — a run that
+    # paused again would carry none.
+    assert out["step_count"] >= 1
 
 
 def test_choice_window_payload_contract_ids_and_labels() -> None:
     """Payload contract (spec SC2 "choice window payload"): the host/
     graph payload alone must carry ``kind`` + non-empty ``options`` of
-    ``{id, label}`` — no painted SPA is consulted anywhere here."""
+    ``{id, label}`` — no painted SPA is consulted anywhere here.
+
+    The window that still opens (a pending one from an earlier build)
+    keeps that contract byte for byte."""
     g = _compile(_ANSWER)
-    out = g.invoke(_input(AMBIGUOUS), config=_cfg("cw-contract"))
+    tid = "cw-contract"
+    _seed_legacy_mode_window(g, tid)
+    out = g.invoke(None, config=_cfg(tid))
     payload = _interrupt_payload(out)
     assert payload is not None
     assert payload["kind"] == "choice_window"
@@ -151,7 +214,7 @@ def test_choice_window_payload_contract_ids_and_labels() -> None:
     # The ids are the LASTING tokens: the value a pick resumes with is
     # already the value the audit and the port carry.
     assert [o["id"] for o in options] == ["lexical", "graph", "global", "sql"]
-    # 真数据库 opened at the tracked change T7 (commit 6e8ed97): the old pin was
+    # 真数据库 opened at T7 (commit 6e8ed97): the old pin was
     # ``[True, True, True, False]`` with sql the unopened plan slot; the
     # flag reads the emptied ``TIER_UNAVAILABLE_CODE`` SSOT, so ALL FOUR
     # now render opened — and the window can no longer offer an option
@@ -164,7 +227,8 @@ def test_resume_pick_assigns_mode_and_grounded_retrieves() -> None:
     (auditable operator pick) and the grounded leaf then proceeds."""
     g = _compile([_RETRIEVE_CALL, AIMessage(content="Per the filings: net sales grew.")])
     tid = "cw-resume-pick"
-    out = g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+    _seed_legacy_mode_window(g, tid)
+    out = g.invoke(None, config=_cfg(tid))
     assert _interrupt_payload(out) is not None
 
     # The pick rides the window's own option id and is matched against it
@@ -197,7 +261,8 @@ def test_invalid_pick_reopens_window_then_valid_pick_resolves() -> None:
     client's ``B`` is reopened, not quietly read as 知识问答."""
     g = _compile(_ANSWER)
     tid = "cw-invalid-pick"
-    out = g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+    _seed_legacy_mode_window(g, tid)
+    out = g.invoke(None, config=_cfg(tid))
     assert _interrupt_payload(out) is not None
 
     again = g.invoke(Command(resume="Z"), config=_cfg(tid))
@@ -223,7 +288,7 @@ def test_invalid_pick_reopens_window_then_valid_pick_resolves() -> None:
 
 
 def test_pick_of_the_opened_sql_tier_assigns_it_never_a_substitute() -> None:
-    """Flipped by the tracked change T7 (commit 6e8ed97): the old pin asserted a pick
+    """Flipped by T7 (commit 6e8ed97): the old pin asserted a pick
     of the unopened sql exited ``typed_fail`` + ``real_db_not_wired`` +
     ``search_mode=None``. sql is open now, so the window's marked-open
     option and the assigned 档 agree — and the invariant that survives
@@ -234,7 +299,8 @@ def test_pick_of_the_opened_sql_tier_assigns_it_never_a_substitute() -> None:
     would refuse."""
     g = _compile(_ANSWER)
     tid = "cw-sql-pick"
-    out = g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+    _seed_legacy_mode_window(g, tid)
+    out = g.invoke(None, config=_cfg(tid))
     payload = _interrupt_payload(out)
     assert payload is not None
 
@@ -254,7 +320,8 @@ def test_pick_of_the_opened_sql_tier_assigns_it_never_a_substitute() -> None:
             continue
         one = _compile(_ANSWER)
         one_thread = f"cw-agree-{option['id']}"
-        one.invoke(_input(AMBIGUOUS), config=_cfg(one_thread))
+        _seed_legacy_mode_window(one, one_thread)
+        one.invoke(None, config=_cfg(one_thread))
         resolved = one.invoke(
             Command(resume=option["id"]), config=_cfg(one_thread)
         )
@@ -270,7 +337,8 @@ def test_pick_of_the_opened_综述_assigns_global() -> None:
     option and the assigned 档 agree."""
     g = _compile(_ANSWER)
     tid = "cw-global-pick"
-    g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+    _seed_legacy_mode_window(g, tid)
+    g.invoke(None, config=_cfg(tid))
     done = g.invoke(Command(resume="global"), config=_cfg(tid))
     assert not done.get("__interrupt__")
     audit = done["search_mode_decision"]
@@ -288,7 +356,8 @@ def test_lowercase_lasting_token_pick_resolves() -> None:
     for spelling in ("graph", "GRAPH", " Graph "):
         g = _compile(_ANSWER)
         tid = f"cw-lowercase-pick-{spelling.strip()}"
-        g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+        _seed_legacy_mode_window(g, tid)
+        g.invoke(None, config=_cfg(tid))
         done = g.invoke(Command(resume=spelling), config=_cfg(tid))
         assert not done.get("__interrupt__"), spelling
         audit = done["search_mode_decision"]
@@ -322,15 +391,17 @@ def test_pin_assigns_mode_without_window() -> None:
     assert audit["signals"].get("pinned") is True
 
 
-def test_choice_window_off_by_default_grounded_clarify_completes() -> None:
-    """Factory default OFF keeps the pre-T2 flow: the clarify residual
+def test_choice_window_off_by_default_grounded_fallback_completes() -> None:
+    """Factory default OFF keeps the pre-T2 flow: the routing residual
     runs through to the grounded leaf without any interrupt (this is
-    what keeps the default-collected suites green)."""
+    what keeps the default-collected suites green) — and the lane flag
+    does not change WHAT the residual decides."""
     g = _compile([AIMessage(content="Net sales grew.")], choice_window=False)
     out = g.invoke(_input(AMBIGUOUS), config=_cfg("cw-off"))
     assert not out.get("__interrupt__")
-    assert out["search_mode_decision"]["decision_tier"] == "clarify"
-    assert out["search_mode_decision"]["search_mode"] is None
+    assert out["search_mode_decision"]["decision_tier"] == "fallback"
+    assert out["search_mode_decision"]["search_mode"] == "graph"
+    assert out["search_mode_decision"]["options"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +477,12 @@ def _new_thread(client: TestClient) -> str:
     return created["id"]
 
 
+def _propose_body() -> dict[str, Any]:
+    """The Fast 抽图 propose request — the window that still opens on the
+    wire (the routing residual never opens one any more)."""
+    return {"question": AMBIGUOUS, "propose_extract_method": "fast"}
+
+
 def test_send_streams_choice_window_event(
     client: TestClient, store, http_app: FastAPI
 ) -> None:
@@ -416,7 +493,7 @@ def test_send_streams_choice_window_event(
     thread_id = _new_thread(client)
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/event-stream")
@@ -433,6 +510,37 @@ def test_send_streams_choice_window_event(
     assert "citations" not in names
 
 
+def test_send_never_streams_a_mode_window_and_carries_the_fallback(
+    client: TestClient, store, http_app: FastAPI
+) -> None:
+    """A routing residual is a POLICY decision on the wire too: the send
+    runs through (no ``choice_window`` frame) and the terminal status
+    frame carries the whole fallback audit — the tier, the recorded
+    default, the judge's own signals and the EMPTY options, so no client
+    can render a mode picker out of the receipt."""
+    _install_window_graph(http_app, _ANSWER)
+    thread_id = _new_thread(client)
+    r = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": AMBIGUOUS},
+    )
+    assert r.status_code == 200
+    events = _parse_sse_events(r.text)
+    names = [name for name, _ in events]
+    assert "choice_window" not in names
+    assert names[-1] == "citations"
+    status_frame = next(data for name, data in events if name == "status")
+    audit = status_frame["search_mode_decision"]
+    assert audit["decision_tier"] == "fallback"
+    assert audit["search_mode"] == "graph"
+    assert audit["confidence"] == 0.0
+    assert audit["options"] == []
+    # The judge was reached and refused (no client in this lane): the EXIT
+    # survives the projection unchanged.
+    assert audit["signals"].get("mode_jev_exit") == "no_jev_client"
+    assert "mode_jev_label" not in audit["signals"]
+
+
 def test_send_while_choice_pending_returns_409(
     client: TestClient, store, http_app: FastAPI
 ) -> None:
@@ -442,12 +550,12 @@ def test_send_while_choice_pending_returns_409(
     thread_id = _new_thread(client)
     first = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert first.status_code == 200
     second = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert second.status_code == 409
     assert second.json() == {"error": "concurrent_run"}
@@ -463,12 +571,12 @@ def test_resume_with_pick_streams_the_completed_run(
     thread_id = _new_thread(client)
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert _parse_sse_events(r.text)[-1][0] == "choice_window"
 
     resumed = client.post(
-        f"/api/threads/{thread_id}/resume", json={"pick": "graph"}
+        f"/api/threads/{thread_id}/resume", json={"pick": "fast"}
     )
     assert resumed.status_code == 200
     assert resumed.headers["content-type"].startswith("text/event-stream")
@@ -482,8 +590,11 @@ def test_resume_with_pick_streams_the_completed_run(
     audit = installed._graph.get_state(
         _cfg(thread_id)
     ).values["search_mode_decision"]
+    # The 档 pick belongs to the method window; the 档 itself is the
+    # routing residual's recorded default.
     assert audit["search_mode"] == "graph"
-    assert audit["decision_tier"] == "operator_pick"
+    assert audit["decision_tier"] == "fallback"
+    assert audit["options"] == []
 
 
 def test_resume_without_pick_reemits_the_window(
@@ -496,7 +607,7 @@ def test_resume_without_pick_reemits_the_window(
     thread_id = _new_thread(client)
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
 
@@ -518,7 +629,7 @@ def test_get_thread_projects_pending_choice_when_turn_table_is_empty(
 
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert sent.status_code == 200
     events = _parse_sse_events(sent.text)
@@ -564,7 +675,7 @@ def test_get_thread_replaces_pending_projection_after_choice_resume(
 
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert sent.status_code == 200
     events = _parse_sse_events(sent.text)
@@ -578,7 +689,7 @@ def test_get_thread_replaces_pending_projection_after_choice_resume(
     assert [run.id for run in store.list_runs(thread_id)] == ["earlier-run"]
 
     resumed = client.post(
-        f"/api/threads/{thread_id}/resume", json={"pick": "graph"}
+        f"/api/threads/{thread_id}/resume", json={"pick": "fast"}
     )
     assert resumed.status_code == 200
     assert _parse_sse_events(resumed.text)[-1][0] == "citations"
@@ -669,7 +780,7 @@ def test_get_thread_live_lock_suppresses_pending_choice_projection(
     g = _install_window_graph(http_app, _ANSWER)
     thread_id = _new_thread(client)
     run = g.stream(
-        _input(AMBIGUOUS),
+        {**_input(AMBIGUOUS), "extract_method_proposal": {"proposed": "fast"}},
         config=_cfg(thread_id, run_id="live-choice-run"),
         stream_mode="values",
     )
@@ -705,7 +816,7 @@ def test_get_thread_checkpoint_read_failure_is_actionable_503(
     thread_id = _new_thread(client)
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
 
@@ -745,7 +856,7 @@ def test_get_thread_rejects_malformed_pending_choice_checkpoint(
     private_question = f"{AMBIGUOUS} PRIVATE-QUESTION-SENTINEL"
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": private_question},
+        json={**_propose_body(), "question": private_question},
     )
     assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
 
@@ -802,7 +913,7 @@ def test_get_thread_non_string_human_question_is_not_malformed(
     thread_id = _new_thread(client)
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
 
@@ -882,7 +993,7 @@ def test_get_thread_projection_failure_logs_the_typed_cause(
     thread_id = _new_thread(client)
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS},
+        json=_propose_body(),
     )
     assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
 
@@ -928,11 +1039,57 @@ def test_bodyless_resume_on_fresh_thread_still_204(
     assert r.status_code == 204
 
 
+def test_ask_answers_a_routing_residual_instead_of_pausing(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    """A routing residual is not a pause any more, so the unattended
+    surface ANSWERS it: the run proceeds on the recorded default and the
+    reply is a normal (non-``choice_pending``) answer."""
+    _install_window_graph(http_app, _ANSWER)
+    r = client.post("/ask", json={"question": AMBIGUOUS})
+    assert r.status_code == 200
+    assert r.json()["status"] in ("done", "refuse")
+    assert "error" not in r.json()
+
+
 def test_ask_answers_choice_pending_409(http_app: FastAPI, client: TestClient) -> None:
     """The unattended ``POST /ask`` sync-invoke contract with the HITL
-    lane on: a clarify ask PAUSES (never a silent 档) and the surface
-    answers the typed 409 ``choice_pending``."""
-    _install_window_graph(http_app, _ANSWER)
+    lane on: a PAUSED run is never answered on the operator's behalf —
+    the surface answers the typed 409 ``choice_pending`` and closes
+    nothing.
+
+    The paused run is STOOD IN for (the same technique the pending
+    projection test below uses for the GET seam): the only window a plain
+    run opens is the Fast propose window, and ``/ask`` has no field to
+    seed it, while the 档 window is legacy-only (ADR 0104) and the
+    cascade never opens one. The contract under test is the SURFACE's
+    refusal, not the window's.
+    """
+    from langgraph.types import Interrupt
+
+    from fin.host.http import get_graph
+
+    # The stand-in must be a payload the surface can really receive: a
+    # choice window offers NON-EMPTY ``{id, label}`` options (the
+    # payload contract this file pins in the graph lane). Proving the 409
+    # against an empty ``options`` list would prove it against a fiction
+    # no production path emits.
+    assert PENDING_CHOICE_WINDOW_PAYLOAD["kind"] == "choice_window"
+    options = PENDING_CHOICE_WINDOW_PAYLOAD["options"]
+    assert options, "the stood-in choice window must offer options"
+    for option in options:
+        assert set(option) >= {"id", "label"}
+        assert option["id"] and option["label"]
+
+    class _PausedGraph:
+        def invoke(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "__interrupt__": [
+                    Interrupt(value=PENDING_CHOICE_WINDOW_PAYLOAD)
+                ]
+            }
+
+    http_app.dependency_overrides[get_graph] = lambda: _PausedGraph()
     r = client.post("/ask", json={"question": AMBIGUOUS})
     assert r.status_code == 409
     assert r.json() == {"error": "choice_pending"}

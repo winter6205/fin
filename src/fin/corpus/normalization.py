@@ -3,7 +3,7 @@
 Spec SC17: the normalization of frozen text — whitespace, Unicode
 compatibility, hyphens, soft line breaks — is produced by **one** rule
 outlet, and frozen-unit text and chunk text share it. The citation gate
-(``fin.host.citation_gate``) matches spans verbatim (a plain ``in``
+(``fin.host.grounded.citation_gate``) matches spans verbatim (a plain ``in``
 substring search with no normalization of its own), so this module is
 the gate's compatibility surface: both sides of every substring
 assertion must come from here.

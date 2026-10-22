@@ -55,9 +55,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import ExtractedPage, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.citation_gate import COMPANY_KIND
+from fin.host.grounded.citation_gate import COMPANY_KIND
 from fin.host.thread_store import InMemoryThreadStore, RunRecord
-from fin.host.visual_evidence import (
+from fin.host.evidence.visual_evidence import (
     VISUAL_CLAIM_FIELDS,
     VISUAL_EVIDENCE_KIND,
     VisualEvidence,
@@ -752,7 +752,13 @@ def test_a_claim_run_leaves_the_citation_frame_and_export_untouched(
     )
     assert json_export.status_code == 200, json_export.text
     body = json_export.json()
-    assert list(body) == ["thread_id", "run_id", "kind", "citations"]
+    assert list(body) == [
+        "thread_id",
+        "run_id",
+        "kind",
+        "citations",
+        "retrieval_window",
+    ]
     for secret in claim_secrets:
         assert secret not in json_export.text
 
@@ -944,12 +950,12 @@ def test_postgres_run_sql_round_trips_visual_claims_jsonb(monkeypatch) -> None:
     )
 
     params = captured_params[0]
-    # The written column is the LAST INSERT parameter, serialized as JSON.
+    # visual_claims stays at index 18. Later columns are appended.
     assert json.loads(params[18]) == [claim]
-    # ``structured_evidence`` is column 20, appended after ``visual_claims``
-    # so every earlier index keeps its meaning.
     assert json.loads(params[19]) == []
-    assert len(params) == 20
+    assert json.loads(params[20]) == {}
+    assert params[21] is None
+    assert len(params) == 22
 
     parsed = store._row_to_run(rows_back[0])
     assert parsed.visual_claims == [claim]

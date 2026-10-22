@@ -1,7 +1,7 @@
 # fin — 领域词汇表
 
 > 本文件是项目领域词汇的**单一事实源 (SSOT)**.
-> 仅 `domain-modeling` 技能可写; 其他技能按 `docs/agents/context-contract.md` 消费.
+> Maintained by `domain-modeling`; consumers quote definitions verbatim.
 >
 > Product identity disambiguation: see [ADR 0090](adr/0090-product-identity-knowledge-qa-entry-point.md) (fin is a knowledge-QA entry point, not a knowledge base and not a finance/research product).
 
@@ -16,8 +16,8 @@ An enterprise **knowledge-QA** agent (知识问答助手) (the 入口, not the �
 _Avoid_: research-agent product, treating fin as a finance/financial-research assistant product (finance is only the current corpus domain, not the product identity), workspace-as-kind, 10-Q as the product name, Q&A API as the product, treating grounded-track contracts as the whole product personality, treating fin as a parallel corpus store or 库门
 
 **host agent**:
-fin as the LangGraph runtime that routes tracks and calls grounded-track tools behind the **retrieve port**; it is not the ranking or vector store.
-_Avoid_: client, treating fin as only a FAQ bot, treating fin as the long-term memory server
+fin's LangGraph host graph, which routes tracks and calls grounded-track tools behind the **retrieve port**; it is not the application-level **Fin Runtime**, ranking service, or vector store.
+_Avoid_: client, treating fin as only a FAQ bot, treating fin as the long-term memory server, treating the graph as the durable operation queue
 
 **track**:
 The per-turn contract on the host graph: `dialogue`, `clarify`, `off_topic`, or `grounded`. Chosen in-graph before execution; tools and the citation verifier bind only to `grounded`.
@@ -27,8 +27,14 @@ _Avoid_: Chat|Research UI mode, HTTP-only router, single global grounded contrac
 The Soft-Track leaf that binds corpus tools and the **citation verifier** (ADR 0061). Not a product name, not **search mode**, and not the `retrieve` tool. Wire value `research` is an alias for this leaf.
 _Avoid_: Research mode picker, retrieve as the track enum, four retrieve nodes, renaming **research thread**
 
+**route intent**:
+The product action selected for an input before execution, distinct from the graph **track** and the eventual answer outcome.
+_Stage_: Adopted QA-chain contract (2026-10-16); runtime implementation and acceptance remain in the execution plans.
+_Avoid_: fifth track, semantic result, search mode
+
 **Soft-Track**:
-The v1 turn-orchestration shape: one compiled host graph, multi-track routing, tiered track decision (rules → ambiguous **Jev** four-label Choice → inherit → grounded clarify → conditional policy). Ambiguous low confidence or judge-down is `clarify`, not silent `grounded`. Flat graph until upgrade triggers in ADR 0027. _Stage: rules on main; product gray-zone is Jev Choice (ADR 0080); default pytest Fake; `specs/soft-track-judge-route.md`._
+The v1 turn-orchestration shape: one compiled host graph with rules-first routing across four tracks and optional ambiguous **Jev** hints; missing, failed or unusable hints default to authorized retrieval, while actionable missing user conditions may still clarify. Route intent and semantic outcomes are separate; flat topology retains ADR 0027 upgrade triggers.
+_Stage_: Adopted routing amendment under ADR 0080 (2026-10-16); default pytest remains Fake, and runtime acceptance remains pending.
 _Avoid_: supervisor handoff as v1, dual product shells, treating flat topology as permanent, MiniMax JSON as the product gray-zone classifier, MiniMax as Jev fallback
 
 **status snapshot**:
@@ -127,7 +133,7 @@ On the **grounded** track, the model repeatedly picks `list_files`, `retrieve`, 
 _Avoid_: pipeline, chain, fixed graph of retrieve-then-generate, requiring the citation verifier on dialogue/clarify/off_topic
 
 **list_files**:
-Catalog tool over ingested/pushed **filings** (not a serve-time extracted-tree SSOT), keyed like EDGAR submissions: CIK, form, accession, filing_date always exist on a live row; ticker and fiscal period are optional. v1 callers still pass `company` / `period`; additive optional `cik` / `form` / `ticker` / `filing_date`; hits stay `{document_id, company, period, version, page_count}` until output keys are extended; unknown or conflicting filters yield `filings: []`.
+Catalog tool over ingested/pushed **资料**, exposing display title/type and optional descriptive company/period; new public document IDs derive from trusted corpus scope and raw bytes, never filename or metadata. The catalog owns bounded metadata filters and typed validation; the adopted QA-chain retrieval spec fixes schema and caller compatibility under ADR 0031, while the existing financial read projection remains supported.
 _Avoid_: list_filings, list_documents, glob, requiring ticker, treating company as forever equal to ticker, a generic CMS file browser
 
 **get_xbrl_fact**:
@@ -151,11 +157,12 @@ The model-facing name for a known-locator source read: it resolves one authorize
 _Avoid_: read_file as the future tool name, read_locator, read_page, read_chunk, treating read as retrieve, reading embeddings
 
 **ingest endpoint**:
-The product job that parses, applies **切分** from the format parameter table, and **入库推送** or invalidates via MCP. Version close/replace is an MCP call. Not a grounded-track tool.
+The single public file-upload job that parses supported documents, applies **切分** from the format parameter table, and **入库推送** or invalidates via MCP; new document identity derives from trusted corpus scope and raw bytes. Version close/replace is an MCP call. Not a grounded-track tool.
 _Avoid_: chunk-any-string tool, model-chosen split points, EDGAR form name as the root document type
 
 **thread attach**:
-An operator-submitted file under a logical `attachment_id` for the **research thread** lifetime; fin owns its durable raw bytes, parsed units, versioned **visual observations**, thread-private searchable index, and lifecycle state. `uploaded` means only that raw bytes are durable; an eligible graph turn starts or joins preparation, `ready` requires parsed text, required visual observations, and an index usable after restart, and the host binds access to the active thread, tombstones before cleanup, and never pushes the attachment into the permanent company corpus (ADRs 0083, 0085, 0086, 0088, and 0089).
+An operator-submitted file under a logical `attachment_id` for the **research thread** lifetime; fin owns its durable original bytes, access scope, thread-private index, versioned **visual observations**, and caller-visible lifecycle. In the adopted target, the independent parser service owns parsing-job state and result artifacts, while fin consumes results and decides readiness, binds access to the active thread, tombstones before cleanup, and never pushes the attachment into the permanent company corpus (ADRs 0083, 0085, 0086, 0088, and 0089).
+_Stage_: Current code also stores parsed units and performs parsing inside the host attachment workflow; the target ownership split is not yet implemented.
 _Avoid_: treating drag-into-chat as corpus ingest, treating `uploaded` as `ready`, model-visible filesystem paths, injecting the attachment body into the prompt, page-only attachment browsing
 
 **uploaded**:
@@ -167,8 +174,33 @@ The thread-attachment state meaning parsed page text, required visual observatio
 _Avoid_: uploaded, merely indexed, model-memory-ready
 
 **attachment preparation job**:
-Durable, idempotent work keyed by attachment content version that begins when an eligible grounded graph turn reaches `ensure_attachment_ready`; it performs layout, OCR, page rendering, full-page vision analysis, and indexing, then resumes the waiting run after completion, including after restart.
-_Avoid_: upload-time parse, per-turn duplicate parse, background corpus ingest
+The fin-owned attachment workflow that associates a **parser job** with an attachment version, consumes its durable result, builds the thread-private index, and changes readiness before resuming a waiting run.
+_Stage_: The current implementation may perform parsing inside this workflow; the adopted target assigns parsing status, attempts, and result-artifact existence to the independent parser service.
+_Avoid_: treating a **parser job** as attachment readiness, upload-time implicit success, per-turn duplicate parse, background corpus ingest
+
+**parser job**:
+One versioned asynchronous parse operation whose independent parser service owns status, worker attempts, cancellation, and durable result existence; fin owns the calling attachment or corpus association and decides whether the result is usable for readiness or publication.
+_Stage_: Adopted target design on 2026-10-20; no parser-service implementation or fidelity result is implied.
+_Avoid_: attachment-ready state, indexed content, citation verification, Runtime graph run
+
+**parser service**:
+The independent context that owns **parser job** state, the **parser attempt**s that work on those jobs, cancellation, and the durable **parser result envelope**, in a PostgreSQL schema of its own. fin keeps ownership of attachment and corpus visibility, readiness, indexing, and publication, and reaches the service over its own API.
+_Stage_: Adopted target design on 2026-10-20; the current implementation is the parser package under `src/fin/parser/`, which owns the `fin_parser` schema and imports no other fin context.
+_Avoid_: the corpus ingest endpoint, the host attachment workflow, a second corpus store, Redis as job truth
+
+**parser attempt**:
+One fenced claim by a parser worker to work on a **parser job**, identified separately from that job and guarded by the job's current **fencing token** and lease. Only the attempt holding the job's effective token may commit; a superseded attempt's write is refused rather than applied.
+_Stage_: Adopted target design on 2026-10-20; the current implementation fences attempts per job with a monotonically increasing token.
+_Avoid_: **worker attempt** for a graph run, a retry counter, an unfenced process-local owner
+
+**fencing token**:
+The per-**parser job** counter that names the one **parser attempt** allowed to act on that job right now. Every claim produces a higher token and a token is never reused, so a late write from a superseded attempt is refused instead of applied.
+_Avoid_: lease expiry time, attempt number, an opaque id that cannot be compared, a UUID
+
+**parser result envelope**:
+The durable, versioned parse output a **parser attempt** commits for a **parser job**: the parsed document under its schema version plus a reference to the derived output, never the output bytes. The **parser service** keeps ownership of the artifact; fin validates and adopts it before any readiness or publication decision.
+_Stage_: Adopted target design on 2026-10-20; the current implementation stores the envelope and the result reference in the `fin_parser` schema.
+_Avoid_: the retrieve envelope, attachment readiness, storing the parsed bytes inline as the result
 
 **visual observation**:
 A persisted, versioned description from fin's configured vision model, bound to an original attachment page or crop and carrying structured coverage of inspected scope and visual detail. It is derived search material tied to the attachment version and original image location, never source text or a verbatim quote (ADR 0089).
@@ -183,8 +215,8 @@ A current-run reference proving that the run explicitly retrieved or read a matc
 _Avoid_: model conversation memory, generated source quote, re-upload as citation, bare vision response without persisted provenance
 
 **corpus ingest**:
-The separate workspace control that sends a file through the **ingest endpoint** into the retrieve backend.
-_Avoid_: one control that both attaches and stores without an explicit ingest choice
+The operator action that sends a supported file through the single **ingest endpoint** into the retrieve backend; `title`, `company`, `period`, and `doc_type` are optional descriptive metadata and do not define identity. A **thread attach** remains scoped to the active conversation and is not permanent corpus ingestion.
+_Avoid_: a financial upload mode, a generic upload mode, requiring company/period, treating thread attachment as permanent corpus ingestion
 
 **locator**:
 A typed source identity for citation and `read_source`: company sources use `{document_id, version, unit}` and thread attachments use `{kind: "attachment", attachment_id, version, unit}`. The host validates the attachment against the trusted active thread and parsed-content version; a read continuation position is separate from the locator. Retrieved chunks carry a locator as `source_ref`, while the claimed quote remains separate (ADRs 0046 and 0088). A **database row is not a locator** — it has a third identity shape, not a third locator spelling; see **database-row** (ADR 0091).
@@ -225,8 +257,28 @@ _Avoid_: timeout, token budget, treating this number as the cite-repair limit or
 ### Host graph
 
 **host graph**:
-LangGraph compiled around the agent loop plus code gates (verifier, caps, interrupt). It is the durable runtime, not a hand-drawn retrieve → generate flowchart.
-_Avoid_: retrieval graph
+LangGraph compiled around the agent loop plus code gates (verifier, caps, interrupt); it executes one logical **run** and owns graph state through the **checkpointer**. It does not own durable input acceptance, run dispatch, or parser-job lifecycle.
+_Avoid_: retrieval graph, durable operation queue, second business-state authority
+
+**Fin Runtime**:
+The application-owned authority that accepts durable client operations, orders work per **research thread**, manages run reservations and fenced **worker attempts**, and exposes thread snapshots and subscriptions. It dispatches the host graph but does not own graph checkpoints or **parser job** state.
+_Stage_: Adopted target design on 2026-10-20; the current application still has process-local run controls and its single-process guard.
+_Avoid_: LangGraph checkpointer, Redis as business-state authority, parser scheduler, second workflow engine
+
+**accepted operation**:
+One durable record of a stable client intent, committed with its input and resulting queue/run identity before the Runtime acknowledges acceptance; replaying the same operation identity and payload returns its recorded acceptance, while a changed payload conflicts.
+_Stage_: Adopted target design on 2026-10-20; the current API does not yet provide this durable idempotency contract.
+_Avoid_: a single HTTP attempt, graph execution attempt, corpus-ingest **幂等键**
+
+**worker attempt**:
+One fenced claim by a graph worker to execute or resume a logical **run**, identified separately from that run and guarded by the current lease, attempt generation, and thread generation.
+_Stage_: Adopted target design on 2026-10-20; current process-local ownership is not evidence of cross-process fencing.
+_Avoid_: new user turn, run identity, an unfenced process-local owner
+
+**thread event cursor**:
+An opaque resume position backed by a monotonically increasing PostgreSQL sequence over client-visible events for one thread, including events across runs and thread lifecycle changes; its snapshot reads the projection, revision, and high-water mark from one consistent database snapshot, and per-run sequence is auxiliary.
+_Stage_: Adopted target design on 2026-10-20; current event delivery is not claimed to provide this durable thread-wide sequence.
+_Avoid_: Redis stream ID as durable cursor, per-run sequence as thread-wide order
 
 **session compaction**:
 A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, grounded-track tool schemas, and when memory is ON any **memory prefetch** or **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
@@ -237,16 +289,22 @@ When memory is ON, advisory recall or **memory prefetch** text placed in the mod
 _Avoid_: last-N memory window as the token budget, using recall as retrieve/`read_source` evidence
 
 **checkpointer**:
-v1 durable runs use LangGraph `PostgresSaver` via `FIN_CHECKPOINT_URL`; product HTTP/CLI raise if that URL is unset. Pytest uses `InMemorySaver` only (plus explicit `FIN_SCRIPTED_MODEL` e2e); it does not survive process exit.
-_Avoid_: SqliteSaver as the product default, InMemorySaver as a silent CLI/HTTP fallback, LangSmith-hosted persistence
+Current v1 runs use LangGraph `PostgresSaver` via `FIN_CHECKPOINT_URL`; product HTTP/CLI raise if that URL is unset, while pytest uses `InMemorySaver` only (plus explicit `FIN_SCRIPTED_MODEL` e2e). The adopted target keeps graph checkpoints in the same PostgreSQL database as Runtime state but in a separate schema, with every checkpoint mutation passing through a generation-aware adapter in the same database transaction as ownership validation.
+_Avoid_: treating checkpoints as accepted-operation or run-state authority, an unfenced saver fallback, SqliteSaver as the product default, InMemorySaver as a silent CLI/HTTP fallback, LangSmith-hosted persistence
 
 **thread_id**:
 A conversation session: follow-up questions reuse this id so checkpoints and messages accumulate. Omitting it creates a new session before invoke; it is not a user_id.
 _Avoid_: one question per thread, treating a refuse as killing the session
 
 **run**:
-One graph `invoke` or `stream` on a thread (`run_id`): `done` / `refuse` / `step_cap` end the run; a follow-up is a new run on the same `thread_id` that resets run-scoped evidence and caps. Crash resume continues that in-flight `run_id` from the last complete host-graph node; at most one run is active per thread.
-_Avoid_: collapsing run into thread_id, concurrent invokes on one thread, deleting the user turn to “sanitize” a crash
+One logical graph turn (`run_id`) accepted for a thread: `done` / `refuse` / `step_cap` end it; a follow-up is a new run on the same `thread_id` that resets run-scoped evidence and caps. Under the adopted target contract, a run may be queued or waiting without occupying a worker, and takeover resumes the same run only when its checkpoint and effects are safe; each worker claim is a separate fenced **worker attempt**.
+_Stage_: The current implementation invokes directly and retains process-local ownership; durable queueing and takeover are target behavior.
+_Avoid_: collapsing run into thread_id, treating a worker attempt as a new turn, concurrent effective graph owners on one thread, deleting the user turn to “sanitize” a crash
+
+**turn receipt**:
+One logical operational summary of an accepted answer turn, correlated across pause and continuation and distinct from task state, task completion, and per-tool-attempt measurement records.
+_Stage_: Adopted QA-chain contract (2026-10-16); receipt fields remain distinct from the target **tool outcome ledger**.
+_Avoid_: task outcome, one row per HTTP request, **operational trace**, complete tool-attempt denominator, second task store
 
 **research thread**:
 The product conversation: one `thread_id` the operator talks in; each question is a run that may be any **track**; follow-ups keep full messages, citations when present, and status-snapshot history. This is how fin is used after v1; it is not a one-shot `/ask` demo.
@@ -268,6 +326,26 @@ _Avoid_: a second thinking card, a new SSE event type, treating HTTP wait as mod
 A per-burst collapsible tool-call list on the same turn, sibling to the **thinking fold**. Live while those calls run so the operator can debug (including retrieve via the **retrieve port**); auto-collapses when that burst ends. UI label: 工具. MCP is not a transcript tool name.
 _Avoid_: default-hidden tools with no fold, dumping ToolMessage JSON, nesting tools inside thinking prose, labeling the row MCP
 
+**logical tool call**:
+One model-requested tool action and its bounded argument-correction loop, tracked separately from each model-emitted attempt and each execution attempt.
+_Stage_: Adopted tool-evaluation contract on 2026-10-20; no complete per-call ledger is implied by current traces or receipts.
+_Avoid_: one provider tool-call ID, one network request, conflating correction with execution retry
+
+**schema correction**:
+The single bounded model feedback opportunity for a tool call rejected by its canonical Pydantic argument schema before side effects; execution failures and uncertain effects follow separate policies.
+_Stage_: Adopted target contract on 2026-10-20; implementation and measured correction quality remain pending.
+_Avoid_: unbounded prompt loop, retrying a side effect whose outcome is unknown, exposing submitted values in correction feedback
+
+**tool outcome ledger**:
+The canonical durable record of tool-call validation and execution outcomes from which tool-quality rates and denominators are computed; traces and UI rows may link to it but are not substitutes for it.
+_Stage_: Adopted measurement design on 2026-10-20; the durable ledger and metrics have not been implemented or validated.
+_Avoid_: **turn receipt** as every-attempt history, **operational trace** as a metric source, raw call volume as quality
+
+**operational trace**:
+The optional, best-effort five-span OpenTelemetry view adopted in ADR 0102 for diagnosing selected execution seams; it may be sampled or incomplete and does not count all tool attempts or establish evaluation outcomes.
+_Stage_: ADR 0102 adopts the instrumentation design; this definition does not claim all five spans are currently emitted.
+_Avoid_: **tool outcome ledger**, complete attempt history, evaluation denominator, billing authority
+
 **工作区**:
 The one global default operator directory `$HOME/.fin/default` (created if missing). Every **research thread**, profile read, and **memory fact** workspace key uses this path.
 _Avoid_: Path.cwd() as implicit 工作区, `$HOME/.fin/workspaces/<slug>`, left-rail 指定/新建, a second 知识库, calling the **工作台** a 工作区
@@ -281,8 +359,8 @@ The operator-visible set of **资料** already pushed to **iknow-memory** (ready
 _Avoid_: freeze-slice catalog as 就绪, treating MCP 可达 as nonempty retrieve, **thread attach** as membership in the set
 
 **检索档** (`search mode`):
-Which retrieve path a knowledge question uses after it has entered **grounded**: A 查找 (lexical-first), **graph** 知识问答 (iknow graph-priority then vector∥BM25 fill; community summaries may mix in, capped by **community level** — MCP `filters.search_mode=graph`, formerly `B`; missing key defaults to graph), **global** 综述 (index-time community summaries; report text ES ∥ report vectors, then optional drop to windows — ADR 0070; MCP `filters.search_mode=global`, formerly `C`), D `sql` 结构化查询 over structured representations of the same ingested **资料** in iknow (ADR 0094; the current standalone contract-expiry implementation is a legacy path pending a replacement SPEC). Assignment reuses the Soft-Track cascade (ADR 0027 / 0062 / 0081): rules, then **Jev** Choice when ambiguous, then inherit, then clarify or typed fail — not a required picker and not silent global. _Stage (landed, ADR 0081): the ambiguous 档 tier IS that closed-set **Jev** Choice over `A | graph | global | D`; default pytest injects the shared Fake Choice and the live round-trip is the named `jev_live` suite. No MiniMax structured classify remains on the product path._ Cascade **clarify** opens a **choice window** (structured options → operator pick → resume execute). Search-mode copy is call-scoped (ADR 0061): inject once in near context, never rewrite history; after **session compaction**, re-inject the mode this turn needs.
-_Avoid_: open business-intent labels, one unnamed retrieve for every question, treating Fake as a 档, retrieve as this enum, four host retrieve nodes, per-turn 档 picker as the default UX, clarify with no selectable options, `search_mode=C` as the lasting 综述 token, `search_mode=B` as the lasting 知识问答 token, **local** as the 知识问答 MCP value
+The host's internal retrieval implementation for a **grounded** question, using the closed set `lexical | graph | global | sql` behind the **retrieve port**; explicit rules/debug pins, eligible same-job inheritance, and **Jev** decide it, with an audited `graph` / `fallback` residual when still unassigned (ADR 0104; implemented on `fix/qa-design-correction-20261020`; the real-model browser acceptance is Not run because the external model provider is unavailable — see the [implementation report](verification/2026-10-20-qa-design-correction-implementation.md)). Current-turn receipts retain provenance, confidence, and original judge EXITs; people clarify answer-changing content such as documents or periods, while rendered UI omits internal mode names and raw tokens remain in machine diagnostics.
+_Avoid_: user-facing mode pickers, treating mode uncertainty as missing user content, silent global fallback, presenting fallback as a confident Jev prediction, four host retrieve nodes, Fake as a mode, retired `A`/`B`/`C`/`D` wire tokens, `local` as the graph token
 
 **社区**:
 Entity-graph clusters from **hierarchical Leiden** after extract and merge (ADR 0056 / 0065), on the **largest connected component** by default (ADR 0074), split until **max_cluster_size** (default 10, tunable — ADR 0072), with a **fixed default seed** (ADR 0075). Graph changes **rebuild** Leiden and summaries; C is not-ready until that succeeds (ADR 0064 / 0078); B does not wait on communities.
@@ -313,24 +391,24 @@ Retired **工作台** chrome (`/monitor` watchlist + retrieve-reachability). Pro
 _Avoid_: `/monitor` as a product route, MCP as a nav label, watchlist as fin chrome, treating 监控 as a 工作区 picker
 
 **Corpus 首页**:
-Retired chrome name. `/kb` is not a product route; catalog and upload live outside fin (iknow 看板 / 中台). `/` remains last-thread restore or empty composer, not a 对话总览.
+Retired chrome name. `/kb` is not a product route; catalog and upload live outside fin (iknow 看板 / 中台). `/` is the homepage, with last-thread restoration limited to one non-demo cold application start there; deliberate later Home/Back visits stay home (design adopted 2026-10-20; implemented on `fix/qa-design-correction-20261020`; the real-model browser acceptance is Not run because the external model provider is unavailable — see the [implementation report](verification/2026-10-20-qa-design-correction-implementation.md)).
 _Avoid_: `/` as corpus cards, `/` as a thread-card overview, Corpus as a nav label, 对话 as a chrome entry, auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest, deep-link `/kb` as a dashboard handoff
 
 **v1 surface**:
-The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. Crash resume continues the in-flight run on that `thread_id`. Plan-approval and tool-approval HITL are not v1; **choice window** on cascade clarify is (ADR 0062).
-_Avoid_: HTTP-only first ship, separate graphs per transport, treating plan-approval as the clarify surface
+The current first-ship CLI and HTTP surface compile the same host graph and HTTP calls sync `invoke` with the sync `PostgresSaver`; that compatibility remains while the target moves graph execution into supervised worker processes. Process separation does not itself require a sync-to-async graph or saver rewrite. Plan-approval and tool-approval HITL remain outside v1 (ADR 0062); the Fast extraction proposal keeps its confirmed choice window and the document-choice question keeps its resumable interrupt, while genuine content clarification is a terminal `task_clarification` question answered by a new-message turn (no graph interrupt, no paused run) and unresolved internal mode selection falls back with a receipt (ADR 0104; implemented on `fix/qa-design-correction-20261020`; the real-model browser acceptance is Not run because the external model provider is unavailable — see the [implementation report](verification/2026-10-20-qa-design-correction-implementation.md)).
+_Avoid_: HTTP-only first ship, separate graphs per transport, an implicit async-persistence rewrite, treating plan-approval as the clarify surface
 
 **HITL**:
-LangGraph `interrupt` may be compiled into the host graph. Durability is crash resume of the in-flight run. **Choice window** is the v1 interrupt UX for Soft-Track / search-mode clarify (structured options, operator pick, then execute). Plan-approval and tool-approval UI stay out of v1.
-_Avoid_: declarative plan-mode as v1, Studio as the required v1 interface, free-text clarify with no options as the only confirm path
+LangGraph `interrupt` provides durable in-flight resume for the confirmed Fast extraction proposal and for the document-choice question, the one resumable clarification; content clarification is a terminal `task_clarification` question answered by a new turn, with no interrupt and no paused run. Internal mode-selection uncertainty uses the audited fallback instead of a choice window (ADR 0104; implemented on `fix/qa-design-correction-20261020`; the real-model browser acceptance is Not run because the external model provider is unavailable — see the [implementation report](verification/2026-10-20-qa-design-correction-implementation.md)); plan/tool approval UI remains outside v1.
+_Avoid_: internal retrieval modes as user choices, Studio as the required interface, a judge outage as missing user content, free-text ambiguity without understandable options as the only confirmation path
 
 **Jev**:
-TypeSafe System One for host closed-set **Choice**: Soft-Track's four **track** leaves, then (only after **grounded**) 检索档 `A|graph|global|D`. Product path only (ADR 0080 / 0081); default pytest injects Fake Choice; live Jev is required to land; no MiniMax fallback.
-_Avoid_: v1 model, retrieve rerank, MiniMax JSON classify, MiniMax as Jev fallback, Fake as the product classifier, counting a Fake pass as live, four retrieve nodes
+TypeSafe System One for host closed-set **Choice**: Soft-Track's four **track** leaves and, after **grounded**, internal `lexical | graph | global | sql` selection. Default pytest uses Fake Choice, changed configured paths require real evidence, missing optional Soft-Track hints use the adopted ADR 0080 retrieval fallback, and an unresolved search-mode choice retains its EXIT/confidence signals while the host applies graph fallback (ADR 0104; implemented on `fix/qa-design-correction-20261020`; the real-model browser acceptance is Not run because the external model provider is unavailable — see the [implementation report](verification/2026-10-20-qa-design-correction-implementation.md)).
+_Avoid_: answering model, retrieve reranker, MiniMax JSON classify fallback, Fake as the product classifier, counting a Fake pass as live, four retrieve nodes
 
 **v1 model**:
-The agent-loop LLM is `ChatOpenAI` selected at runtime by `FIN_MODEL` (default `MiniMax-M3`) and `FIN_BASE_URL` (default official MiniMax CN Chat Completions `https://api.minimaxi.com/v1`; the URL includes `/v1`). Keys stay in environment variables (`FIN_API_KEY`); slash ids do not go through `init_chat_model`.
-_Avoid_: compiled-in model name as the only option, `init_chat_model` for slash ids, `minimax-cn/MiniMax-M3` as the v1 default, LLM-as-judge as the citation gate, using this client as the product Soft-Track gray-zone classifier
+The agent-loop LLM is `ChatOpenAI`; its model id is required from `FIN_MODEL` or `llm.model` in operator settings, with no compiled-in model fallback. `FIN_BASE_URL` defaults to the official MiniMax CN Chat Completions endpoint `https://api.minimaxi.com/v1` (the URL includes `/v1`). Keys stay in environment variables (`FIN_API_KEY`); slash ids do not go through `init_chat_model`.
+_Avoid_: `init_chat_model` for slash ids, LLM-as-judge as the citation gate, using this client as the product Soft-Track gray-zone classifier
 
 **FIN_API_KEY**:
 项目自有的 LLM API key 环境变量名（2026-08-27 由 `ANTHROPIC_AUTH_TOKEN` 硬切而来，无 fallback）
@@ -347,7 +425,7 @@ _Avoid_: copying an external research-agent product or code tree into `src/fin`,
 ### Corpus and eval
 
 **product corpus**:
-The operator-selected filings after ingest: fin parses source text into **冻结单元**, then deterministically **切分**s and pushes its chunks to the retrieve backend. Serve-time `retrieve` / `read_source` / the citation verifier use this-run tool payloads (ADR 0046), not a second on-disk tree as company-corpus SSOT.
+The operator-selected supported documents after ingest: fin parses source text into **冻结单元**, then deterministically **切分**s and pushes its chunks to the retrieve backend. Serve-time `retrieve` / `read_source` / the citation verifier use this-run tool payloads (ADR 0046), not a second on-disk tree as permanent-corpus SSOT.
 _Avoid_: the historical private fixture set as product SSOT, unofficial PDF as live identity, broad index backfill as the ingest default, a second PDF-page product path
 
 **eval fixture**:
@@ -359,7 +437,7 @@ Historical private 12-PDF fixture freeze (ADR 0004, superseded by 0029), coverin
 _Avoid_: current catalog, gold SSOT, demo FAQ
 
 **ingest**:
-The CLI/job (and the product **ingest endpoint**) that parses filings, **切分**s, and **入库推送** to the retrieve backend. The ask path does not perform ingestion or access raw filings.
+The CLI/job and public **ingest endpoint** that parse supported corpus documents, apply **切分**, and **入库推送** to the retrieve backend through one file-based upload path. Public document identity derives from trusted corpus scope and raw bytes; filename and optional metadata do not define it, and the ask path does not ingest files.
 _Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database, 切分 as a research-track tool
 
 **资料主体**:
@@ -377,6 +455,11 @@ _Avoid_: Postgres bytea as the primary raw store, putting raw PDFs in the checkp
 **contract eval**:
 Scripted-model harness against the separately supplied **eval fixture**. Required classes: HTML-unit citation pass, unknown locator refuse, catalog miss, and a cross-period case. Nine v1 gold cases are not the ceiling.
 _Avoid_: live LLM in default pytest, FinanceBench in default pytest
+
+**Fin acceptance case set**:
+The evolving, versioned set of at least 50 independent Fin business cases with frozen rubrics, reported separately from mechanism tests, browser journeys, and the real authorized **评测数据集**.
+_Stage_: The target acceptance requirement is adopted; the current case count and campaign evidence have not been established by this design decision.
+_Avoid_: counting duplicate paraphrases as independent, counting synthetic cases as real corpus, treating a green mechanism suite as business acceptance
 
 **capability eval**:
 Opt-in or nightly harness on **product corpus** plus a live model; records coverage, abstain, and citation quality. Not a per-commit gate.

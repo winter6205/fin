@@ -18,7 +18,7 @@ Two authorities live here:
 * :class:`MappingFailureLedger` — the counter. In memory by default;
   an append-only JSONL log when given a ``path``, which is what makes
   「计数落盘且 >0 时可断言」true after the producing process exits. The
-  host side (``fin.host.evidence_admission``) records into the same
+  host side (``fin.host.evidence.evidence_admission``) records into the same
   ledger, so one number covers both places a hit can fail to map.
 
 A canonical fin ``source_ref`` is parsed directly into a locator. A

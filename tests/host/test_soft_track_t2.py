@@ -11,7 +11,7 @@ from fin.host.agent_instructions import (
     CLARIFY_INSTRUCTIONS_MARKER,
     HOST_INSTRUCTIONS_MARKER,
 )
-from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
+from fin.host.grounded.citation_gate import HIDDEN_BOUNCE_MARKER
 from jev_fake import FakeJevChoice
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
@@ -26,7 +26,7 @@ def _checkpoint_messages(graph, thread_id: str) -> list:
     return list((snapshot.values or {}).get("messages") or [])
 
 
-def test_underspecified_filing_ask_clarify_skips_tools_and_gate():
+def test_jev_clarify_ask_skips_tools_and_gate():
     """Metric without company/period → clarify, no tools, done, empty cites."""
     model = ScriptedChatModel(
         script=[
@@ -41,6 +41,7 @@ def test_underspecified_filing_ask_clarify_skips_tools_and_gate():
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
         known_document_ids=KNOWN_IDS,
     )
     out = g.invoke(
@@ -74,7 +75,7 @@ def test_underspecified_filing_ask_clarify_skips_tools_and_gate():
     )
 
 
-def test_clarify_prompt_is_call_scoped_not_research():
+def test_jev_clarify_prompt_is_call_scoped_not_research():
     """Clarify leaf prepends CLARIFY prompt at call time only."""
     from fin.host.scripted_model import ScriptedChatModel as SCM
 
@@ -97,6 +98,7 @@ def test_clarify_prompt_is_call_scoped_not_research():
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
         known_document_ids=KNOWN_IDS,
     )
     g.invoke(
@@ -128,7 +130,7 @@ def test_clarify_prompt_is_call_scoped_not_research():
     assert "period" in content
 
 
-def test_company_without_period_metric_ask_is_clarify():
+def test_jev_clarify_company_ask_without_period():
     """Filing metric with company but missing period → clarify."""
     model = ScriptedChatModel(
         script=[
@@ -140,6 +142,7 @@ def test_company_without_period_metric_ask_is_clarify():
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
         known_document_ids=KNOWN_IDS,
     )
     out = g.invoke(
@@ -159,7 +162,7 @@ def test_bare_q_follows_judge_to_dialogue_not_research():
     """Regression (ADR 0080 retarget): bare ``q`` is gray-zone — the
     Jev Choice decides it. A judged ``dialogue`` must land the dialogue
     leaf, NOT research (no single global default track). Without a
-    client the same utterance fail-closes to clarify (covered by
+    client the same utterance falls back to retrieval (covered by
     ``test_track_decision`` gray-zone units)."""
     model = ScriptedChatModel(script=[AIMessage(content="plain reply")])
     g = compile_graph(
@@ -181,7 +184,7 @@ def test_bare_q_follows_judge_to_dialogue_not_research():
     assert out["track_decision"]["decision_tier"] == "jev"
 
 
-def test_filled_slots_follow_up_after_clarify_enters_research():
+def test_jev_clarify_follow_up_with_filled_slots_enters_research():
     """T2: next run with company+period filled can enter research."""
     from fin.host.state import reset_input_state
 
@@ -199,6 +202,7 @@ def test_filled_slots_follow_up_after_clarify_enters_research():
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
         known_document_ids=KNOWN_IDS,
     )
     tid = "t-soft-clarify-then-research"

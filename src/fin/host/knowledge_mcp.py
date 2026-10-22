@@ -38,6 +38,12 @@ through ``fin.host.http.serve()``. The gate treats ``None`` as open so
 the hermetic default pytest suite (which never boots ``fin-serve``)
 keeps its current conversation contracts. Only a boot that actually
 published 缺 / 坏 closes the gate for the bound ``mcp`` adapter.
+
+``None`` on the STATUS surface is its own fact, not 缺: absence was
+never established there, so :func:`knowledge_mcp_status_value` renders
+it as :data:`KNOWLEDGE_MCP_NOT_PROBED`. A serving process always
+publishes (``serve()`` probes unconditionally), so this value reaches
+``GET /api/status`` in hermetic boots only — never the SPA's boot.
 """
 
 from __future__ import annotations
@@ -72,14 +78,29 @@ KNOWLEDGE_MCP_STATES = (
     KNOWLEDGE_MCP_REACHABLE,
 )
 
+# ----- the DISPLAY-ONLY fourth value -----
+#
+# 未探测 (not probed) is not a fourth probe outcome: no handshake can
+# observe "the probe never ran". It is the rendering of a ``None``
+# snapshot — this process never probed — and it is deliberately NOT in
+# :data:`KNOWLEDGE_MCP_STATES`, so :func:`publish_knowledge_mcp_state`
+# still rejects it. That keeps the invariant "you can only publish what
+# a probe observed": 缺 asserts an ESTABLISHED absence, and a process
+# that never looked has established nothing. Rendering ``None`` as 缺
+# made an unbooted host read like a broken one.
+KNOWLEDGE_MCP_NOT_PROBED = "not_probed"
+
 # The stable 409 token + operator copy shared by the HTTP gate and (T3)
 # the SPA left corner.
 KNOWLEDGE_MCP_FAULT_ERROR = "knowledge_mcp_fault"
 KNOWLEDGE_MCP_FAULT_MESSAGE = "知识 MCP 故障"
 
 
-# Probe budget defaults: a short bounded retry, read by tests to shrink.
-DEFAULT_PROBE_TIMEOUT_SECONDS = 2.0
+# Probe budget defaults, read by tests to shrink.
+# A cold stdio startup (config, generation id, server connect) runs past
+# 2s. A shorter timeout kills the child before tools/list, and the retry
+# starts another cold process, latching fault.
+DEFAULT_PROBE_TIMEOUT_SECONDS = 10.0
 DEFAULT_PROBE_ATTEMPTS = 2
 
 # JSON-RPC id for the ``tools/list`` request that completes the probe.
@@ -112,6 +133,41 @@ def knowledge_mcp_state() -> str | None:
     """Return the snapshot, or ``None`` when this process never probed."""
     with _state_lock:
         return _state
+
+
+def knowledge_mcp_status_value(published: str | None) -> str:
+    """Resolve one snapshot value to what ``GET /api/status`` publishes.
+
+    The single resolution of the ``None`` case, so the status route cannot
+    drift back to coercing it into 缺:
+
+    * ``None`` → 未探测. Absence was never established, so it is not
+      reported as 缺 (see :data:`KNOWLEDGE_MCP_NOT_PROBED`).
+    * a member of :data:`KNOWLEDGE_MCP_STATES` → verbatim. 缺 / 坏 / 可达
+      are the probe's findings and the route is not allowed to editorialize
+      them.
+    * anything else → 坏, plus an ERROR log. ``publish_knowledge_mcp_state``
+      validates, so a stray state can only arrive through a programming
+      error; the net still catches it rather than echoing an unvouched
+      value. 坏 is the fail-closed rendering because it is the one state
+      that asserts no probe finding — 缺 would claim a probe established an
+      absence, and 未探测 would claim none ran. Logging keeps the
+      corruption loud instead of silently degraded.
+
+    Pure: the caller reads the snapshot (and owns the lock). Display-only —
+    this maps a snapshot to a wire value and never publishes.
+    """
+    if published is None:
+        return KNOWLEDGE_MCP_NOT_PROBED
+    if published in KNOWLEDGE_MCP_STATES:
+        return published
+    logger.error(
+        "knowledge MCP snapshot holds %r, which is not a probed state; "
+        "reporting %s on /api/status until the process re-bootstraps",
+        published,
+        KNOWLEDGE_MCP_FAULT,
+    )
+    return KNOWLEDGE_MCP_FAULT
 
 
 def reset_knowledge_mcp_state() -> None:
@@ -321,10 +377,12 @@ __all__ = [
     "KNOWLEDGE_MCP_FAULT_ERROR",
     "KNOWLEDGE_MCP_FAULT_MESSAGE",
     "KNOWLEDGE_MCP_MISSING",
+    "KNOWLEDGE_MCP_NOT_PROBED",
     "KNOWLEDGE_MCP_REACHABLE",
     "KNOWLEDGE_MCP_STATES",
     "knowledge_mcp_gate_closed",
     "knowledge_mcp_state",
+    "knowledge_mcp_status_value",
     "probe_knowledge_mcp",
     "publish_knowledge_mcp",
     "publish_knowledge_mcp_state",

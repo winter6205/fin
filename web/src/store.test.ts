@@ -12,7 +12,16 @@ import {
 import { EVIDENCE_SCHEMA_VERSION } from "./evidenceContract";
 import { describeSendFailure } from "./sendFailure";
 import { useWorkspaceStore } from "./store";
-import type { ChoiceWindow, Citation, ThreadDetail, Turn } from "./types";
+import { classifyThreadOpenFailure } from "./threadEntry";
+import type {
+  ChoiceWindow,
+  Citation,
+  PendingQuestionView,
+  TaskRuntimeView,
+  ThreadDetail,
+  Turn,
+} from "./types";
+import { EMPTY_WORKSPACE_OPERATIONS } from "./workspaceOperation";
 
 const THREAD_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -27,6 +36,7 @@ function seedThread(): void {
     activeThread: thread,
     threads: [],
     sendingQuestion: false,
+    sendingThreadId: null,
     resumingThreadId: null,
   });
 }
@@ -57,6 +67,7 @@ function seedResumableThread(): void {
     activeThread: thread,
     threads: [],
     sendingQuestion: false,
+    sendingThreadId: null,
     resumingThreadId: null,
   });
 }
@@ -197,50 +208,141 @@ function expectNeverShrinks(seen: string[]): void {
   }
 }
 
-/** Route BOTH an SSE run and the ``GET /api/threads/{id}`` history row
- * so a stream and a history refresh genuinely compete on one thread.
- * The run stalls before its first frame until ``release`` resolves,
- * letting the caller land the GET mid-flight. Every other route
- * (the tail ``refreshThreads``) answers with an empty thread list. */
-function stubRunAndDetail(
-  frames: Frame[],
-  detail: ThreadDetail,
-  release: Promise<void>,
-): void {
+/**
+ * A controlled transport for the thread-entry contract.
+ *
+ * It routes BOTH the SSE run and the ``GET /api/threads/{id}`` history
+ * read, and each side can be held independently — so a read can land
+ * AFTER the stream frames (the late-read case), or while the run is
+ * still streaming. The order of the transport is controlled, never the
+ * clock: no sleeps, no real timers.
+ *
+ * It also COUNTS the reads and the sends, so the contract can be
+ * asserted on observable behaviour — the visible answer, the turn rows
+ * and the request counts — instead of on how the source calls a
+ * function.
+ */
+interface EntryTransport {
+  state: {
+    /** GET /api/threads/{id} calls seen. */
+    getCalls: number;
+    /** POST /api/threads/{id}/messages calls seen. */
+    sendCalls: number;
+    /** The thread ids the reads were for, in order. */
+    getThreadIds: string[];
+  };
+  /** Hold the NEXT read of one thread until ``releaseGet``. */
+  holdGet(threadId: string): void;
+  releaseGet(threadId: string): void;
+  /** Hold the SSE run until ``releaseRun``. */
+  holdRun(): void;
+  releaseRun(): void;
+}
+
+function stubEntryTransport(options: {
+  frames: Frame[];
+  details: Record<string, ThreadDetail>;
+  /**
+   * Optional per-thread SEQUENCE of details: the Nth read of a thread
+   * answers with the Nth entry (the last one repeats). Two reads of the
+   * SAME thread must be told apart to see which one owns the state.
+   */
+  detailSequence?: Record<string, ThreadDetail[]>;
+}): EntryTransport {
+  const state = { getCalls: 0, sendCalls: 0, getThreadIds: [] as string[] };
+  const gates = new Map<string, { promise: Promise<void>; release: () => void }>();
+  const armed = new Set<string>();
+  let runGate: { promise: Promise<void>; release: () => void } | null = null;
+
+  const gate = () => {
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { promise, release };
+  };
+
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : String(input);
-      if (!url.endsWith("/messages") && !url.endsWith("/resume")) {
-        if (url.endsWith(THREAD_ID)) {
-          return new Response(JSON.stringify(detail), {
-            status: 200,
+      if (url.endsWith("/messages") || url.endsWith("/resume")) {
+        state.sendCalls += 1;
+        const held = runGate;
+        if (held) await held.promise;
+        let next = 0;
+        const body = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (next >= options.frames.length) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(
+              new TextEncoder().encode(sseFrame(options.frames[next])),
+            );
+            next += 1;
+          },
+        });
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
+      const match = /\/api\/threads\/([^/?]+)$/.exec(url);
+      if (match) {
+        const threadId = decodeURIComponent(match[1]);
+        state.getCalls += 1;
+        state.getThreadIds.push(threadId);
+        // Which read of this thread is this one? Captured at request
+        // time, so a held read keeps its own slot.
+        const readIndex =
+          state.getThreadIds.filter((id) => id === threadId).length - 1;
+        // One-shot gate: the NEXT read of this thread waits; the
+        // post-send projection re-read is not the entry read.
+        if (armed.has(threadId)) {
+          armed.delete(threadId);
+          const held = gates.get(threadId);
+          if (held) await held.promise;
+        }
+        const sequence = options.detailSequence?.[threadId];
+        const detail = sequence
+          ? sequence[Math.min(readIndex, sequence.length - 1)]
+          : options.details[threadId];
+        if (!detail) {
+          return new Response(JSON.stringify({ error: "thread_not_found" }), {
+            status: 404,
             headers: { "content-type": "application/json" },
           });
         }
-        return new Response("[]", {
+        return new Response(JSON.stringify(detail), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       }
-      await release;
-      let next = 0;
-      const body = new ReadableStream<Uint8Array>({
-        pull(controller) {
-          if (next >= frames.length) {
-            controller.close();
-            return;
-          }
-          controller.enqueue(new TextEncoder().encode(sseFrame(frames[next])));
-          next += 1;
-        },
-      });
-      return new Response(body, {
+      // Every other route (the thread LIST, the corpus, …) answers empty.
+      return new Response("[]", {
         status: 200,
-        headers: { "content-type": "text/event-stream" },
+        headers: { "content-type": "application/json" },
       });
     }),
   );
+
+  return {
+    state,
+    holdGet: (threadId: string) => {
+      gates.set(threadId, gate());
+      armed.add(threadId);
+    },
+    releaseGet: (threadId: string) => {
+      gates.get(threadId)?.release();
+    },
+    holdRun: () => {
+      runGate = gate();
+    },
+    releaseRun: () => {
+      runGate?.release();
+    },
+  };
 }
 
 const RUN_ID = "22222222-2222-4222-8222-222222222222";
@@ -507,7 +609,7 @@ describe("thinking pending on send", () => {
   });
 });
 
-// turn-trace-folds (the tracked change): the store folds the SSE stream into the
+// turn-trace-folds: the store folds the SSE stream into the
 // turn's burst timeline — arrival-order sibling thinking/tool folds,
 // auto-collapse at burst end.
 describe("trace burst folding on send", () => {
@@ -548,7 +650,7 @@ describe("trace burst folding on send", () => {
     expect(turns[0].tool_summaries?.[0]?.summary).toBe("'q': 1 hit");
   });
 
-  // Spec line 33 + #252 follow-up: the SECOND thinking burst must
+  // Spec line 33 + the follow-up: the SECOND thinking burst must
   // collapse when the first answer frame streams, NOT stay open until
   // terminal status — the operator watches prose while the fold is
   // already folded (with its tail preview).
@@ -635,7 +737,7 @@ describe("trace burst folding on send", () => {
     expect(items.every((i) => i.live === false)).toBe(true);
   });
 
-  // #252 follow-up (render saturation): at provider chunk granularity
+  // Render saturation follow-up: at provider chunk granularity
   // every SSE frame used to trigger one store patch → one full
   // transcript re-render; on a long thread the live fold froze and
   // the answer dumped at run end. The store now coalesces delta
@@ -795,7 +897,7 @@ describe("live answer fold across a bounce", () => {
     expect(recorder.seen).toContain(PRE_BOUNCE);
   });
 
-  it("keeps the streamed draft on a normal done run (that pull request)", async () => {
+  it("keeps the streamed draft on a normal done run", async () => {
     seedThread();
     stubSseRun([
       ["answer", { text: "streamed " }],
@@ -898,6 +1000,7 @@ function seedStreamedThread(
     activeThread: threadWith(turns, overrides),
     threads: [],
     sendingQuestion: false,
+    sendingThreadId: null,
     resumingThreadId: null,
   });
 }
@@ -1009,6 +1112,13 @@ describe("openThread GET reconcile", () => {
     // read carries the server ledger, the stream carries the same
     // refusal live. Both rows keep their citation order — the fold
     // unions refusals and nothing else.
+    //
+    // T2 (plans/2026-10-20-qa-design-correction.md): the read is
+    // ISSUED before the run starts, because a read issued while this
+    // client is sending on the thread is skipped by the entry
+    // contract — the live send owns the thread. What this test pins is
+    // unchanged: the history row and the live row each carry one
+    // refusal, and neither reorders the citations.
     const refusal = { citation_index: 1, error: "malformed_evidence_contract" };
     const secondCitation: Citation = {
       ...SERVER_CITATION,
@@ -1021,12 +1131,8 @@ describe("openThread GET reconcile", () => {
       }),
       rejected_citations: [refusal],
     };
-    let releaseStream!: () => void;
-    const streamGate = new Promise<void>((resolve) => {
-      releaseStream = resolve;
-    });
-    stubRunAndDetail(
-      [
+    const transport = stubEntryTransport({
+      frames: [
         [
           "status",
           {
@@ -1050,18 +1156,21 @@ describe("openThread GET reconcile", () => {
           },
         ],
       ],
-      threadWith([historyRow as unknown as Turn]),
-      streamGate,
-    );
+      details: { [THREAD_ID]: threadWith([historyRow as unknown as Turn]) },
+    });
+    transport.holdGet(THREAD_ID);
+    transport.holdRun();
 
     seedStreamedThread([]);
+    const openP = useWorkspaceStore.getState().openThread(THREAD_ID);
     const sendP = useWorkspaceStore
       .getState()
       .sendQuestion(THREAD_ID, "营收多少？");
 
     // The history GET resolves while the stream is still gated.
-    await useWorkspaceStore.getState().openThread(THREAD_ID);
-    releaseStream();
+    transport.releaseGet(THREAD_ID);
+    await openP;
+    transport.releaseRun();
     await sendP;
 
     const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
@@ -1266,6 +1375,7 @@ describe("loadStatus 重连 in-flight guard", () => {
           model_identity: "fin/MiniMax-M3",
           corpus_filing_count: 12,
           bound_collection_name: "默认资料集合",
+          run_counts: { active: 0, paused: 0, suspected_stuck: 0 },
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       ),
@@ -1290,6 +1400,7 @@ describe("loadStatus 重连 in-flight guard", () => {
       model_identity: "fin/MiniMax-M3",
       corpus_filing_count: 12,
       bound_collection_name: "默认资料集合",
+      run_counts: { active: 0, paused: 0, suspected_stuck: 0 },
     });
 
     expect(useWorkspaceStore.getState().loadingStatus).toBe(false);
@@ -1347,6 +1458,7 @@ describe("pickChoice for a reloaded pending turn", () => {
       }),
       threads: [],
       sendingQuestion: false,
+      sendingThreadId: null,
       resumingThreadId: null,
     });
   }
@@ -1527,5 +1639,533 @@ describe("pickChoice for a reloaded pending turn", () => {
     expect(turns[0].in_flight).toBe(true);
     expect(useWorkspaceStore.getState().activeThread?.pending_turn ?? null).toBeNull();
     expect(useWorkspaceStore.getState().resumingThreadId).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T2 (plans/2026-10-20-qa-design-correction.md, task 2; the demo
+// amendment's "Streaming entry" bullet): the thread-entry contract.
+//
+// Entering a thread while THIS client is sending on it must reuse the
+// live send: no redundant read, no loading/empty branch, and no late
+// read replacing newer stream state. A different thread, a cold deep
+// link and a completed historical session keep their required read.
+//
+// The transport below can land the thread GET AFTER the stream frames
+// (the late-read case) and can hold either side independently, so the
+// ORDER of the transport is controlled — never the clock. Requests are
+// counted by kind, so the contract is asserted on observable
+// behaviour: the visible answer, the turn rows and the request counts.
+// ---------------------------------------------------------------------------
+
+/** The SSE frames of one answered run: the prose, then the terminal
+ * status that clears the in-flight flag. */
+const ENTRY_FRAMES: Frame[] = [
+  ["answer", { text: WATCHED_PROSE }],
+  ["status", { run_id: RUN_ID, status: "done", assistant_message: "" }],
+];
+
+describe("thread entry while this client is sending (T2)", () => {
+  it("reuses the live send: the entry read is skipped and the answer keeps streaming", async () => {
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: { [THREAD_ID]: threadWith([]) },
+    });
+    transport.holdRun();
+    const recorder = recordVisibleAnswers();
+
+    const sendP = useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？");
+    // The thread-scoped in-flight fact is set SYNCHRONOUSLY: a route
+    // mount right after this call already sees it.
+    expect(useWorkspaceStore.getState().sendingThreadId).toBe(THREAD_ID);
+
+    // The route mounts while the answer is still arriving.
+    const outcome = await useWorkspaceStore.getState().openThread(THREAD_ID);
+    expect(outcome).toEqual({
+      kind: "skipped",
+      threadId: THREAD_ID,
+      reason: "sending",
+    });
+    // No redundant read: the live send owns this thread.
+    expect(transport.state.getCalls).toBe(0);
+    // No empty state either: the live turn table is still on screen.
+    const live = useWorkspaceStore.getState().activeThread;
+    expect(live?.id).toBe(THREAD_ID);
+    expect(live?.turns).toHaveLength(1);
+
+    transport.releaseRun();
+    await sendP;
+    recorder.stop();
+
+    expectNeverShrinks(recorder.seen);
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns[0].answer).toBe(WATCHED_PROSE);
+    expect(turns[0].in_flight).toBe(false);
+    // The send settled: the thread-scoped fact is released.
+    expect(useWorkspaceStore.getState().sendingThreadId).toBeNull();
+  });
+
+  it("keeps the required read for a DIFFERENT thread", async () => {
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: {
+        [OTHER_THREAD_ID]: threadWith(
+          [watchedTurn({ answer: PERSISTED_PROSE })],
+          { id: OTHER_THREAD_ID },
+        ),
+      },
+    });
+    transport.holdRun();
+
+    const sendP = useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？");
+    const before = transport.state.getCalls;
+
+    const outcome = await useWorkspaceStore
+      .getState()
+      .openThread(OTHER_THREAD_ID);
+
+    expect(outcome).toEqual({ kind: "opened", threadId: OTHER_THREAD_ID });
+    expect(transport.state.getCalls).toBe(before + 1);
+    expect(useWorkspaceStore.getState().activeThread?.id).toBe(OTHER_THREAD_ID);
+
+    transport.releaseRun();
+    await sendP;
+  });
+
+  it("still reads a sending thread the operator left and came back to", async () => {
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: {
+        [THREAD_ID]: threadWith([watchedTurn()]),
+        [OTHER_THREAD_ID]: threadWith(
+          [watchedTurn({ answer: PERSISTED_PROSE })],
+          { id: OTHER_THREAD_ID },
+        ),
+      },
+    });
+    transport.holdRun();
+
+    const sendP = useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？");
+    // The operator leaves the thread: the pane holds another one now,
+    // so the live state of the sending thread is no longer on screen.
+    await useWorkspaceStore.getState().openThread(OTHER_THREAD_ID);
+    expect(useWorkspaceStore.getState().activeThread?.id).toBe(OTHER_THREAD_ID);
+    const before = transport.state.getCalls;
+
+    // Coming back to the sending thread needs its own read — a guard
+    // may skip a REDUNDANT read, never a required one.
+    const outcome = await useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    expect(outcome).toEqual({ kind: "opened", threadId: THREAD_ID });
+    expect(transport.state.getCalls).toBe(before + 1);
+    expect(useWorkspaceStore.getState().activeThread?.id).toBe(THREAD_ID);
+
+    transport.releaseRun();
+    await sendP;
+  });
+
+  it("keeps the required read for a cold deep link", async () => {
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: { [THREAD_ID]: threadWith([watchedTurn()]) },
+    });
+
+    const outcome = await useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    expect(outcome).toEqual({ kind: "opened", threadId: THREAD_ID });
+    expect(transport.state.getCalls).toBe(1);
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].answer).toBe(WATCHED_PROSE);
+  });
+
+  it("keeps the required read for a completed historical session", async () => {
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: {
+        [THREAD_ID]: threadWith([watchedTurn({ answer: PERSISTED_PROSE })]),
+      },
+    });
+
+    await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+    expect(useWorkspaceStore.getState().sendingThreadId).toBeNull();
+    const before = transport.state.getCalls;
+
+    const outcome = await useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    expect(outcome).toEqual({ kind: "opened", threadId: THREAD_ID });
+    expect(transport.state.getCalls).toBe(before + 1);
+    // The prose the operator watched survive the reconcile.
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns[0].answer).toBe(WATCHED_PROSE);
+  });
+
+  it("sends the question exactly once across the three entry paths", async () => {
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: { [THREAD_ID]: threadWith([]) },
+    });
+    transport.holdRun();
+
+    // HomePage: the thread is opened, then the question is sent.
+    await useWorkspaceStore.getState().openThread(THREAD_ID);
+    const sendP = useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？");
+    // The route mounts (App.ThreadRoute) and the thread page re-syncs.
+    await useWorkspaceStore.getState().openThread(THREAD_ID);
+    await useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    expect(transport.state.sendCalls).toBe(1);
+    // Only the ONE required read (the entry that opened the thread);
+    // the two entries during the send read nothing.
+    expect(transport.state.getCalls).toBe(1);
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].question).toBe("营收多少？");
+
+    transport.releaseRun();
+    await sendP;
+  });
+
+  it("does not let a late read drop the live turn and its streamed prose", async () => {
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      // The server has not written the RunRecord yet: the history read
+      // carries no row for the run that is already answering.
+      details: { [THREAD_ID]: threadWith([]) },
+    });
+    transport.holdGet(THREAD_ID);
+    const recorder = recordVisibleAnswers();
+
+    // The read starts BEFORE the send.
+    const openP = useWorkspaceStore.getState().openThread(THREAD_ID);
+    // The send runs to its terminal frame while the read is pending.
+    const sendP = useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？");
+    await sendP;
+    expect(
+      useWorkspaceStore.getState().activeThread?.turns[0].answer,
+    ).toBe(WATCHED_PROSE);
+
+    // The slow read lands LAST.
+    transport.releaseGet(THREAD_ID);
+    await openP;
+    recorder.stop();
+
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].answer).toBe(WATCHED_PROSE);
+    expect(turns[0].status).toBe("done");
+    expectNeverShrinks(recorder.seen);
+  });
+
+  it("does not let a pending read repaint the thread the operator left", async () => {
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: {
+        [THREAD_ID]: threadWith([watchedTurn()]),
+        [OTHER_THREAD_ID]: threadWith(
+          [watchedTurn({ answer: PERSISTED_PROSE })],
+          { id: OTHER_THREAD_ID },
+        ),
+      },
+    });
+    transport.holdGet(THREAD_ID);
+
+    const openA = useWorkspaceStore.getState().openThread(THREAD_ID);
+    // The operator moves to another thread while the first read pends.
+    await useWorkspaceStore.getState().openThread(OTHER_THREAD_ID);
+    expect(useWorkspaceStore.getState().activeThread?.id).toBe(OTHER_THREAD_ID);
+
+    // The first read lands last and must not take the active thread back.
+    transport.releaseGet(THREAD_ID);
+    const outcome = await openA;
+    expect(outcome.kind).toBe("superseded");
+    expect(useWorkspaceStore.getState().activeThread?.id).toBe(OTHER_THREAD_ID);
+  });
+
+  it("survives a double effect on the same thread without duplicating the turn table", async () => {
+    seedStreamedThread([watchedTurn()]);
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: { [THREAD_ID]: threadWith([watchedTurn()]) },
+    });
+
+    const first = useWorkspaceStore.getState().openThread(THREAD_ID);
+    const second = useWorkspaceStore.getState().openThread(THREAD_ID);
+    await Promise.all([first, second]);
+
+    // Both reads are answered; neither one duplicates the turn table.
+    expect(transport.state.getCalls).toBe(2);
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(useWorkspaceStore.getState().activeThread?.id).toBe(THREAD_ID);
+  });
+
+  it("orders two reads of the SAME thread: the older one does not write over the newer", async () => {
+    // Two concurrent reads of ONE thread are only orderable with a
+    // per-read token: a thread id cannot say which of them is newer.
+    // The older read lands last here, and it must not replace the
+    // state the newer read already owns.
+    seedThread();
+    const transport = stubEntryTransport({
+      frames: ENTRY_FRAMES,
+      details: { [THREAD_ID]: threadWith([watchedTurn()]) },
+      detailSequence: {
+        [THREAD_ID]: [
+          threadWith([watchedTurn({ answer: "更早的读" })]),
+          threadWith([watchedTurn({ answer: "更新的读" })]),
+        ],
+      },
+    });
+    // The FIRST read waits; the second one lands first.
+    transport.holdGet(THREAD_ID);
+
+    const older = useWorkspaceStore.getState().openThread(THREAD_ID);
+    const newer = useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    await newer;
+    expect(
+      useWorkspaceStore.getState().activeThread?.turns[0].answer,
+    ).toBe("更新的读");
+
+    // The older read lands last: it is superseded and writes nothing.
+    transport.releaseGet(THREAD_ID);
+    const olderOutcome = await older;
+    expect(olderOutcome.kind).toBe("superseded");
+    expect(
+      useWorkspaceStore.getState().activeThread?.turns[0].answer,
+    ).toBe("更新的读");
+  });
+
+  it("releases the thread-scoped fact when the send fails", async () => {
+    seedThread();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: "concurrent_run" }), {
+            status: 409,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+
+    await expect(
+      useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？"),
+    ).rejects.toBeInstanceOf(ConcurrentRunError);
+
+    // A failed send settles like a successful one: the fact is
+    // released, so the next entry reads the thread again.
+    expect(useWorkspaceStore.getState().sendingThreadId).toBeNull();
+  });
+
+  it("keeps the failure distinctions: a refused thread still rejects as gated", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ error: "knowledge_mcp_fault", message: "知识 MCP 故障" }),
+            { status: 409, headers: { "content-type": "application/json" } },
+          ),
+      ),
+    );
+
+    const error = await useWorkspaceStore
+      .getState()
+      .openThread(THREAD_ID)
+      .catch((e: unknown) => e);
+
+    expect(classifyThreadOpenFailure(error)).toBe("gated");
+  });
+
+  it("keeps the failure distinctions: an unknown thread still rejects as missing", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: "thread_not_found" }), {
+            status: 404,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+
+    const error = await useWorkspaceStore
+      .getState()
+      .openThread(THREAD_ID)
+      .catch((e: unknown) => e);
+
+    expect(classifyThreadOpenFailure(error)).toBe("missing");
+  });
+});
+
+// question-workspace: a TERMINAL clarification reply opens a NEW turn on
+// the normal send door, and the host owns that turn's question text
+// (``fin.host.graph._clarify_reply_turn_question``): the committed task
+// goal (or, with no current task, the pending question's own prompt)
+// beside the operator's answer, trimmed and separated by the two fixed
+// labels. The optimistic row renders before any host frame arrives, so it
+// must publish that ONE composition exactly — otherwise the row rewrites
+// itself the moment the persisted GET replaces it.
+describe("a terminal clarification reply composes the reply turn's question", () => {
+  const GOAL = "ZEUS 年假政策是什么？";
+  const PROMPT = "请补充：公司/期间";
+  const CHOICE = "2023 年度";
+  const REPLY_RUN_ID = "66666666-6666-4666-8666-666666666666";
+  const QUESTION_ID = "q-terminal-1";
+
+  function terminalQuestion(): PendingQuestionView {
+    return {
+      question_id: QUESTION_ID,
+      task_id: "task-1",
+      task_version: 1,
+      prompt: PROMPT,
+      choices: ["苹果公司", CHOICE, "other"],
+      input_version: 1,
+      purpose: "task_clarification",
+      origin_run_id: null,
+      choice_details: [],
+    };
+  }
+
+  /** The host's projection for a thread paused on a terminal clarification.
+   * ``goal === null`` is the shape the host publishes when it asks before
+   * a task is current. */
+  function terminalEnvelope(goal: string | null): TaskRuntimeView {
+    return {
+      current_task:
+        goal === null
+          ? null
+          : {
+              task_id: "task-1",
+              goal,
+              expected_result: "",
+              task_version: 1,
+              necessary_conditions: [],
+              outcome: "active",
+              outcome_reason: "",
+              created_at_input_version: 1,
+            },
+      archived_tasks: [],
+      pending_question: terminalQuestion(),
+      reconciliation: null,
+      task_outcome: null,
+      input_version: 1,
+      input_history: [],
+    };
+  }
+
+  function seedTerminalClarification(goal: string | null): void {
+    useWorkspaceStore.setState({
+      activeThread: threadWith([]),
+      threads: [],
+      sendingQuestion: false,
+      sendingThreadId: null,
+      resumingThreadId: null,
+      taskRuntime: { [THREAD_ID]: terminalEnvelope(goal) },
+      clarificationDrafts: {},
+      workspaceOperations: EMPTY_WORKSPACE_OPERATIONS,
+      restoreRequests: {},
+      taskProjectionRefusal: {},
+      taskProjectionRefreshFailed: {},
+    });
+  }
+
+  /** Stub the reply run: the POST answers one terminal status frame, the
+   * projection re-read answers the host's state with the question cleared,
+   * and every other GET answers an empty list. Returns the questions the
+   * optimistic row carried while the POST was in flight — before any host
+   * frame or persisted row could supply them. */
+  function stubReplyDoor(): string[] {
+    const optimisticQuestions: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : String(input);
+        if (init?.method === "POST") {
+          const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+          optimisticQuestions.push(turns[turns.length - 1]?.question ?? "");
+          const frame = `event: status\ndata: ${JSON.stringify({
+            run_id: REPLY_RUN_ID,
+            status: "done",
+            assistant_message: "",
+          })}\n\n`;
+          return new Response(frame, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        if (url.includes(`/threads/${THREAD_ID}`)) {
+          return new Response(
+            JSON.stringify({
+              ...threadWith([]),
+              task_runtime: { ...terminalEnvelope(null), pending_question: null },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+    return optimisticQuestions;
+  }
+
+  async function replyWith(goal: string | null, freeText?: string): Promise<string[]> {
+    seedTerminalClarification(goal);
+    const store = useWorkspaceStore.getState();
+    store.openTaskClarification(THREAD_ID);
+    if (freeText === undefined) {
+      store.selectTaskChoice(THREAD_ID, CHOICE);
+    } else {
+      store.selectTaskChoice(THREAD_ID, "other");
+      store.setTaskOtherText(THREAD_ID, freeText);
+    }
+    const optimisticQuestions = stubReplyDoor();
+    await useWorkspaceStore.getState().submitTaskReply(THREAD_ID);
+    return optimisticQuestions;
+  }
+
+  it("puts the committed goal beside the pick, and keeps it after the re-read", async () => {
+    const optimisticQuestions = await replyWith(GOAL);
+
+    const expected = `原问题：${GOAL}\n补充回答：${CHOICE}`;
+    expect(optimisticQuestions).toEqual([expected]);
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].question).toBe(expected);
+  });
+
+  it("falls back to the pending question's prompt and trims the free text", async () => {
+    // No current task: the host composes from the pending question's own
+    // prompt. The answer is Other's text with padding, so this also pins
+    // the trim both surfaces apply before composing.
+    const optimisticQuestions = await replyWith(null, "  只看 ZEUS Employee Handbook  ");
+
+    const expected = `原问题：${PROMPT}\n补充回答：只看 ZEUS Employee Handbook`;
+    expect(optimisticQuestions).toEqual([expected]);
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].question).toBe(expected);
   });
 });

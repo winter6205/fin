@@ -179,8 +179,56 @@ def test_poll_accepts_the_unwrapped_result_variant() -> None:
     assert poll.community_index_state == CommunityIndexState("in_progress", None)
 
 
-def test_poll_requires_community_state() -> None:
+def test_poll_accepts_an_explicit_null_community_state() -> None:
+    """A never-written C singleton answers ``null`` on the wire, and a
+    present ``null`` is that honest "no claim yet" answer — not a body
+    fin has to reject. The job row beside it is still parsed in full."""
+    body = {**POLL_BODY, "community_index_state": None}
+    port = MCPIndexJobPort(session=StubSession(_tool_response(body)))
+    poll = port.poll_index_job("job-1")
+    assert poll.community_index_state is None
+    assert poll.record == IndexJobRecord(
+        job_id="job-1",
+        source_ref="src-1",
+        content_identity="id-1",
+        status="ready",
+        started_at="2026-01-01T00:00:00.000Z",
+        finished_at="2026-01-01T00:02:00.000Z",
+        failure_code=None,
+    )
+
+
+def test_poll_accepts_a_null_community_state_on_the_unwrapped_variant() -> None:
+    body = {**POLL_BODY, "community_index_state": None}
+    response = {"jsonrpc": "2.0", "id": _TOOL_REQUEST_ID, "result": body}
+    port = MCPIndexJobPort(session=StubSession(response))
+    assert port.poll_index_job("job-1").community_index_state is None
+
+
+def test_poll_requires_the_community_state_key() -> None:
     body = {key: value for key, value in POLL_BODY.items() if key != "community_index_state"}
+    port = MCPIndexJobPort(session=StubSession(_tool_response(body)))
+    with pytest.raises(IndexJobUnavailableError):
+        port.poll_index_job("job-1")
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param([], id="list"),
+        pytest.param("in_progress", id="string"),
+        pytest.param(7, id="number"),
+        pytest.param({}, id="empty_object"),
+        pytest.param({"failure_code": None}, id="no_status"),
+        pytest.param({"status": ""}, id="blank_status"),
+        pytest.param({"status": 1}, id="mistyped_status"),
+        pytest.param({"status": "ready", "failure_code": 7}, id="mistyped_failure_code"),
+    ],
+)
+def test_poll_rejects_a_malformed_community_state(state: Any) -> None:
+    """Only an explicit ``null`` reads as "not written yet"; anything
+    else that is not a well-formed sub-object stays off-contract."""
+    body = {**POLL_BODY, "community_index_state": state}
     port = MCPIndexJobPort(session=StubSession(_tool_response(body)))
     with pytest.raises(IndexJobUnavailableError):
         port.poll_index_job("job-1")

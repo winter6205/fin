@@ -197,7 +197,7 @@ def _durable_deployment(**overrides: "str | None") -> dict[str, str]:
 
     ``None`` removes a key; ``""`` / whitespace stands for a key the
     deployment exported empty. Either way the map is passed in explicitly, so
-    the operator ``.env`` that ``tests/conftest.py`` loads can never decide a
+    a shell-exported operator variable can never decide a
     case for us.
     """
     values = {

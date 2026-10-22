@@ -13,9 +13,9 @@ surface:
   letter must resolve to nothing here as everywhere else. A lasting tier
   that arrives without copy fails
   :func:`test_copy_keys_are_exactly_the_lasting_tiers`.
-* the copy TEXT names the lasting MCP token and never tells the model its
-  token is a retired letter — including the 真数据库 copy, whose document
-  tables stay on ``graph``.
+* the copy TEXT names no mode at all — neither the lasting MCP token nor
+  the operator label — and never tells the model to send a mode filter,
+  because the host assigns the mode and the model cannot send one.
 * an unresolvable token injects nothing: the payload stays byte-identical
   to the no-档 call, so an out-of-set value never borrows another 档's
   instructions.
@@ -66,12 +66,15 @@ def test_every_copy_is_marked_once(mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", LASTING_RETRIEVE_TIERS)
-def test_a_word_token_copy_names_its_own_token(mode: str) -> None:
-    """Every 档 copy teaches the wire token the operator's request carries:
-    a label with no token taught beside it is how a model ends up sending a
-    档 nobody named."""
+def test_a_copy_never_teaches_the_model_to_send_a_mode(mode: str) -> None:
+    """The model cannot send a mode: the host assigns it and the retrieve
+    call carries it (spec search-mode SC2). A copy that told the model to
+    send a mode filter taught an argument the tool schema does not accept,
+    and the model then spent turns trying to send it."""
     copy = SEARCH_MODE_USAGE_COPY[mode]
-    assert f"filters.search_mode={mode}" in copy
+    assert "search_mode" not in copy
+    for lasting in LASTING_RETRIEVE_TIERS:
+        assert f"filters.search_mode={lasting}" not in copy
 
 
 @pytest.mark.parametrize("mode", sorted(SEARCH_MODE_USAGE_COPY))
@@ -85,28 +88,37 @@ def test_no_copy_instructs_a_retired_letter(mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", sorted(SEARCH_MODE_USAGE_COPY))
-def test_operator_label_sits_under_its_own_key(mode: str) -> None:
-    """The 档 labels are unchanged (CONTEXT 检索档): only the token moved."""
-    assert TIER_LABELS[mode] in SEARCH_MODE_USAGE_COPY[mode]
+def test_no_copy_names_any_mode(mode: str) -> None:
+    """The copy describes the path the host chose and names none of them.
+
+    A named mode is a vocabulary the model then repeats in its own
+    reasoning — and that reasoning is rendered — so the operator saw the
+    internal mode names on the page. The operator's labels and the lasting
+    tokens are both forbidden here."""
+    copy = SEARCH_MODE_USAGE_COPY[mode]
+    for lasting in LASTING_RETRIEVE_TIERS:
+        assert f" {lasting} " not in f" {copy} ", mode
+        assert f"{lasting} " not in copy, mode
+        assert TIER_LABELS[lasting] not in copy, mode
+    assert "档" not in copy, mode
 
 
-def test_real_db_copy_keeps_document_tables_on_graph() -> None:
-    assert "graph" in SEARCH_MODE_USAGE_COPY["sql"]
-    assert "filters.search_mode=graph" in SEARCH_MODE_USAGE_COPY["sql"]
+def test_the_copies_still_describe_their_path() -> None:
+    """Naming no mode must not empty the copy: each one still tells the
+    model how to use the path the host picked."""
+    assert "keyword-first" in SEARCH_MODE_USAGE_COPY["lexical"]
+    assert "neighbourhoods" in SEARCH_MODE_USAGE_COPY["graph"]
+    assert "community summaries" in SEARCH_MODE_USAGE_COPY["global"]
+    assert "live" in SEARCH_MODE_USAGE_COPY["sql"]
+    assert "expiry-window" in SEARCH_MODE_USAGE_COPY["sql"]
 
 
-def test_the_lookup_copy_names_the_token_once_and_the_wire_once() -> None:
-    """The 查找 copy is one mechanism descriptor plus the wire sentence — the
-    shape every other 档 copy uses. It used to say the word three times
-    (``检索档 lexical``, ``lexical-first``, the wire sentence), and a token
-    repeated in prose is a second spelling waiting to drift. The wire
-    teaching itself is what this pins hardest: without it the model has no
-    idea what to send.
-    """
+def test_the_lookup_copy_names_no_token_at_all() -> None:
+    """The 查找 copy used to say the word three times (``检索档 lexical``,
+    ``lexical-first``, the wire sentence), and a token repeated in prose is
+    a second spelling waiting to drift. The copy now names it zero times."""
     copy = SEARCH_MODE_USAGE_COPY["lexical"]
-    assert copy.count("lexical") == 2
-    assert "filters.search_mode=lexical" in copy
-    assert "lexical-first" not in copy
+    assert "lexical" not in copy
     assert "keyword-first" in copy
 
 

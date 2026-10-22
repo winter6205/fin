@@ -21,16 +21,16 @@ from typing import Any
 
 import pytest
 
-from fin.host.attachment_prep_worker import DrainCadence
-from fin.host.evidence_contract import (
+from fin.host.attachment.attachment_prep_worker import DrainCadence
+from fin.host.evidence.evidence_contract import (
     EVIDENCE_UNAVAILABLE,
     RETRIEVE_UNAVAILABLE,
 )
-from fin.host.structured_evidence import build_stored_record, structured_snapshots_of
-from fin.host.structured_evidence_drain_worker import (
+from fin.host.evidence.structured_evidence import build_stored_record, structured_snapshots_of
+from fin.host.evidence.structured_evidence_drain_worker import (
     StructuredInvalidationDrainWorker,
 )
-from fin.host.structured_evidence_invalidation import (
+from fin.host.evidence.structured_evidence_invalidation import (
     StructuredInvalidationRefusal,
     drain_invalidation_batch,
 )
@@ -500,7 +500,7 @@ def _admission_sibling(**over: Any) -> dict[str, Any]:
 
 
 def _admitted_record(**over: Any) -> dict[str, Any]:
-    from fin.host.structured_evidence_admission import admit_structured_evidence
+    from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
 
     admission = admit_structured_evidence(_admission_sibling(**over))
     assert admission.refusal is None
@@ -515,8 +515,8 @@ def test_live_pg_admitted_structured_evidence_round_trips_through_the_jsonb_colu
     persisted ``fin_run.structured_evidence`` value, not an always-empty column."""
     import psycopg
 
-    from fin.host.structured_evidence import project_stored_structured_evidence
-    from fin.host.structured_snapshot import structured_snapshot_digest
+    from fin.host.evidence.structured_evidence import project_stored_structured_evidence
+    from fin.host.evidence.structured_snapshot import structured_snapshot_digest
 
     record = _admitted_record()
     thread_id = f"thread-{uuid.uuid4()}"
@@ -560,7 +560,7 @@ def test_live_pg_a_refused_sibling_persists_zero_records_not_an_empty_success(
     """
     import psycopg
 
-    from fin.host.structured_evidence_admission import admit_structured_evidence
+    from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
 
     admission = admit_structured_evidence(_admission_sibling(operation="aggregate"))
     assert admission.refusal is not None
@@ -599,7 +599,7 @@ def test_live_pg_an_admitted_record_that_fails_the_write_guard_raises_and_leaves
     """
     import psycopg
 
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.thread_store import EvidenceContractWriteError
 
     record = _admitted_record()
@@ -746,7 +746,7 @@ def test_live_pg_admitting_the_same_sibling_twice_writes_the_same_digest(
     structured_admission_live_pg_url: str,
 ) -> None:
     """Repeat delivery of one producer result is stable on real storage."""
-    from fin.host.structured_evidence_admission import admit_structured_evidence
+    from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
 
     first = admit_structured_evidence(_admission_sibling())
     second = admit_structured_evidence(_admission_sibling())

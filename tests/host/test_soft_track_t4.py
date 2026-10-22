@@ -7,14 +7,14 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
-from fin.host.jev_choice import (
+from fin.host.grounded.citation_gate import HIDDEN_BOUNCE_MARKER
+from fin.host.question.jev_choice import (
     JEV_CHOICE_EXIT_INVALID_LABEL,
     JEV_CHOICE_EXIT_SCHEMA,
     JEV_CHOICE_EXIT_TRANSPORT,
     JevChoiceError,
 )
-from fin.host.track_decision import decide_track
+from fin.host.grounded.track_decision import decide_track
 from jev_fake import FakeJevChoice
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
@@ -32,17 +32,19 @@ def _thread_config(thread_id: str) -> dict:
         JEV_CHOICE_EXIT_TRANSPORT,
     ],
 )
-def test_jev_exit_codes_all_fail_closed_to_clarify(exit_code: str):
-    """Any typed judge exit is clarify (ADR 0080) — no fall-through to
-    a MiniMax JSON classify or a silent default track."""
+def test_jev_exit_codes_all_fall_back_to_retrieval(exit_code: str):
+    """GE-1: any typed judge exit leaves the turn on the retrieval lane
+    — never a pre-retrieval clarify, never a fall-through to a MiniMax
+    JSON classify or a silent default track. The receipt still records
+    WHY the judge decided nothing."""
     fake = FakeJevChoice([JevChoiceError("judge down", exit_code=exit_code)])
     decision = decide_track(
         [HumanMessage(content="hmm maybe this?")],
         jev_client=fake,
     )
     assert len(fake.calls) == 1
-    assert decision.track == "clarify"
-    assert decision.decision_tier == "clarify"
+    assert decision.track == "grounded"
+    assert decision.decision_tier == "jev_fallback"
     assert decision.signals.get("jev_exit") == exit_code
 
 
@@ -75,8 +77,11 @@ def test_jev_valid_label_used_when_ambiguous():
     assert decision.decision_tier == "jev"
 
 
-def test_graph_jev_error_does_not_crash_and_skips_gate():
-    """Injected judge throw → clarify leaf; non-research skips the gate."""
+def test_graph_jev_error_does_not_crash_and_reaches_grounded():
+    """GE-1: an injected judge throw is contained at the cascade boundary
+    — the turn reaches the grounded leaf (never a crash, never a
+    pre-retrieval clarify). With no retrieval, the leaf's admission
+    falls through to the citation gate unchanged."""
     fake = FakeJevChoice(
         [JevChoiceError("boom", exit_code=JEV_CHOICE_EXIT_TRANSPORT)]
     )
@@ -98,12 +103,15 @@ def test_graph_jev_error_does_not_crash_and_skips_gate():
         },
         config=_thread_config("t-soft-t4-exit"),
     )
-    assert out["track"] == "clarify"
+    assert out["track"] == "grounded"
+    assert out["track_decision"]["decision_tier"] == "jev_fallback"
     assert (
         out["track_decision"]["signals"].get("jev_exit") == "transport"
     )
-    assert out["status"] == "done"
-    assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))
+    assert out["status"] == "refuse"
+    # The gate DID run now (the turn is grounded, not a pre-retrieval
+    # clarify): the answer cites nothing, so the gate bounces it.
+    assert HIDDEN_BOUNCE_MARKER in str(out.get("messages", []))
     assert out.get("citations", ()) == () or out.get("citations") == []
 
 

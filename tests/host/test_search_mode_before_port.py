@@ -24,7 +24,7 @@ what is asserted is the TOKEN a call carries, never how iknow ranks
 * ``test_a_pinned_letter_is_a_named_exit_and_routes_nothing`` — the same
   seam an old client used to pin with a letter.
 * ``test_a_newly_opened_ask_assigns_its_token_and_starts_no_letter`` —
-  the plan slot that the tracked change T7 opened (``sql``) now reads as a plain
+  the plan slot that T7 opened (``sql``) now reads as a plain
   assignment on every audit field, and the typed-fail shape no longer
   fires for ANY closed-set naming.
 * ``test_the_value_handed_to_the_port_is_never_a_letter`` — the port
@@ -40,13 +40,16 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
-from fin.host.agent_instructions import SEARCH_MODE_INSTRUCTIONS_MARKER
+from fin.host.agent_instructions import (
+    SEARCH_MODE_INSTRUCTIONS_MARKER,
+    SEARCH_MODE_USAGE_COPY,
+)
 from fin.host.graph import compile_graph
 from fin.host.named_failures import (
     LASTING_RETRIEVE_TIERS,
     TIER_UNAVAILABLE_CODE,
 )
-from fin.host.search_mode_decision import (
+from fin.host.grounded.search_mode_decision import (
     decide_search_mode,
     normalize_search_mode,
 )
@@ -67,7 +70,7 @@ KNOWN_IDS = {"AAPL-2022Q3"}
 # Every spelling a request can arrive with for each OPENED 档: the lasting
 # token, a case variant, and the CONTEXT label an utterance names it with.
 # ``global`` joined this set when fin task 4 opened 综述 into a real report
-# arm; ``sql`` joined it at the tracked change T7 (commit 6e8ed97), when 真数据库 became a
+# arm; ``sql`` joined it at T7 (commit 6e8ed97), when 真数据库 became a
 # real arm too — every lasting token in the closed set now routes itself to
 # the port, and no plan slot is left to refuse (``TIER_UNAVAILABLE_CODE``
 # is empty; the mechanism stays for a future slot).
@@ -78,7 +81,7 @@ OPENED_SPELLINGS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sql", ("sql", "SQL", "真数据库")),
 )
 # Formerly the unopened plan slot with the 具名失败 its name yielded
-# (``("sql", REAL_DB_NOT_WIRED, ...)``); the tracked change T7 moved sql into
+# (``("sql", REAL_DB_NOT_WIRED, ...)``); T7 moved sql into
 # OPENED_SPELLINGS and this set is EMPTY — the typed-fail entry point
 # below keeps testing it as a NEGATIVE invariant (nothing in the closed
 # set can produce it).
@@ -214,15 +217,17 @@ def test_an_assigned_tier_records_its_token_before_retrieve(
             lasting
         ] * len(port.calls), [call["search_mode"] for call in port.calls]
         # The retrieve call is the SECOND model call of this run: the copy on
-        # the first one is the audit's own token, visible before the port ran.
+        # the first one is the assignment's own copy, visible before the port
+        # ran. The copy names no mode — the host assigns it — so what proves
+        # the assignment is the copy's identity, not a word in it.
         blocks = _mode_copy_blocks(model)
         assert blocks and all(
-            f"检索档 {lasting}" in block for block in blocks
+            SEARCH_MODE_USAGE_COPY[lasting] in block for block in blocks
         ), (spelling, blocks)
 
 
 def test_a_newly_opened_ask_assigns_its_token_and_starts_no_letter() -> None:
-    """Flipped by the tracked change T7 (commit 6e8ed97): the old case pinned the
+    """Flipped by T7 (commit 6e8ed97): the old case pinned the
     ``sql`` utterance as ``typed_fail`` + ``failure_code=real_db_not_wired``
     + ``search_mode=None`` handed to the port. The 档 is open now, so
     naming it ASSIGNS it — the audit reads the lasting token on every
@@ -286,15 +291,25 @@ def test_a_pinned_letter_is_a_named_exit_and_routes_nothing(
 ) -> None:
     """The pin seam keeps its old client honest by name, not by guess: a
     retired letter is out of the closed set, so the cascade records the
-    ``invalid_search_mode`` EXIT and hands no 档 to the port."""
+    ``invalid_search_mode`` EXIT and hands no 档 to the port.
+
+    The rejection stays NAMED at the residual (spec contract item 2: the
+    fallback does not silently reinterpret a refused explicit selection):
+    the decision is a typed fail carrying the same code, and the port is
+    still handed ``None`` — the run ends in the port's own named
+    rejection instead of an invented default.
+    """
     out, port, _model = _run(PLAIN_ASK, pinned=letter)
 
     audit = out["search_mode_decision"]
     assert audit["signals"].get("pin_exit") == "invalid_search_mode", letter
     assert audit["signals"].get("pin") == letter
     assert audit["search_mode"] is None
-    # The residual may still be a clarify (no judge injected here), which is
-    # the same "invent nothing" answer the closed set gives everywhere else.
+    assert audit["decision_tier"] == "typed_fail"
+    assert audit["failure_code"] == "invalid_search_mode"
+    assert audit["options"] == []
+    # The port is still handed None: the named rejection is not turned into
+    # a fallback answer on the way to the seam.
     assert [call["search_mode"] for call in port.calls] == [None] * len(
         port.calls
     ), [call["search_mode"] for call in port.calls]
@@ -305,12 +320,21 @@ def test_an_utterance_naming_a_letter_resolves_no_tier(letter: str) -> None:
     """Zero coexistence at the entry: ``A档`` / ``D档`` is ordinary prose the
     judge and the rest of the cascade read, not a named 档 — the letter class
     left the naming pattern together with the alias map, so the rules tier
-    cannot even see it as a candidate."""
+    cannot even see it as a candidate.
+
+    Ordinary prose then takes the recorded default: the residual assigns
+    ``graph`` at the ``fallback`` tier with no options, and NO rule marker
+    claims the letter named a 档.
+    """
     decision = decide_search_mode(
         [HumanMessage(content=f"{letter}档 {PLAIN_ASK}")]
     )
-    assert decision.search_mode is None
     assert "tier_naming" not in decision.signals
+    assert "ambiguous_naming" not in decision.signals
+    assert decision.search_mode == "graph"
+    assert decision.decision_tier == "fallback"
+    assert decision.confidence == 0.0
+    assert decision.options == []
 
 
 # ----- the port seam's own view -----
@@ -337,7 +361,7 @@ def test_the_value_handed_to_the_port_is_never_a_letter() -> None:
 
     assert resolve_search_mode(normalize_search_mode("GRAPH")) == "graph"
     assert resolve_search_mode(normalize_search_mode("GLOBAL")) == "global"
-    # Every closed-set token — ``sql`` included since the tracked change T7 opened it
+    # Every closed-set token — ``sql`` included since T7 opened it
     # (the old pin asserted a ``TierUnavailableError`` carrying
     # ``real_db_not_wired`` for it) — crosses the seam as itself. The
     # refusal class stays as machinery for a future plan slot; with the

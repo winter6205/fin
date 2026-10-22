@@ -2,7 +2,7 @@
 
 Spec ``specs/thread-attachment-source-read.md`` (decision 1 / decision 7,
 lines 59 + 61) and plan item 8 (T3 acceptance), pinned through the frozen
-``fin.host.attachment_retrieval`` contract:
+``fin.host.attachment.attachment_retrieval`` contract:
 
 * a ready attachment hit carries ``source_ref={kind:"attachment",
   attachment_id,version,unit}`` (``unit`` is the one-based frozen-unit
@@ -47,7 +47,7 @@ from langgraph.types import Command
 
 from fin.corpus.extracted import Locator
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.attachment_retrieval import (
+from fin.host.attachment.attachment_retrieval import (
     AttachmentChunk,
     AttachmentIndexUnavailableError,
     AttachmentLocator,
@@ -566,7 +566,7 @@ def test_the_search_runs_once_even_when_the_company_leg_rewrites() -> None:
 
 
 # ---------------------------------------------------------------------------
-# unwired retriever: the envelope is exactly today's envelope
+# unwired retriever: no attachment keys reach the envelope
 # ---------------------------------------------------------------------------
 
 
@@ -586,14 +586,15 @@ def test_retriever_absent_keeps_the_envelope_byte_identical() -> None:
                 },
                 "score": 1.5,
             }
-        ]
+        ],
+        "distribution": "hit",
     }
 
 
 def test_retriever_absent_keeps_the_miss_envelope_byte_identical() -> None:
     graph = _compile(company_hits=False)
 
-    assert _envelope(_run(graph, _THREAD_A)) == {"chunks": []}
+    assert _envelope(_run(graph, _THREAD_A)) == {"chunks": [], "distribution": "zero"}
 
 
 def test_attachment_ids_without_a_retriever_changes_nothing() -> None:
@@ -605,7 +606,7 @@ def test_attachment_ids_without_a_retriever_changes_nothing() -> None:
         _run(graph, _THREAD_A, args={"query": GROUNDED, "attachment_ids": ["att-1"]})
     )
 
-    assert envelope == {"chunks": []}
+    assert envelope == {"chunks": [], "distribution": "zero"}
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +772,7 @@ def test_the_composition_root_threads_the_service_as_the_retriever(
     monkeypatch.setitem(sys.modules, "langgraph.checkpoint.postgres", pg_module)
     for key in ("FIN_RETRIEVE_ADAPTER", "FIN_MODEL", "FIN_BASE_URL"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-attachment-test-model")
 
     calls: list[dict[str, Any]] = []
 
@@ -789,7 +791,7 @@ def test_the_composition_root_threads_the_service_as_the_retriever(
 
 
 # ---------------------------------------------------------------------------
-# T3 -> T4 handoff (the tracked change integration gate)
+# T3 -> T4 handoff (integration gate)
 # ---------------------------------------------------------------------------
 
 

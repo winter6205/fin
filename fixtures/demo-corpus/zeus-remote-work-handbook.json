@@ -1,0 +1,28 @@
+{
+  "source_ref": "zeus-remote-work-handbook",
+  "title": "ZEUS Remote Work Handbook",
+  "content": "ZEUS Remote Work Handbook · Page 1\nSection 1: Remote work eligibility\nEmployees whose role is marked hybrid may work remotely on Friday, the company-wide remote day stated in zeus-handbook, Section 1. A manager may approve one additional remote day in a week when the team calendar shows adequate on-site coverage. Employees must keep their work location current in the People Portal by 10:00 local time on each workday. Roles requiring secure lab access remain on site for scheduled lab sessions. This guide applies to employees in ZEUS offices and does not change local employment terms.\n\nZEUS Remote Work Handbook · Page 2\nSection 2: Equipment and expenses\nZEUS supplies one encrypted laptop, one docking station, and one headset to each approved remote worker. The equipment remains company property and is returned within 5 working days after a role change or departure. Home internet reimbursement is capped at USD 55 per month and is submitted through the expense workflow. See zeus-expense-policy, Section 1, for receipt and approval rules. Employees must lock the screen whenever they leave a shared room and may not print restricted project material at home.\n\nZEUS Remote Work Handbook · Page 3\nSection 3: Availability and safety\nCore collaboration hours are 10:00–15:00 in the employee's local time zone. A team may set a narrower overlap window in its working agreement, but may not require availability outside the employee's contracted hours. Managers review remote arrangements every 6 months. Employees report a lost device to the Service Desk within 30 minutes and follow the incident steps in zeus-incident-response, Section 1. A request for an ergonomic assessment is sent to Workplace Services; approved adjustments are reviewed within 10 working days.",
+  "chunks": [
+    {
+      "content": "ZEUS Remote Work Handbook · Page 1\nSection 1: Remote work eligibility\nEmployees whose role is marked hybrid may work remotely on Friday, the company-wide remote day stated in zeus-handbook, Section 1. A manager may approve one additional remote day in a week when the team calendar shows adequate on-site coverage. Employees must keep their work location current in the People Portal by 10:00 local time on each workday. Roles requiring secure lab access remain on site for scheduled lab sessions. This guide applies to employees in ZEUS offices and does not change local employment terms.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Remote Work Handbook · Page 2\nSection 2: Equipment and expenses\nZEUS supplies one encrypted laptop, one docking station, and one headset to each approved remote worker. The equipment remains company property and is returned within 5 working days after a role change or departure. Home internet reimbursement is capped at USD 55 per month and is submitted through the expense workflow. See zeus-expense-policy, Section 1, for receipt and approval rules. Employees must lock the screen whenever they leave a shared room and may not print restricted project material at home.",
+      "index": 1
+    },
+    {
+      "content": "ZEUS Remote Work Handbook · Page 3\nSection 3: Availability and safety\nCore collaboration hours are 10:00–15:00 in the employee's local time zone. A team may set a narrower overlap window in its working agreement, but may not require availability outside the employee's contracted hours. Managers review remote arrangements every 6 months. Employees report a lost device to the Service Desk within 30 minutes and follow the incident steps in zeus-incident-response, Section 1. A request for an ergonomic assessment is sent to Workplace Services; approved adjustments are reviewed within 10 working days.",
+      "index": 2
+    }
+  ],
+  "metadata": {
+    "document_type": "employee_handbook",
+    "page_count": 3,
+    "company": "ZEUS",
+    "form": "10-K",
+    "period": "2024 FY",
+    "filing_date": "2024-02-19"
+  },
+  "valid_from": "2024-02-19T00:00:00Z"
+}

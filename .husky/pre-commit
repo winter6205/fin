@@ -1,1 +1,1 @@
-npm run typecheck:staged
+sh scripts/lint-s5.sh --changed --staged && node scripts/pyright-staged.mjs

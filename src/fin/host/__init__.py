@@ -3,13 +3,13 @@
 T3 adds the ADR 0009 tool wrapper (``list_files``) as a plain
 callable. T4 adds ``retrieve`` against an injected
 ``BM25Adapter``. T5 introduces the citation gate at
-``src/fin/host/citation_gate.py``: the code gate on the path to END
+``src/fin/host/grounded/citation_gate.py``: the code gate on the path to END
 that fills the user-visible citations from extractive spans that
 matched this run's tool evidence (ADR 0008 + ADR 0021). T6 wires
 all three into the LangGraph host graph via ``compile_graph``.
 """
 
-from fin.host.citation_gate import (
+from fin.host.grounded.citation_gate import (
     BounceResult,
     Citation,
     CitationGateError,
@@ -22,7 +22,7 @@ from fin.host.citation_gate import (
 )
 from fin.host.graph import ConcurrentRunError, WorkspaceRootMissingError, compile_graph
 from fin.host.scripted_model import ScriptedChatModel
-from fin.host.session_compaction import (
+from fin.host.session.session_compaction import (
     SESSION_TOKEN_BUDGET,
     OccupancyCompactor,
     SessionSummaryError,

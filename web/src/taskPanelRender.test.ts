@@ -11,11 +11,21 @@ import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToString } from "react-dom/server";
 
-import TaskPanel from "./components/TaskPanel";
-import { taskState, type SubmissionNotice, type TaskStateView } from "./taskState";
+import TaskPanel from "./capabilities/task/components/TaskPanel";
+import {
+  gapsText,
+  runStatusText,
+  sourcesText,
+  submissionText,
+  taskOutcomeText,
+} from "./capabilities/task/taskPanelView";
+import { taskState, type SubmissionNotice, type TaskStateView } from "./capabilities/task/taskState";
+import type { TraceSpan } from "./capabilities/trace/traceSpans";
+import type { TurnTraceRead } from "./capabilities/trace/turnTraceRead";
 import type {
   CurrentTask,
   PendingQuestionView,
+  SearchModeDecision,
   TaskRuntimeView,
   Turn,
 } from "./types";
@@ -72,8 +82,30 @@ function envelope(overrides: Partial<TaskRuntimeView> = {}): TaskRuntimeView {
   };
 }
 
-function render(state: TaskStateView): string {
-  return renderToString(createElement(TaskPanel, { state }));
+function render(
+  state: TaskStateView,
+  devMode = true,
+  searchModeDecision?: SearchModeDecision | null,
+  extra: {
+    threadId?: string;
+    currentTurn?: Turn | null;
+    trace?: TurnTraceRead;
+  } = {},
+): string {
+  // ``devMode`` defaults to TRUE here because these cases pin WHAT the
+  // rows say — the markup of the receipt surface itself. Whether that
+  // surface is visible in the product's default view is a separate
+  // question, pinned in its own describe block below. Gating the render
+  // must not change a single row value, so every row assertion below is
+  // asserted against the developer-mode render it was written for.
+  return renderToString(
+    createElement(TaskPanel, {
+      state,
+      devMode,
+      searchModeDecision,
+      ...extra,
+    }),
+  );
 }
 
 /** Label -> value for every rendered row, read off the panel markup. */
@@ -92,6 +124,31 @@ function visible(html: string): string {
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ");
+}
+
+/** The internal retrieval names and their operator labels. The rendered
+ * receipt must carry NONE of them — neither in the visible text nor in
+ * an attribute (docs/CONTEXT.md 检索档: "rendered UI omits internal mode
+ * names and raw tokens remain in machine diagnostics"). */
+const INTERNAL_MODE_TOKENS = [
+  "lexical",
+  "graph",
+  "global",
+  "sql",
+  "查找",
+  "知识问答",
+  "综述",
+  "真数据库",
+] as const;
+
+/** Assert on the WHOLE rendered markup, not on the visible text alone:
+ * a raw token in an attribute is a leak too. */
+function expectNoInternalMode(html: string): void {
+  for (const token of INTERNAL_MODE_TOKENS) {
+    expect(html, `the rendered receipt leaks the internal name "${token}"`).not.toContain(
+      token,
+    );
+  }
 }
 
 /** A panel state built the way the thread page builds it, so the render
@@ -226,5 +283,295 @@ describe("source rows stay read-only intent", () => {
     expect(html).not.toMatch(/<(select|input|textarea)\b/);
     expect(html).not.toContain('role="listbox"');
     expect(rows(html).get("已失效")).toBeUndefined();
+  });
+});
+
+// specs/demo-seed.md item 6 / ADR 0100 decision 6: "Run status, Runtime
+// receipts and source evaluation are developer-mode or log-only, hidden
+// by default." The panel is hidden AS A WHOLE, not row by row: in the
+// default view the operator sees none of it, so the answer's own sources
+// list is the only source surface on the page.
+describe("the receipt surface is developer-mode only", () => {
+  it("renders nothing at all by default — no panel, no rows", () => {
+    const html = render(state({ taskRuntime: envelope() }), false);
+    expect(html).not.toContain('data-testid="task-panel"');
+    expect(rows(html).size).toBe(0);
+    expect(html).not.toContain("运行");
+  });
+
+  it("carries none of the internal receipt strings into the default view", () => {
+    // These are the machine-facing rows named by the requirement: run
+    // status, the Runtime submission receipt, the answer-basis row and
+    // the source-evaluation row. None may reach a user by default.
+    const html = visible(
+      render(
+        state({
+          taskRuntime: envelope(),
+          turns: [],
+          submission: {
+            state: "accepted",
+            text: "Runtime 已经接受了这次输入。",
+          },
+          savedRestriction: "filing-a",
+        }),
+        false,
+      ),
+    );
+    for (const receipt of [
+      "已受理：Runtime 已经接受了这次输入。",
+      "Runtime 尚未报告",
+      "当前没有可显示的来源评估。",
+      "来源限制",
+    ]) {
+      expect(html, receipt).not.toContain(receipt);
+    }
+  });
+
+  it("shows the panel in full under developer mode, rows unchanged", () => {
+    const hidden = state({
+      taskRuntime: envelope(),
+      submission: {
+        state: "accepted",
+        text: "Runtime 已经接受了这次输入。",
+      },
+    });
+    const shown = rows(render(hidden, true));
+    expect(shown.get("任务")).toBe("进行中");
+    expect(shown.get("本轮")).toBe("已回答");
+    expect(shown.get("运行")).toBe("运行已结束");
+    expect(shown.get("待补")).toBe("Runtime 尚未报告");
+    expect(shown.get("来源")).toBe("当前没有可显示的来源评估。");
+    expect(shown.get("提交")).toBe("已受理：Runtime 已经接受了这次输入。");
+  });
+
+  it("hides the render only — the row judgement stays intact and reachable", () => {
+    // Gating the RENDER must not destroy the values: the pure view
+    // module still answers for the very state the default view hides, so
+    // the facts remain computable and loggable.
+    const hidden = state({ taskRuntime: envelope() });
+    expect(runStatusText(hidden)).toBe("运行已结束");
+    expect(gapsText(hidden)).toBe("Runtime 尚未报告");
+    expect(sourcesText(hidden)).toBe("当前没有可显示的来源评估。");
+    expect(taskOutcomeText(hidden)).toBe("进行中");
+    expect(submissionText(hidden)).toBeNull();
+  });
+
+  it("still honours the taskless rule under developer mode", () => {
+    // The gate is a visibility decision, not a replacement for the
+    // existing one: a taskless thread renders nothing in EITHER mode.
+    const taskless = state({ taskRuntime: undefined, turns: [] });
+    expect(render(taskless, true)).not.toContain('data-testid="task-panel"');
+    expect(render(taskless, false)).not.toContain('data-testid="task-panel"');
+  });
+
+  it("shows the search mode only in developer mode and names old history", () => {
+    const selected: SearchModeDecision = {
+      search_mode: "global",
+      decision_tier: "jev",
+      confidence: 0.91,
+    };
+    const dev = render(state({ taskRuntime: undefined }), true, selected);
+    const ordinary = render(state({ taskRuntime: undefined }), false, selected);
+    const history = render(state({ taskRuntime: undefined }), true, null);
+
+    expect(dev).toContain('data-testid="search-mode-receipt"');
+    // The receipt states PROVENANCE, not the retrieval implementation:
+    // the internal 档 name must not reach the DOM, in the text or in an
+    // attribute (docs/CONTEXT.md 检索档; spec search-mode-host item 7).
+    expect(dev).toContain('data-decision-tier="jev"');
+    expect(dev).not.toContain("data-mode=");
+    expect(visible(dev)).toContain("检索档决策：判定命中");
+    expect(visible(dev)).toContain("决策置信度：0.91");
+    expect(ordinary).not.toContain('data-testid="search-mode-receipt"');
+    expect(visible(history)).toContain("历史记录未保存检索档决策。");
+    expectNoInternalMode(dev);
+  });
+
+  it("keeps every internal retrieval name out of the rendered receipt", () => {
+    // The raw token is a raw token wherever it sits: the attribute, the
+    // visible text, and the judge's own label signal (which names a 档).
+    const fallback: SearchModeDecision = {
+      search_mode: "graph",
+      decision_tier: "fallback",
+      confidence: 0,
+      signals: {
+        mode_jev_exit: "low_confidence",
+        mode_jev_label: "graph",
+        mode_jev_confidence: 0.44,
+      },
+    };
+    const dev = render(state({ taskRuntime: undefined }), true, fallback);
+
+    expect(dev).toContain('data-decision-tier="fallback"');
+    const text = visible(dev);
+    expect(text).toContain("检索档决策：自动回退");
+    expect(text).toContain("判定置信度：0.44");
+    expect(text).toContain("判定结果：low_confidence");
+    expectNoInternalMode(dev);
+  });
+});
+
+// The developer trace section: spans -> a waterfall; no spans -> the
+// receipt/stages plus the trace-disabled hint. Both branches are rendered
+// from INJECTED data so the network never decides a test.
+const TRACE_ID = "a".repeat(32);
+
+function span(overrides: Partial<TraceSpan> = {}): TraceSpan {
+  return {
+    trace_id: TRACE_ID,
+    span_id: "s1",
+    parent_span_id: null,
+    name: "span",
+    start_time_ms: 1_000,
+    duration_ms: 100,
+    attributes: {},
+    ...overrides,
+  };
+}
+
+function traceRows(html: string): Array<{
+  name: string;
+  left: string;
+  width: string;
+}> {
+  const pattern =
+    /data-testid="trace-span-row" data-span-name="([^"]*)" data-left-percent="([^"]*)" data-width-percent="([^"]*)"/g;
+  return [...html.matchAll(pattern)].map((match) => ({
+    name: match[1],
+    left: match[2],
+    width: match[3],
+  }));
+}
+
+describe("the developer trace section", () => {
+  it("draws one waterfall row per span with its offset and duration width", () => {
+    const html = render(state({ taskRuntime: envelope() }), true, undefined, {
+      threadId: "thread-1",
+      currentTurn: turn(),
+      trace: {
+        status: "ready",
+        traceState: "local",
+        spans: [
+          span({ span_id: "s1", name: "classify_node", start_time_ms: 1_000, duration_ms: 100 }),
+          span({ span_id: "s2", name: "retrieve_tool", start_time_ms: 1_050, duration_ms: 50 }),
+          span({ span_id: "s3", name: "model_node", start_time_ms: 1_100, duration_ms: 100 }),
+        ],
+      },
+    });
+
+    expect(html).toContain('data-testid="trace-waterfall"');
+    expect(traceRows(html)).toEqual([
+      { name: "classify_node", left: "0", width: "50" },
+      { name: "retrieve_tool", left: "25", width: "25" },
+      { name: "model_node", left: "50", width: "50" },
+    ]);
+    expect(html.match(/data-testid="trace-span-bar"/g)).toHaveLength(3);
+    expect(visible(html)).toContain("100.0 ms");
+    expect(visible(html)).toContain("50.0 ms");
+    expect(visible(html)).toContain("thread_id=thread-1");
+    expect(visible(html)).toContain("turn_id=" + RUN_ID);
+    expect(visible(html)).toContain("trace_id=" + TRACE_ID);
+  });
+
+  it("falls back to the receipt stages/status and says trace 未开启", () => {
+    const html = render(state({ taskRuntime: envelope() }), true, undefined, {
+      threadId: "thread-1",
+      currentTurn: turn({
+        thinking_text: "先查最新财报",
+        thinking_duration_ms: 1_000,
+        tool_summaries: [
+          { name: "retrieve", summary: "命中 1 条", tool_call_id: "c1" },
+        ],
+      }),
+      trace: { status: "ready", traceState: "off", spans: [] },
+    });
+
+    expect(html).not.toContain('data-testid="trace-waterfall"');
+    expect(html).toContain('data-testid="trace-receipt-fallback"');
+    const stages = [...html.matchAll(/data-testid="trace-stage-row" data-stage="([^"]*)"/g)]
+      .map((match) => match[1]);
+    expect(stages).toEqual([
+      "run-status",
+      "turn-result",
+      "turn-status",
+      "thinking-0",
+      "tools-1",
+    ]);
+    const hint = html.match(
+      /data-testid="trace-disabled-hint"[^>]*>([^<]*)</,
+    );
+    expect(hint?.[1]).toBe("trace 未开启");
+    const text = visible(html);
+    expect(text).toContain("运行已结束");
+    expect(text).toContain("已回答");
+    expect(text).toContain("1.00 s");
+    expect(text).toContain("1 次：retrieve");
+    expect(text).not.toContain("错误");
+  });
+
+  it("keeps the receipt fallback when the trace read fails, without an error", () => {
+    const html = render(state({ taskRuntime: envelope() }), true, undefined, {
+      threadId: "thread-1",
+      currentTurn: turn(),
+      trace: { status: "error" },
+    });
+
+    expect(html).toContain('data-testid="trace-receipt-fallback"');
+    expect(visible(html)).toContain("trace 状态不可读，显示回执");
+    expect(visible(html)).not.toContain("错误");
+  });
+
+  it("does not call an enabled-but-empty trace disabled", () => {
+    const html = render(state({ taskRuntime: envelope() }), true, undefined, {
+      threadId: "thread-1",
+      currentTurn: turn(),
+      trace: { status: "ready", traceState: "local", spans: [] },
+    });
+
+    expect(visible(html)).toContain("trace 已开启，但本轮没有 span");
+    expect(visible(html)).not.toContain("trace 未开启");
+  });
+
+  it("says an external exporter keeps its spans off this view", () => {
+    // console / otlp ARE tracing: the panel must not claim tracing is off
+    // just because nothing landed in the local span table.
+    const html = render(state({ taskRuntime: envelope() }), true, undefined, {
+      threadId: "thread-1",
+      currentTurn: turn(),
+      trace: { status: "ready", traceState: "external", spans: [] },
+    });
+
+    expect(html).toContain('data-testid="trace-receipt-fallback"');
+    expect(visible(html)).toContain("trace 已开启（非本地存储）");
+    expect(visible(html)).not.toContain("trace 未开启");
+  });
+
+  it("renders an unreadable store with the receipt, not an empty-trace claim", () => {
+    const html = render(state({ taskRuntime: envelope() }), true, undefined, {
+      threadId: "thread-1",
+      currentTurn: turn(),
+      trace: { status: "ready", traceState: "unreadable", spans: [] },
+    });
+
+    expect(html).toContain('data-testid="trace-receipt-fallback"');
+    expect(visible(html)).toContain("trace 状态不可读，显示回执");
+    expect(visible(html)).not.toContain("trace 已开启，但本轮没有 span");
+  });
+
+  it("adds nothing to the ordinary (non-developer) view", () => {
+    const html = render(state({ taskRuntime: envelope() }), false, undefined, {
+      threadId: "thread-1",
+      currentTurn: turn(),
+      trace: {
+        status: "ready",
+        traceState: "local",
+        spans: [span({ name: "retrieve_tool" })],
+      },
+    });
+
+    expect(html).toBe("");
+    expect(html).not.toContain('data-testid="trace-panel"');
+    expect(html).not.toContain('data-testid="task-panel"');
+    expect(visible(html)).not.toContain("trace");
   });
 });

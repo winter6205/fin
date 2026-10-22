@@ -1,0 +1,86 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Branch protection must require both `CI / python 3.12` and `CI / web`; neither
+# job is optional and neither uses continue-on-error. `python 3.12` is the job's
+# `name:`, not its id `python`, so the check is `CI / python 3.12`.
+#
+# Fixture-dependent files are listed in scripts/ci/fixture-dependent-tests.txt;
+# docs/test-gaps.md records the coverage they hold back.
+
+jobs:
+  python:
+    name: python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          # pyproject requires-python is >=3.12,<3.13.
+          python-version: "3.12"
+          enable-cache: true
+
+      # No FIN_TEST_DSN is set: tests/conftest.py drops FIN_CHECKPOINT_URL and
+      # the Postgres-backed suites skip, which is the hermetic default.
+      #
+      # --locked, not --frozen: --frozen only stops uv writing uv.lock, so a
+      # dependency edit without a re-lock would pass. The extras are required
+      # because pyright resolves imports under `include = ["src/fin"]`, where
+      # src/fin/corpus/object_store.py and src/fin/corpus/ocr.py import boto3
+      # and pytesseract.
+      - name: Install dependencies
+        run: uv sync --locked --extra ocr --extra object-store
+
+      - name: Type check
+        run: uv run --no-sync pyright
+
+      # The capability boundary check is stdlib-only, so it needs no synced
+      # environment beyond the interpreter.
+      - name: Capability boundary check
+        run: uv run --no-sync python scripts/check_capability_boundaries.py
+
+      - name: Test
+        run: scripts/ci/pytest-public-lane.sh
+
+      # The guard asserts the exclusion list's own contract, which is
+      # independent of whether the lane above is green. Run it either way, or a
+      # red lane would silently stop reporting denylist drift.
+      - name: Assert the excluded modules fail loudly
+        if: ${{ always() }}
+        run: scripts/ci/assert-fixture-lane-fails.sh
+
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm --prefix web ci
+
+      - name: Stream harness tests
+        run: npm run test:stream
+
+      - name: Type check
+        run: npm --prefix web run typecheck
+
+      - name: Test
+        run: npm --prefix web test

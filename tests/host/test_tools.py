@@ -545,6 +545,8 @@ def test_list_files_with_synthetic_3page_row_reports_page_count(
         [
             {
                 "document_id": "TEST-2023Q1",
+                "title": "Test filing",
+                "doc_type": "narrative",
                 "company": "TEST",
                 "period": "2023 Q1",
                 "version": "a" * 64,

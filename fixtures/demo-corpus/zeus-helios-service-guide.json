@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-helios-service-guide",
+  "title": "ZEUS HELIOS Service Guide",
+  "content": "ZEUS HELIOS Service Guide · Page 1\nSection 1: Service levels\nThe HELIOS standard subscription includes business-day support from 08:00 to 18:00 UTC. The regulated subscription includes 24x7 support. Severity 1 cases receive an acknowledgement within 30 minutes; the support clock pauses while ZEUS waits for information requested from the customer. These service levels supplement the product terms in zeus-product-guide, Section 2. A customer may open a case in the HELIOS console or by telephone using the support number on the order form.\n\nZEUS HELIOS Service Guide · Page 2\nSection 2: Data export and retention\nA workspace administrator can export telemetry as compressed CSV from the console. A standard-plan export covers up to 400 days and a regulated-plan export covers up to 1,460 days, subject to the retention settings in zeus-product-guide, Section 2. Export jobs containing more than 50 GB are split into numbered files and retained for 7 days. Deleted workspaces enter a 14-day recovery window; after that window, their telemetry is removed from active storage and scheduled backups.",
+  "chunks": [
+    {
+      "content": "ZEUS HELIOS Service Guide · Page 1\nSection 1: Service levels\nThe HELIOS standard subscription includes business-day support from 08:00 to 18:00 UTC. The regulated subscription includes 24x7 support. Severity 1 cases receive an acknowledgement within 30 minutes; the support clock pauses while ZEUS waits for information requested from the customer. These service levels supplement the product terms in zeus-product-guide, Section 2. A customer may open a case in the HELIOS console or by telephone using the support number on the order form.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS HELIOS Service Guide · Page 2\nSection 2: Data export and retention\nA workspace administrator can export telemetry as compressed CSV from the console. A standard-plan export covers up to 400 days and a regulated-plan export covers up to 1,460 days, subject to the retention settings in zeus-product-guide, Section 2. Export jobs containing more than 50 GB are split into numbered files and retained for 7 days. Deleted workspaces enter a 14-day recovery window; after that window, their telemetry is removed from active storage and scheduled backups.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "product_description",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "10-Q",
+    "period": "2024 Q2",
+    "filing_date": "2024-07-30"
+  },
+  "valid_from": "2024-07-30T00:00:00Z"
+}

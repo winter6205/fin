@@ -1,0 +1,28 @@
+{
+  "source_ref": "zeus-incident-response",
+  "title": "ZEUS Security Incident Response Procedure",
+  "content": "ZEUS Security Incident Response Procedure · Page 1\nSection 1: Report and classify\nAnyone who suspects a security incident contacts the Service Desk immediately and selects the Security Incident category. The on-call analyst opens a case, records the reporter's callback details, and assigns an initial severity within 15 minutes. A lost or stolen device is reported within 30 minutes under zeus-remote-work-handbook, Section 3. Do not forward suspicious attachments or delete the original message; preserve the message headers for the analyst.\n\nZEUS Security Incident Response Procedure · Page 2\nSection 2: Containment and communications\nFor a confirmed S1 incident, the incident commander may isolate affected ZEUS-managed systems, suspend exposed credentials, and pause automated integrations. The commander records each action, its UTC timestamp, and the system owner who carried it out. The Security Duty Manager approves any customer-facing statement before it is sent. Updates go to the incident bridge every 30 minutes during active containment. Staff must not speculate about cause or impact in public channels. If evidence indicates a regulated customer record may be affected, Legal and Privacy join the bridge within 20 minutes. A containment step that could interrupt a customer's service requires the incident commander's approval and a recorded reason. The response log is stored with the incident case; it includes known facts, open questions, decisions, and the next review time. Once the immediate risk is controlled, the commander assigns an investigator and confirms a customer update schedule with the account lead. The schedule is reviewed at least once per business day until closure.\n\nZEUS Security Incident Response Procedure · Page 3\nSection 3: Recovery and review\nThe service owner restores systems from a verified clean checkpoint and checks integrity before traffic is resumed. The incident commander closes the bridge only after monitoring remains stable for 60 minutes. Within 5 working days, the investigator publishes a review with a timeline, contributing conditions, and named follow-up owners. Corrective actions receive a due date no later than 30 calendar days after the review. Unresolved actions are escalated to the Risk Committee; see zeus-risk-committee-minutes, Section 1, for its review cadence.",
+  "chunks": [
+    {
+      "content": "ZEUS Security Incident Response Procedure · Page 1\nSection 1: Report and classify\nAnyone who suspects a security incident contacts the Service Desk immediately and selects the Security Incident category. The on-call analyst opens a case, records the reporter's callback details, and assigns an initial severity within 15 minutes. A lost or stolen device is reported within 30 minutes under zeus-remote-work-handbook, Section 3. Do not forward suspicious attachments or delete the original message; preserve the message headers for the analyst.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Security Incident Response Procedure · Page 2\nSection 2: Containment and communications\nFor a confirmed S1 incident, the incident commander may isolate affected ZEUS-managed systems, suspend exposed credentials, and pause automated integrations. The commander records each action, its UTC timestamp, and the system owner who carried it out. The Security Duty Manager approves any customer-facing statement before it is sent. Updates go to the incident bridge every 30 minutes during active containment. Staff must not speculate about cause or impact in public channels. If evidence indicates a regulated customer record may be affected, Legal and Privacy join the bridge within 20 minutes. A containment step that could interrupt a customer's service requires the incident commander's approval and a recorded reason. The response log is stored with the incident case; it includes known facts, open questions, decisions, and the next review time. Once the immediate risk is controlled, the commander assigns an investigator and confirms a customer update schedule with the account lead. The schedule is reviewed at least once per business day until closure.",
+      "index": 1
+    },
+    {
+      "content": "ZEUS Security Incident Response Procedure · Page 3\nSection 3: Recovery and review\nThe service owner restores systems from a verified clean checkpoint and checks integrity before traffic is resumed. The incident commander closes the bridge only after monitoring remains stable for 60 minutes. Within 5 working days, the investigator publishes a review with a timeline, contributing conditions, and named follow-up owners. Corrective actions receive a due date no later than 30 calendar days after the review. Unresolved actions are escalated to the Risk Committee; see zeus-risk-committee-minutes, Section 1, for its review cadence.",
+      "index": 2
+    }
+  ],
+  "metadata": {
+    "document_type": "policy_process",
+    "page_count": 3,
+    "company": "ZEUS",
+    "form": "8-K",
+    "period": "2024-06-17",
+    "filing_date": "2024-06-17"
+  },
+  "valid_from": "2024-06-17T00:00:00Z"
+}

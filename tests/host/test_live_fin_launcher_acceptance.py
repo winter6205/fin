@@ -112,7 +112,7 @@ def live_stack() -> Iterator[None]:
     this exercises the same code path the operator runs. `fin up` ends in
     an `exec` of fin-serve, so it is started detached and then polled —
     its exit code belongs to fin-serve, not to the boot verdict; the
-    verdict is read from `/api/status` and `.fin/ready`.
+    verdict is read from `/api/status` and `<FIN_HOME>/run/ready`.
     """
     _require_live_toolchain()
     if _serve_is_up():
@@ -214,22 +214,29 @@ def test_status_agrees_with_the_boot_verdict(live_stack: None) -> None:
     assert "knowledge_mcp=reachable" in result.stdout
 
 
+def _runtime_run_dir() -> Path:
+    """The run dir `fin up` writes, from the same resolver the scripts use."""
+    from fin.host.fin_home import resolve_fin_home, run_dir
+
+    return run_dir(resolve_fin_home())
+
+
 def test_verdict_file_records_the_ready_code(live_stack: None) -> None:
-    """`fin up` cannot set an exit code (it execs fin-serve); `.fin/ready` is
-    the durable verdict an operator or script can read."""
-    verdict = REPO_ROOT / ".fin" / "ready"
-    assert verdict.is_file(), "fin up must write its verdict to .fin/ready"
+    """`fin up` cannot set an exit code (it execs fin-serve); the ready file
+    under the resolved run dir is the durable verdict."""
+    verdict = _runtime_run_dir() / "ready"
+    assert verdict.is_file(), "fin up must write its verdict to <FIN_HOME>/run/ready"
     assert verdict.read_text(encoding="utf-8").strip() == "0 ready"
 
 
 def test_serve_log_has_a_producer(live_stack: None) -> None:
     """`fin logs` was documented and impossible: nothing wrote the file.
 
-    `fin up` must leave serve's own output in `.fin/serve.log`, or the
-    command `fin logs` tails is a dead end.
+    `fin up` must leave serve's own output in `<FIN_HOME>/run/serve.log`,
+    or the command `fin logs` tails is a dead end.
     """
-    log = REPO_ROOT / ".fin" / "serve.log"
-    assert log.is_file(), "fin up must tee fin-serve output to .fin/serve.log"
+    log = _runtime_run_dir() / "serve.log"
+    assert log.is_file(), "fin up must tee fin-serve output to <FIN_HOME>/run/serve.log"
     assert log.stat().st_size > 0, "the serve log must not be empty"
     assert "Uvicorn running" in log.read_text(encoding="utf-8", errors="replace")
 

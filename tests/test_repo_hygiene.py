@@ -4,9 +4,9 @@ The suite here exists because of a real incident, not a style preference.
 A worktree that shares the main checkout's `node_modules` through a
 symlink of that exact name could commit the link: `.gitignore` carried
 `node_modules/`, and a **trailing slash matches only a real directory**,
-so a symlink by that name was never ignored. a private commit (that pull request) committed
+so a symlink by that name was never ignored. 224b1fe committed
 such a link pointing at itself — blob content
-`/home/winner/projects/fin/node_modules` — and from then on every
+`/home/operator/projects/fin/node_modules` — and from then on every
 `npm run` in a checkout carrying it died with ELOOP (exit 216), which is
 why husky's `pre-commit` failed for reasons that had nothing to do with
 the staged change. 082fddf removed the entry from `main`; 44b397f did the
@@ -71,7 +71,7 @@ def test_rule_ignores_node_modules_by_name(shape: str) -> None:
 
     Regression pin for the trailing-slash hole: with `node_modules/` the
     verdict for a symlink by that name was "not ignored", which is what
-    let a private commit commit it.
+    let 224b1fe commit it.
     """
     assert _ignore_verdict(shape), (
         f"{shape} is NOT ignored — a worktree symlink under this name could be "

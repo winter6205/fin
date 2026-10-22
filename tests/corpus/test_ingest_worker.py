@@ -62,13 +62,25 @@ _MD_SAMPLE = (
     _PROJECT_ROOT
     / "data/corpus/dataset/documents/md/AAPL-2022Q3__table_dense__md__md.md"
 )
-DOC = "DOC-1"
+_SCOPE = "fin-ingest-worker"
 
 _TXT_V1 = (
     "Quarterly results overview.\n\n"
     "Revenue grew across every segment this quarter.\n\n"
     "The company reaffirmed its full-year guidance."
 ).encode("utf-8")
+
+
+def _document_id(scope: str, data: bytes) -> str:
+    """The public upload's content-derived id, written out longhand."""
+    digest = hashlib.sha256(data).digest()
+    preimage = (
+        b"fin-corpus-document-v1\x00" + scope.encode("utf-8") + b"\x00" + digest
+    )
+    return "doc_" + hashlib.sha256(preimage).hexdigest()
+
+
+DOC = _document_id(_SCOPE, _TXT_V1)
 
 # A supported format whose bytes are broken: accepted at the door
 # (format recognition passes), then a typed parse failure in the worker
@@ -188,11 +200,11 @@ class _Stack:
             metadata_store=self.pointers,
             state_store=self.states,
             on_ingested=on_ingested,
+            corpus_scope_id=_SCOPE,
         )
 
     def submit(self, data: bytes = _TXT_V1, **overrides: Any) -> Any:
         overrides.setdefault("declared_format", "txt")
-        overrides.setdefault("document_id", DOC)
         return self.endpoint.submit_durable(data, **overrides)
 
     def worker(self, **overrides: Any) -> IngestWorker:
@@ -213,10 +225,6 @@ class _Stack:
         ]
         assert len(rows) == 1, rows
         return dict(rows[0].metadata)
-
-
-class _HookError(RuntimeError):
-    """Named catalog-hook outage for the after-push failure leg."""
 
 
 # ----- discovery ------------------------------------------------------
@@ -455,13 +463,13 @@ def test_malformed_supported_format_fails_typed_and_pushes_nothing(
     tmp_path: Path,
 ) -> None:
     stack = _Stack(tmp_path)
-    stack.submit(_MALFORMED_DOCX, declared_format="docx")
+    submitted = stack.submit(_MALFORMED_DOCX, declared_format="docx")
 
     outcome = stack.worker().run_pending()[0]
 
     assert outcome.state is IngestState.FAILED
     assert stack.push.calls == 0
-    status = stack.status()
+    status = stack.status(submitted.document_id)
     assert status.state is IngestState.FAILED
     assert status.error_type == "MalformedSourceParseError"
     assert status.error_message
@@ -471,13 +479,13 @@ def test_malformed_pdf_fails_typed_and_pushes_nothing(
     tmp_path: Path,
 ) -> None:
     stack = _Stack(tmp_path)
-    stack.submit(_MALFORMED_PDF, declared_format="pdf")
+    submitted = stack.submit(_MALFORMED_PDF, declared_format="pdf")
 
     outcome = stack.worker().run_pending()[0]
 
     assert outcome.state is IngestState.FAILED
     assert stack.push.calls == 0
-    status = stack.status()
+    status = stack.status(submitted.document_id)
     assert status.state is IngestState.FAILED
     assert status.error_type == "MalformedSourceParseError"
     assert status.error_message
@@ -535,26 +543,70 @@ def test_push_dependency_failure_retries_without_reupload(
     assert push.calls == 2
 
 
+class _PushSuccessLostStore(InMemoryIngestStateStore):
+    """A store that loses the ``push_succeeded`` row once, then recovers.
+
+    The crash the identity read-back exists for: the envelopes landed
+    and the journal says so, but fin never recorded the push, so there
+    is no durable proof of it. That is the ONE leg where recovery must
+    re-run the chain (spec line 131) — and where the resumed run's own
+    push skips the journaled batch, leaving the identity map incomplete
+    unless the run reads the stored pairs back.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refuse_push_success = True
+
+    def append_audit(
+        self,
+        document_id: str,
+        action: str,
+        metadata: Any,
+        *,
+        actor: str | None = None,
+    ) -> Any:
+        if action == "push_succeeded" and self.refuse_push_success:
+            raise RuntimeError("the audit store lost the push-success row")
+        return super().append_audit(
+            document_id, action, metadata, actor=actor
+        )
+
+
 def test_journal_skipped_batches_still_yield_the_complete_identity_map(
     tmp_path: Path,
 ) -> None:
+    """The push identity map is complete even when the push was skipped.
+
+    The recovery run's main push consults the on-disk journal, finds the
+    first run's batch already landed, and sends nothing for it — so that
+    run's OWN map is missing those pairs. The run must therefore read
+    them back from the service through an idempotent re-push, never
+    compute them locally; a locally computed identity would be a pair no
+    row holds.
+
+    The failure is placed BEFORE ``push_succeeded`` is durable, which is
+    what makes the leg exist: with a durable push-success the run has no
+    push left to do at all and skips the whole step (see
+    ``tests/corpus/test_ingest_publication_durable.py``). This test
+    covers the complementary leg, and the two together pin both sides.
+    """
+    states = _PushSuccessLostStore()
     hook_calls = {"count": 0}
 
     def hook(_row: Any) -> None:
         hook_calls["count"] += 1
-        if hook_calls["count"] == 1:
-            raise _HookError("catalog registration is down")
 
-    stack = _Stack(tmp_path, on_ingested=hook)
+    stack = _Stack(tmp_path, on_ingested=hook, states=states)
     stack.submit()
 
     first = stack.worker().run_pending()[0]
-    # The push completed and was journaled; the catalog hook failed
-    # after it — the job is typed failed, never a silent ready.
+    # The push completed and was journaled, but the record of it was
+    # lost — no durable proof, so this is a genuine job failure.
     assert first.state is IngestState.FAILED
-    assert stack.status().error_type == _HookError.__name__
-    assert hook_calls["count"] == 1
+    assert stack.status().error_type == IngestDurableCommitError.__name__
 
+    states.refuse_push_success = False
     second = stack.worker().run_pending()[0]
 
     assert second.state is IngestState.READY
@@ -570,7 +622,7 @@ def test_journal_skipped_batches_still_yield_the_complete_identity_map(
     assert set(persisted) == {
         envelope.source_ref for envelope in second.result.envelopes
     }
-    assert hook_calls["count"] == 2
+    assert hook_calls["count"] == 1
 
 
 # ----- input boundaries ------------------------------------------------

@@ -51,7 +51,65 @@ def test_gate_names_the_credential_it_needs() -> None:
     gate = _root_conftest()
     with pytest.raises(pytest.fail.Exception) as excinfo:
         gate.build_jev_live_client({})
-    assert "FIN_JEV_API_KEY" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "FIN_JEV_API_KEY" in message
+    assert "settings.yaml" not in message
+
+
+def test_credential_readers_do_not_apply_home_settings(
+    monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest.Config
+) -> None:
+    """Opt-in gates read ``_PROCESS_SNAPSHOT`` and do not open the home file."""
+    import inspect
+    import os
+    import pwd
+
+    from fin.host import operator_settings
+
+    root = Path(__file__).resolve().parents[1] / "conftest.py"
+    plugin = next(
+        candidate
+        for candidate in pytestconfig.pluginmanager.get_plugins()
+        if getattr(candidate, "__file__", None)
+        and Path(candidate.__file__).resolve() == root
+    )
+    import test_attachment_vision
+    import test_live_graph_visual_lane
+    import tests.conftest as gate
+
+    assert gate is plugin
+
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".fin" / "settings.yaml"
+    forbidden = {
+        real_home.resolve(),
+        (Path.home() / ".fin" / "settings.yaml").resolve(),
+    }
+    seen: list[Path] = []
+
+    def _spy(*, environ: object = None, path: object = None) -> None:
+        if path is not None:
+            seen.append(Path(os.fspath(path)))
+
+    monkeypatch.setattr(operator_settings, "apply_operator_settings", _spy)
+
+    try:
+        gate.jev_live_client()
+    except pytest.fail.Exception:
+        pass
+    test_attachment_vision._live_credentials()
+    test_live_graph_visual_lane._vision_settings()
+
+    opened = {item.resolve() for item in seen}
+    assert opened.isdisjoint(forbidden)
+    assert all(
+        "settings.yaml" not in item
+        for item in test_live_graph_visual_lane._missing_prerequisites()
+    )
+    vision_source = inspect.getsource(
+        test_attachment_vision.test_live_round_trip_against_the_configured_provider
+    )
+    assert "settings.yaml" not in vision_source
+    assert "FIN_API_KEY_ENV" in vision_source
 
 
 class _Item:

@@ -26,6 +26,7 @@ next to the assertions that depend on it.
 from __future__ import annotations
 
 import json
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -43,10 +44,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from fin.corpus.extracted import ExtractedPage, Locator, load_extracted_tree
-from fin.host.compaction import _SUMMARY_MARKER, render_summary_message
+from fin.host.session.compaction import _SUMMARY_MARKER, render_summary_message
 from fin.host.graph import compile_graph
 from fin.host.scripted_model import ScriptedChatModel
-from fin.host.session_compaction import (
+from fin.host.session.session_compaction import (
     SESSION_TOKEN_BUDGET,
     OccupancyCompactor,
     SessionSummaryError,
@@ -57,7 +58,7 @@ from fin.host.session_compaction import (
 from fin.retrieve import FakeRetrievePort
 
 # Bound applied to the session-compaction summary text (mirrors the
-# ``fin.host.compaction`` bounded-summary pattern).
+# ``fin.host.session.compaction`` bounded-summary pattern).
 MAX_SUMMARY_CHARS_BOUND = summary_max_chars()
 
 # Repo root for the corpus fixture (``aapl_page1_text`` is a
@@ -76,12 +77,18 @@ KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
 # Test budget: 1_600 estimated tokens == 6_400 model-facing chars.
 TEST_BUDGET = 1_600
+MODEL_TEST_BUDGET = 10_000
 
 
 @contextmanager
-def _budget() -> Iterator[None]:
-    with session_token_budget(TEST_BUDGET):
+def _budget(tokens: int = TEST_BUDGET) -> Iterator[None]:
+    with session_token_budget(tokens):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_fin_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("FIN_HOME", str(tmp_path / ".fin"))
 
 
 @pytest.fixture(scope="session")
@@ -176,14 +183,13 @@ def _tool_pair(
 def _seed_messages() -> list[BaseMessage]:
     """A fat research history whose occupancy is far above 90%.
 
-    With the 1_600-token override: pairs 1-3 carry 12_000-char
-    ToolMessages (3_001 estimated tokens each side counted with the
-    per-message floor), pair 4 is small, the final AIMessage is 240
-    chars and the seeded question 25 chars. Total is roughly 9_100
-    estimated tokens (~570% of budget) — far past the 90% trigger.
-    The kept tail (summary + pair 4 + the two trailing messages plus
-    the host-prompt overhead) must stay at or under the 40% floor, so
-    the small pair's envelope and the filler length carry that bound.
+    With the 1_600-token override: pairs 1-3 each carry a 12_000-char
+    ToolMessage (3_000 estimated tokens under the chars/4 estimator),
+    pair 4 is small, the final AIMessage is 240 chars and the seeded
+    question is 25 chars. The raw history is far above the 90% trigger.
+    Graph tests use a larger budget so its real prompt and tool-schema
+    overhead still leaves a feasible 40% floor for the newest complete
+    unit.
     """
     messages: list[BaseMessage] = []
     for index in range(3):
@@ -206,6 +212,7 @@ def _seed_checkpoint(
     messages: list[BaseMessage],
     *,
     status_snapshots: list[dict[str, Any]] | None = None,
+    track: str | None = None,
 ) -> None:
     """Write a checkpoint directly so a test starts mid-thread.
 
@@ -216,6 +223,8 @@ def _seed_checkpoint(
     state: dict[str, Any] = {"messages": messages}
     if status_snapshots is not None:
         state["status_snapshots"] = status_snapshots
+    if track is not None:
+        state["track"] = track
     g._graph.update_state(
         {"configurable": {"thread_id": thread_id}},
         state,
@@ -261,7 +270,7 @@ def test_budget_reader_tracks_module_constant_mutation() -> None:
     falls back to the LIVE module attribute — an operator editing
     ``SESSION_TOKEN_BUDGET`` takes effect without touching the
     ``ContextVar`` (single source of truth = the constant)."""
-    import fin.host.session_compaction as sc
+    import fin.host.session.session_compaction as sc
 
     original = sc.SESSION_TOKEN_BUDGET
     try:
@@ -282,7 +291,7 @@ def test_budget_override_wins_over_module_constant() -> None:
     """Spec-M1: an active ``session_token_budget`` override still
     wins over a mutated module constant (the contextmanager stays
     the explicit override seam)."""
-    import fin.host.session_compaction as sc
+    import fin.host.session.session_compaction as sc
 
     original = sc.SESSION_TOKEN_BUDGET
     try:
@@ -296,7 +305,7 @@ def test_budget_override_wins_over_module_constant() -> None:
 def test_budget_override_is_honored_per_call() -> None:
     """The operator-facing override changes the budget for the
     scoped calls and restores the default afterwards."""
-    from fin.host.session_compaction import session_budget_tokens
+    from fin.host.session.session_compaction import session_budget_tokens
 
     assert count_tokens_approximately([]) is not None  # import sanity
     with _budget():
@@ -357,21 +366,149 @@ def test_compact_update_stops_near_forty_percent() -> None:
     the 40% floor (with the host prompt as overhead)."""
     compactor = OccupancyCompactor(summarizer=StubSummarizer())
     messages = _seed_messages()
-    with _budget():
-        update = compactor.compact_update(messages)
-    kept = [m for m in update if not isinstance(m, RemoveMessage)]
     from fin.host.agent_instructions import HOST_SYSTEM_PROMPT
 
     overhead = count_tokens_approximately(
         [SystemMessage(content=HOST_SYSTEM_PROMPT)]
     )
-    with _budget():
+    # The real prompt is graph overhead, so the budget is the one
+    # ``_seed_messages`` reserves for it: a 1_600-token budget leaves
+    # 640 floor tokens against a prompt that alone is far larger, and
+    # no compaction could ever satisfy the floor.
+    with _budget(MODEL_TEST_BUDGET):
+        update = compactor.compact_update(messages, overhead_tokens=overhead)
+    kept = [m for m in update if not isinstance(m, RemoveMessage)]
+    with _budget(MODEL_TEST_BUDGET):
         occupancy = compactor.occupancy(kept, overhead_tokens=overhead)
-    # Greedy eviction stops at the 40% floor; a small margin covers
-    # the per-message floor tokens of the kept messages.
     assert occupancy <= 0.40 + 1e-9, (
         f"post-compaction occupancy {occupancy:.3f} must be <= 0.40"
     )
+
+
+def test_call_scoped_overhead_can_trigger_compaction() -> None:
+    """Call-scoped tokens can cross 90% while messages alone stay below it."""
+    compactor = OccupancyCompactor(summarizer=StubSummarizer())
+    messages = [HumanMessage(content="x" * 400) for _ in range(80)]
+    with _budget(MODEL_TEST_BUDGET):
+        assert compactor.occupancy(messages) < 0.90
+        update = compactor.compact_update(messages, overhead_tokens=2_000)
+    assert update, "message payload plus call overhead must cross 90%"
+
+
+@pytest.mark.parametrize("overhead", [-1, True, 1.5, "1"])
+def test_compaction_rejects_invalid_overhead_before_summary(overhead: Any) -> None:
+    summarizer = StubSummarizer()
+    compactor = OccupancyCompactor(summarizer=summarizer)
+    with _budget(MODEL_TEST_BUDGET):
+        with pytest.raises(ValueError, match="overhead_tokens"):
+            compactor.compact_update(_seed_messages(), overhead_tokens=overhead)
+        with pytest.raises(ValueError, match="overhead_tokens"):
+            compactor.occupancy(_seed_messages(), overhead_tokens=overhead)
+    assert summarizer.prompts == []
+
+
+def test_1600_budget_names_unreachable_model_facing_floor() -> None:
+    """The actual grounded prompt and schemas cannot fit the 640-token floor."""
+    summarizer = StubSummarizer()
+    model = ScriptedChatModel(script=[AIMessage(content="")])
+    graph = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+        summarizer=summarizer,
+    )
+    messages = _seed_messages()
+    overhead = graph._compaction_overhead_tokens(
+        {"messages": messages, "track": "grounded"}
+    )
+    assert overhead > TEST_BUDGET * 0.40
+    with _budget():
+        with pytest.raises(SessionSummaryError, match="40% floor"):
+            graph._compactor.compact_update(
+                messages,
+                overhead_tokens=overhead,
+            )
+    assert summarizer.prompts == []
+
+
+def test_summary_wrapper_and_overhead_fit_with_visible_summary_truncation() -> None:
+    """The summary body is visibly shortened when the wrapper and host
+    overhead would otherwise push the model-facing result above 40%."""
+    compactor = OccupancyCompactor(
+        summarizer=StubSummarizer(text="important context " * 1_000)
+    )
+    messages = _seed_messages()
+    from fin.host.agent_instructions import HOST_SYSTEM_PROMPT
+
+    overhead = count_tokens_approximately(
+        [SystemMessage(content=HOST_SYSTEM_PROMPT)]
+    ) + 3_000
+    with _budget(MODEL_TEST_BUDGET):
+        update = compactor.compact_update(
+            messages,
+            overhead_tokens=overhead,
+            status_snapshots=[{"company": "ZEUS", "period": "FY2026"}],
+        )
+    kept = [m for m in update if not isinstance(m, RemoveMessage)]
+    summary = kept[0]
+    assert isinstance(summary, SystemMessage)
+    assert summary.additional_kwargs["fin_compaction_summary_truncated"] is True
+    assert summary.additional_kwargs["fin_compaction_summary_text"]
+    with _budget(MODEL_TEST_BUDGET):
+        occupancy = compactor.occupancy(kept, overhead_tokens=overhead)
+    assert occupancy <= 0.40
+
+
+def test_too_small_summary_body_fails_before_calling_summarizer() -> None:
+    """A wrapper that leaves less than two summary chars is named early."""
+    snapshot = None
+    wrapper_tokens = 0
+    for suffix_length in range(4):
+        candidate = {
+            "company": "ZEUS",
+            "period": "x" * suffix_length,
+            "document_ids": [],
+        }
+        wrapper = render_summary_message("x", candidate)
+        fixed_chars = len(str(wrapper.content)) - 1
+        tokens = count_tokens_approximately(
+            [render_summary_message("x", candidate)]
+        )
+        if 4 * tokens + 3 - fixed_chars < 2:
+            snapshot = candidate
+            wrapper_tokens = tokens
+            break
+    assert snapshot is not None, "test precondition: find tight wrapper metadata"
+
+    summarizer = StubSummarizer()
+    compactor = OccupancyCompactor(summarizer=summarizer)
+    messages = [
+        HumanMessage(content="older context " * 20),
+        HumanMessage(content="newest!"),
+    ]
+    floor_tokens = int(TEST_BUDGET * 0.40)
+    overhead = floor_tokens - wrapper_tokens - 1
+    with _budget():
+        with pytest.raises(SessionSummaryError, match="summary body"):
+            compactor.compact_update(
+                messages,
+                status_snapshots=[snapshot],
+                force=True,
+                overhead_tokens=overhead,
+            )
+    assert summarizer.prompts == []
+
+
+def test_python_large_overhead_is_named_as_unreachable_not_overflow() -> None:
+    summarizer = StubSummarizer()
+    compactor = OccupancyCompactor(summarizer=summarizer)
+    with _budget(MODEL_TEST_BUDGET):
+        assert compactor.occupancy(
+            _seed_messages(), overhead_tokens=10**1000
+        ) == 1.0
+        with pytest.raises(SessionSummaryError, match="40% floor"):
+            compactor.compact_update(_seed_messages(), overhead_tokens=10**1000)
+    assert summarizer.prompts == []
 
 
 def test_eviction_never_splits_a_tool_pair() -> None:
@@ -445,7 +582,7 @@ def test_trigger_measurement_counts_existing_summary_weight() -> None:
 def test_summary_output_is_bounded() -> None:
     """Spec-M2b: repeated compactions cannot grow the summary
     unboundedly — the produced summary text is capped (same
-    ``_bounded_text`` pattern as ``fin.host.compaction``)."""
+    ``_bounded_text`` pattern as ``fin.host.session.compaction``)."""
     compactor = OccupancyCompactor(
         summarizer=StubSummarizer(text="y" * 50_000)
     )
@@ -461,6 +598,110 @@ def test_summary_output_is_bounded() -> None:
     assert body.endswith("…")
 
 
+# ===== a stopped run does not wait on the summary =====
+
+
+class BlockingSummarizer:
+    """A summarizer that never returns until released.
+
+    Stands in for the real blocking model call the compaction gate makes
+    on the run's own thread: nothing observes it, so a stop can only be
+    honoured by this module rather than by the graph.
+    """
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def invoke(self, messages: list[BaseMessage]) -> AIMessage:
+        self.entered.set()
+        self.release.wait(timeout=10)
+        return AIMessage(content="summary that arrives too late")
+
+
+def test_a_stopped_run_abandons_the_summary_instead_of_waiting_for_it() -> None:
+    """The blocking summary must not outlive the stop that asked it to end.
+
+    Compaction runs on the run's own thread inside ``graph.stream``, so a
+    stop that cannot abandon this call cannot end the turn at all: the
+    operator's Stop, a lost client and a server shutdown would all wait
+    the summarizer out.
+    """
+    from fin.host.run_call_supervisor import run_call_context
+    from fin.host.run_control import StopToken
+
+    summarizer = BlockingSummarizer()
+    compactor = OccupancyCompactor(summarizer=summarizer)
+    token = StopToken(thread_id="t-1", run_id="run-1")
+
+    finished: list[str] = []
+
+    def _compact() -> None:
+        try:
+            with _budget():
+                with run_call_context(token, None):
+                    compactor.compact_update(_seed_messages())
+        except SessionSummaryError:
+            finished.append("typed")
+        except BaseException as exc:  # noqa: BLE001 - recorded, asserted below
+            finished.append(type(exc).__name__)
+
+    worker = threading.Thread(target=_compact)
+    worker.start()
+    try:
+        assert summarizer.entered.wait(timeout=5)
+        token.stop(reason="client_disconnect")
+        worker.join(timeout=5)
+        assert finished == ["typed"], finished
+        assert not worker.is_alive()
+    finally:
+        summarizer.release.set()
+        worker.join(timeout=5)
+
+
+def test_an_unstopped_summary_is_waited_for_normally() -> None:
+    """A run nobody stopped still gets its summary: the abandonment is
+    bounded by the stop token, not a timeout that fires on its own."""
+    summarizer = BlockingSummarizer()
+    compactor = OccupancyCompactor(summarizer=summarizer)
+    finished: list[str] = []
+
+    def _compact() -> None:
+        try:
+            with _budget():
+                update = compactor.compact_update(_seed_messages())
+        finally:
+            summarizer.release.set()
+        finished.append("compacted" if update else "noop")
+
+    worker = threading.Thread(target=_compact)
+    worker.start()
+    assert summarizer.entered.wait(timeout=5)
+    assert not finished, "the summary was not waited for"
+    summarizer.release.set()
+    worker.join(timeout=5)
+
+    assert finished == ["compacted"]
+
+
+def test_a_summary_that_raises_a_cancellation_before_the_call_is_not_invoked() -> None:
+    """A run already stopped must not spend a model call it cannot use."""
+    from fin.host.run_call_supervisor import run_call_context
+    from fin.host.run_control import StopToken
+
+    summarizer = StubSummarizer()
+    compactor = OccupancyCompactor(summarizer=summarizer)
+    token = StopToken(thread_id="t-2", run_id="run-2")
+    token.stop(reason="user_stop")
+
+    with _budget():
+        with pytest.raises(SessionSummaryError):
+            with run_call_context(token, None):
+                compactor.compact_update(_seed_messages())
+
+    assert summarizer.prompts == []
+
+
 # ===== graph gate integration =====
 
 
@@ -474,7 +715,7 @@ def test_below_threshold_run_does_not_compact() -> None:
         known_document_ids=KNOWN_IDS,
         summarizer=StubSummarizer(),
     )
-    with _budget():
+    with _budget(MODEL_TEST_BUDGET):
         g.invoke(
             {
                 "messages": [HumanMessage("hello there")],
@@ -490,6 +731,132 @@ def test_below_threshold_run_does_not_compact() -> None:
         and m.additional_kwargs.get("fin_compaction_summary") is True
         for m in messages
     )
+
+
+# ----- the grounded prompt is model-facing OVERHEAD -----
+#
+# ADR 0044 stops the automatic gate at 40% occupancy, and the overhead
+# the gate counts for the next model call is the grounded prompt PLUS
+# the bound tool schemas (plus the 档 copy the turn's mode adds). Every
+# token of prompt text therefore shrinks the room the 40% floor has
+# left for history — a longer prompt is a smaller history budget.
+#
+# The 2026-10-20 enterprise-neutral rewrite of the track prompts grew
+# the grounded prompt by ~80 estimated tokens and pushed the
+# end-to-end gate to 0.4006 occupancy (over the 0.40 floor). The
+# wording budget below is the EARLY WARNING for that failure class:
+# the end-to-end assertion above is the contract, this is the cheap
+# signal that names the cause.
+GROUNDED_PROMPT_TOKEN_BOUND = 780
+"""Estimated-token budget for the grounded system prompt.
+
+Today's wording costs 759 estimated tokens; the 804 of the
+pre-correction wording is what broke the 40% floor. The bound leaves
+~20 tokens of slack for a wording tweak while still catching a
+growth of the size that regressed.
+"""
+
+
+def test_the_grounded_prompt_stays_inside_its_overhead_budget() -> None:
+    """The grounded prompt may not grow past the room the compaction
+    floor leaves for it.
+
+    The prompt is counted as model-facing overhead, so a longer prompt
+    is a smaller history budget: past the bound the automatic gate
+    cannot land under the 40% floor (the end-to-end check in
+    ``test_graph_gate_counts_tool_schemas_and_meets_total_floor``).
+    """
+    from fin.host.agent_instructions import HOST_SYSTEM_PROMPT
+
+    prompt_tokens = count_tokens_approximately(
+        [SystemMessage(content=HOST_SYSTEM_PROMPT)]
+    )
+    assert prompt_tokens <= GROUNDED_PROMPT_TOKEN_BOUND, (
+        f"the grounded prompt costs {prompt_tokens} estimated tokens, over "
+        f"the {GROUNDED_PROMPT_TOKEN_BOUND}-token budget: it is counted as "
+        "model-facing overhead, so a longer prompt pushes the automatic "
+        "compaction gate past the 40% floor"
+    )
+
+
+@pytest.mark.soft_track
+def test_the_grounded_ship_overhead_leaves_room_under_the_floor() -> None:
+    """Soft-Track ship gate: the model-facing overhead of a grounded turn
+    leaves room under ADR 0044's 40% floor for the history the gate
+    keeps.
+
+    The overhead is the grounded prompt plus the bound tool schemas; the
+    turn's 档 copy rides on top of it at model-call time. The floor is a
+    product budget: when the overhead fills it, the automatic gate can
+    no longer land under 40% and the thread stays over budget — the
+    failure the end-to-end gate check in this file exists to catch.
+    """
+    from fin.host.agent_instructions import SEARCH_MODE_USAGE_COPY
+
+    graph = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(script=[AIMessage(content="")]),
+        known_document_ids=KNOWN_IDS,
+        summarizer=StubSummarizer(),
+    )
+    overhead = graph._compaction_overhead_tokens(
+        {"messages": _seed_messages(), "track": "grounded"}
+    )
+    mode_copy_tokens = max(
+        count_tokens_approximately([SystemMessage(content=copy)])
+        for copy in SEARCH_MODE_USAGE_COPY.values()
+    )
+    # The history the gate must be able to keep: the summary wrapper plus
+    # the newest complete unit of the seeded history.
+    history_tokens = count_tokens_approximately(
+        [render_summary_message("x", {}), _seed_messages()[-1]]
+    )
+    floor_tokens = MODEL_TEST_BUDGET * 0.40
+    assert (
+        overhead + mode_copy_tokens + history_tokens <= floor_tokens
+    ), (
+        f"grounded overhead {overhead} + 档 copy {mode_copy_tokens} + "
+        f"history {history_tokens} does not fit the {floor_tokens}-token "
+        "floor: the automatic gate could not land under 40% occupancy"
+    )
+
+
+def test_graph_gate_counts_tool_schemas_and_meets_total_floor() -> None:
+    """The automatic gate includes the grounded prompt and bound schemas."""
+    summarizer = StubSummarizer()
+    graph = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(script=[AIMessage(content="")]),
+        known_document_ids=KNOWN_IDS,
+        summarizer=summarizer,
+    )
+    messages = _seed_messages()
+    thread_id = "t-gate-full-overhead"
+    _seed_checkpoint(graph, thread_id, messages, track="grounded")
+    state = {"messages": messages, "track": "grounded"}
+    overhead = graph._compaction_overhead_tokens(state)
+    assert overhead > 1_000, "grounded schemas and prompt must be counted"
+    with _budget(MODEL_TEST_BUDGET):
+        assert graph._compactor.occupancy(
+            messages,
+            overhead_tokens=overhead,
+        ) >= 0.90
+        graph.invoke(
+            {
+                "messages": [],
+                "evidence": [],
+                "repair_count": 0,
+                "step_count": 0,
+            },
+            config=_thread_config(thread_id),
+        )
+        checkpoint = _snapshot_messages(graph, thread_id)
+        assert isinstance(checkpoint[0], SystemMessage)
+        assert checkpoint[0].additional_kwargs.get("fin_compaction_summary") is True
+        occupancy = graph.occupancy(thread_id)
+    assert occupancy is not None
+    assert occupancy["ratio"] <= 0.40
+    assert len(summarizer.prompts) == 1
 
 
 def test_gate_compacts_before_next_llm_call(aapl_page1_text: str) -> None:
@@ -529,7 +896,14 @@ def test_gate_compacts_before_next_llm_call(aapl_page1_text: str) -> None:
         summarizer=summarizer,
     )
     seeded = _seed_messages()
-    _seed_checkpoint(g, "t-gate-90", seeded)
+    _seed_checkpoint(g, "t-gate-90", seeded, track="grounded")
+    initial_overhead = g._compaction_overhead_tokens(
+        {"messages": seeded, "track": "grounded"}
+    )
+    with _budget(MODEL_TEST_BUDGET):
+        assert g._compactor.occupancy(
+            seeded, overhead_tokens=initial_overhead
+        ) >= 0.90
     # The evicted ids are the AIMessage + ToolMessage of the oldest
     # three fat pairs (call ids ``c-seed-0..2``). Pair 4 (c-seed-3)
     # and the trailing AIMessage + HumanMessage are kept and re-
@@ -547,7 +921,7 @@ def test_gate_compacts_before_next_llm_call(aapl_page1_text: str) -> None:
             if mid is not None:
                 expected_evicted.add(mid)
 
-    with _budget():
+    with _budget(MODEL_TEST_BUDGET):
         out = g.invoke(
             {
                 "messages": [],
@@ -561,6 +935,15 @@ def test_gate_compacts_before_next_llm_call(aapl_page1_text: str) -> None:
     assert out["status"] == "done", out.get("status_reason")
 
     checkpoint = _snapshot_messages(g, "t-gate-90")
+    values = g._graph.get_state(_thread_config("t-gate-90")).values or {}
+    compacted_history = checkpoint[:-3]
+    call_state = {**values, "messages": compacted_history}
+    call_overhead = g._compaction_overhead_tokens(call_state)
+    with _budget(MODEL_TEST_BUDGET):
+        assert g._compactor.occupancy(
+            compacted_history,
+            overhead_tokens=call_overhead,
+        ) <= 0.40
     # 1) The checkpointer actually shrank: summary + 4 kept
     #    (pair 4 = AIMessage + ToolMessage, final AIMessage) + this
     #    turn's HumanMessage is empty (invoke input) + the live pair
@@ -642,6 +1025,7 @@ def test_snapshot_slots_survive_for_classify_inherit(
         g,
         "t-gate-inherit",
         seeded,
+        track="grounded",
         status_snapshots=[
             {"company": "MSFT", "period": "2023 Q1", "document_ids": []},
             {
@@ -651,7 +1035,7 @@ def test_snapshot_slots_survive_for_classify_inherit(
             },
         ],
     )
-    with _budget():
+    with _budget(MODEL_TEST_BUDGET):
         first = g.invoke(
             {
                 "messages": [],
@@ -677,7 +1061,7 @@ def test_snapshot_slots_survive_for_classify_inherit(
 
     # A short follow-up with no slots must inherit the research
     # track from the snapshot that survived compaction.
-    with _budget():
+    with _budget(MODEL_TEST_BUDGET):
         follow = g.invoke(
             {
                 "messages": [HumanMessage("More detail please")],
@@ -738,10 +1122,10 @@ def test_summary_failure_leaves_turn_uncompacted_and_continues(
         summarizer=ExplodingSummarizer(),
     )
     seeded = _seed_messages()
-    _seed_checkpoint(g, "t-gate-fail", seeded)
+    _seed_checkpoint(g, "t-gate-fail", seeded, track="grounded")
     pre_ids = _checkpoint_ids(seeded)
 
-    with _budget():
+    with _budget(MODEL_TEST_BUDGET):
         out = g.invoke(
             {
                 "messages": [],

@@ -1,0 +1,20 @@
+{
+  "source_ref": "zeus-cloud-order-form-template",
+  "title": "ZEUS Cloud Services Order Form Template",
+  "content": "ZEUS Cloud Services Order Form Template · Page 1\nSection 1: Order details\nCustomer selects the service tier, region, start date, and annual commitment in this fictional order form. The minimum initial term is 12 months and renews for 12-month periods unless either party gives 60 days' notice. Usage above the stated monthly allowance is billed at the rate printed beside the selected service. Support coverage follows the service level in zeus-helios-service-guide, Section 1. The order becomes effective when both authorized signatories have signed it.",
+  "chunks": [
+    {
+      "content": "ZEUS Cloud Services Order Form Template · Page 1\nSection 1: Order details\nCustomer selects the service tier, region, start date, and annual commitment in this fictional order form. The minimum initial term is 12 months and renews for 12-month periods unless either party gives 60 days' notice. Usage above the stated monthly allowance is billed at the rate printed beside the selected service. Support coverage follows the service level in zeus-helios-service-guide, Section 1. The order becomes effective when both authorized signatories have signed it.",
+      "index": 0
+    }
+  ],
+  "metadata": {
+    "document_type": "contract_template",
+    "page_count": 1,
+    "company": "ZEUS",
+    "form": "8-K",
+    "period": "Template 2024",
+    "filing_date": "2024-09-09"
+  },
+  "valid_from": "2024-09-09T00:00:00Z"
+}

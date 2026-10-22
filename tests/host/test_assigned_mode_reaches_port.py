@@ -12,13 +12,16 @@ What is pinned here, in order:
 
 * the POSITIVE hop — an assigned 知识问答 sends ``graph``, an assigned
   查找 sends ``lexical``, an assigned 综述 sends ``global``, and — since
-  the tracked change T7 (6e8ed97) opened 真数据库 — an assigned sql turn sends ``sql``
+  T7 (6e8ed97) opened 真数据库 — an assigned sql turn sends ``sql``
   with the port's ``sql_window_*`` pair recorded beside it: all four
   lasting tokens ride the same hop (spec SC2);
-* the ABSENT assignment — an unassigned turn (clarify residual) sends no
-  档 at all (``None`` → the port omits the key → iknow's own default);
-  routing-time refusals have zero producers since the table emptied, and
-  the hop may never swap a named 档 for a substitute one (SC3 / SC6);
+* the ABSENT assignment — the routing residual is an ASSIGNMENT now
+  (ADR 0104): the host decides it itself and the recorded default
+  ``graph`` rides the wire at the ``fallback`` tier; the one hop that
+  still sends no 档 is the typed fail (an explicitly pinned token
+  outside the closed set → ``invalid_search_mode`` → ``None`` → the port
+  omits the key), and the hop may never swap a named 档 for a substitute
+  one (SC3 / SC6);
 * the INVALID assignment — the hop forwards the audit VERBATIM, so a
   retired letter that somehow survives in state is named by the port as
   ``invalid_search_mode`` instead of being guessed into a 档;
@@ -48,7 +51,7 @@ from fin.host.graph import (
 )
 from fin.host.named_failures import RETRIEVE_TIERS
 from fin.host.scripted_model import ScriptedChatModel
-from fin.host.search_mode_decision import assigned_retrieve_mode
+from fin.host.grounded.search_mode_decision import assigned_retrieve_mode
 from fin.host.state import reset_input_state
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
@@ -126,10 +129,15 @@ def _compile(
     )
 
 
-def _run(graph: Any, text: str, thread_id: str) -> dict[str, Any]:
+def _run(
+    graph: Any, text: str, thread_id: str, *, pinned: str | None = None
+) -> dict[str, Any]:
+    configurable: dict[str, Any] = {"thread_id": thread_id}
+    if pinned is not None:
+        configurable["pinned_search_mode"] = pinned
     return graph.invoke(
         {**reset_input_state(text), "evidence": []},
-        config={"configurable": {"thread_id": thread_id}},
+        config={"configurable": configurable},
     )
 
 
@@ -187,7 +195,7 @@ def test_an_assigned_综述_sends_global_on_the_port() -> None:
 
 
 def test_an_assigned_真数据库_sends_sql_and_never_a_substitute() -> None:
-    """Flipped by the tracked change T7 (commit 6e8ed97): the old pin asserted the
+    """Flipped by T7 (commit 6e8ed97): the old pin asserted the
     cascade typed-failed sql (``failure_code == real_db_not_wired``,
     ``modes == [None]``) so the hop could never smuggle it onto the
     wire. The 档 is OPEN now: naming it ASSIGNS it, the hop sends
@@ -231,7 +239,7 @@ def test_the_hop_forwards_the_audit_verbatim_and_the_port_names_it() -> None:
                 {"search_mode_decision": {"search_mode": raw}}
             ))
     # ``sql`` keeps ITS own name through this hop and the port seam now —
-    # the tracked change T7 (6e8ed97) flipped the old pin, which asserted
+    # T7 (6e8ed97) flipped the old pin, which asserted
     # ``pytest.raises(TierUnavailableError)`` for sql. The refusal table is
     # empty, so every closed-set token forwards verbatim and
     # ``TierUnavailableError`` has no reachable raise site left (the class
@@ -313,16 +321,62 @@ def test_a_grounded_run_puts_the_档_on_the_wire_filters() -> None:
     ), arguments
 
 
-def test_an_unassigned_turn_puts_no_档_key_on_the_wire() -> None:
-    """The absent half AT THE WIRE, re-sourced by the tracked change T7 (6e8ed97): the
-    old case drove it with a refused sql turn, but refusals have no
-    producer now, so the genuinely ABSENT assignment is the clarify
-    residual — no 档 named, judge absent → ``search_mode=None`` → no key,
-    so iknow answers with its own default instead of a 档 fin invented."""
+def test_the_routing_residual_puts_the_fallback_档_on_the_wire() -> None:
+    """The residual AT THE WIRE (ADR 0104): a grounded turn the cascade
+    could not route is no longer an unassigned turn — the host ASSIGNS
+    the recorded default ``graph`` at the ``fallback`` tier with a 0.0
+    policy confidence and no mode options, and that 档 rides the wire
+    like any other assignment.
+
+    This replaces the old "an unassigned turn puts no 档 key on the
+    wire" premise: the residual IS an assignment now, so the wire
+    carries ``filters.search_mode == "graph"`` and iknow is never left
+    to answer with a 档 fin did not name. The audit still says where the
+    token came from (``fallback``, not a confident prediction).
+    """
     adapter = _CapturingMcpAdapter()
     out = _run(_compile(adapter), PLAIN_ASK, "wire-unassigned")
 
-    assert out["search_mode_decision"]["search_mode"] is None
+    audit = out["search_mode_decision"]
+    assert audit["search_mode"] == "graph", audit
+    assert audit["decision_tier"] == "fallback", audit
+    assert audit["confidence"] == 0.0, audit
+    assert audit["options"] == [], audit
+    arguments = _arguments(adapter)
+    assert arguments, "the scripted retrieve still ran"
+    assert all(
+        arg.get("filters", {}).get("search_mode") == "graph"
+        for arg in arguments
+    ), arguments
+
+
+@pytest.mark.parametrize("letter", RETIRED_LETTERS)
+def test_a_refused_explicit_pin_puts_no_档_key_on_the_wire(letter: str) -> None:
+    """The typed fail is the ONLY hop that still sends no 档 (ADR 0104
+    contract item 2): an explicitly pinned token outside the closed set
+    stays a NAMED rejection (``invalid_search_mode``) and is never
+    reinterpreted as the recorded default, so the port is handed
+    ``None`` and the wire carries no ``search_mode`` key at all.
+
+    This is the coverage the retired "unassigned turn" case used to
+    carry: the absent assignment still exists, but it is now the typed
+    failure, and it must not be papered over by the fallback. Every
+    retired spelling is refused by name, not just one.
+    """
+    adapter = _CapturingMcpAdapter()
+    out = _run(
+        _compile(adapter),
+        PLAIN_ASK,
+        f"wire-refused-pin-{letter}",
+        pinned=letter,
+    )
+
+    audit = out["search_mode_decision"]
+    assert audit["search_mode"] is None, audit
+    assert audit["decision_tier"] == "typed_fail", audit
+    assert audit["failure_code"] == "invalid_search_mode", audit
+    assert audit["signals"].get("pin_exit") == "invalid_search_mode", audit
+    assert audit["signals"].get("pin") == letter, audit
     arguments = _arguments(adapter)
     assert arguments, "the scripted retrieve still ran"
     assert all(
@@ -383,7 +437,9 @@ class _RecordingWindowAdapter(_CapturingMcpAdapter):
 def _sql_ask() -> str:
     # ``PLAIN_ASK`` keeps the TRACK grounded, so the 档 cascade actually
     # runs and assigns the named 档; a bare sql question without it lands
-    # on the clarify residual and never reaches the port.
+    # on the routing residual, which ADR 0104 assigns host-side (``graph``
+    # at the ``fallback`` tier) — so the 档 named here is the only one the
+    # sql window cases may assert.
     return f"sql档 AAPL net sales 2023 Q3, which contracts expire?"
 
 

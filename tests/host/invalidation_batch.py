@@ -1,6 +1,6 @@
 """The one owner of the ``invalidations`` shapes every drain test builds.
 
-Five suites drive :func:`fin.host.structured_evidence_invalidation.drain_invalidation_batch`:
+Five suites drive :func:`fin.host.evidence.structured_evidence_invalidation.drain_invalidation_batch`:
 the drain's own cases, the real-Postgres lane, the MCP interaction lane, the cadence
 worker and the recovery sweep. Each of them used to spell the batch out as a raw
 dict literal, which is why a change to the production key set could leave four
@@ -22,7 +22,7 @@ So the shape is stated once, HERE, from the spec and not from the parser:
   sent.
 
 WHY these builders do not read the parser's own constants: a builder derived
-from ``fin.host.structured_evidence_invalidation`` cannot disagree with it, so a
+from ``fin.host.evidence.structured_evidence_invalidation`` cannot disagree with it, so a
 case asserting that the two agree would be asserting ``x == x``. Written from
 the spec, they can — and that disagreement is the defect these suites exist to
 catch.

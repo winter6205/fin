@@ -29,6 +29,7 @@ from fin.corpus.ingest_state_model import (
     TransitionRequest,
     coerce_request,
     coerce_state_filter,
+    event_audit,
     failure_guard,
     job_created_audit,
     job_superseded_audit,
@@ -121,6 +122,34 @@ class InMemoryIngestStateStore:
             return tuple(
                 row for row in self._audit if row.document_id == document_id
             )
+
+    def append_audit(
+        self,
+        document_id: str,
+        action: str,
+        metadata: Mapping[str, Any],
+        *,
+        actor: str | None = None,
+    ) -> IngestAuditRow:
+        """Append one state-machine-external event row; return it.
+
+        The job's state is deliberately NOT touched: an event records a
+        publication fact, and moving or failing a job from an audit
+        write would make the audit trail a second state machine.
+        """
+        validate_document_id(document_id)
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError("action must not be empty")
+        row = event_audit(
+            document_id, action, metadata, actor, utc_now()
+        )
+        with self._lock:
+            # The job must exist: an event about nothing is a bug, and
+            # appending it would let a warning poll read a document no
+            # job ever accepted.
+            self._require_job(document_id)
+            self._append_audit(row)
+        return row
 
     def transition(
         self,

@@ -1,6 +1,6 @@
 """The sql 档 consumer: wire rows become database-row evidence, exits stay named.
 
-the tracked change T7 host half. The retrieve tool today builds evidence ONLY
+T7 host half. The retrieve tool today builds evidence ONLY
 from chunks; a ``sql`` answer carries its rows in the ``database_rows``
 sibling (spec §8.0), so without this leg a ledger row is text the model
 sees but a fact the citation gate cannot verify. Pinned here, against
@@ -41,13 +41,13 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import Locator
-from fin.host.citation_gate import (
+from fin.host.grounded.citation_gate import (
     DATABASE_ROW_DISPLAY,
     DATABASE_ROW_KIND,
     EvidenceItem,
     verify_citations,
 )
-from fin.host.evidence_admission import (
+from fin.host.evidence.evidence_admission import (
     database_row_shape_refusal,
     evidence_from_database_rows,
 )
@@ -208,7 +208,7 @@ def test_the_built_row_evidence_passes_the_row_verification_lane() -> None:
         repair_count=0,
         known_document_ids=set(),
     )
-    from fin.host.citation_gate import DoneResult
+    from fin.host.grounded.citation_gate import DoneResult
 
     assert isinstance(result, DoneResult), result
     assert len(result.citations) == 1
@@ -221,7 +221,7 @@ def test_the_built_row_evidence_passes_the_row_verification_lane() -> None:
 def test_an_unsupported_figure_refuses_on_the_row_reason() -> None:
     """A number no returned field supports is the ADR 0091 refusal,
     not a locator bounce: nothing here needs re-citing."""
-    from fin.host.citation_gate import RefuseResult
+    from fin.host.grounded.citation_gate import RefuseResult
 
     items = evidence_from_database_rows([_ROW_WIRE])
     result = verify_citations(
@@ -243,7 +243,7 @@ def test_a_supported_figure_beside_a_fabricated_one_still_refuses() -> None:
     beside it. Under the old ``any(row supports any token)`` reading
     this answer published with a citation, which is exactly the
     laundering the gate's own comment forbids."""
-    from fin.host.citation_gate import RefuseResult
+    from fin.host.grounded.citation_gate import RefuseResult
 
     items = evidence_from_database_rows([_ROW_WIRE])
     result = verify_citations(
@@ -316,7 +316,7 @@ def test_rows_retrieve_becomes_row_evidence_and_rides_the_envelope() -> None:
 
 
 def test_a_zero_row_sql_run_records_the_named_empty() -> None:
-    """The the tracked change empty outcome: the run's own record carries the job
+    """The empty outcome: the run's own record carries the job
     fact, so the verifier's refusal is re-labelled
     ``sql_no_matching_rows`` — NOT ``corpus_not_ready``, whose advice
     (ingest documents) is factually wrong after a database miss."""
@@ -356,9 +356,18 @@ def test_the_rewrite_retry_still_counts_a_rows_object_as_a_result() -> None:
 
 
 def test_the_zero_row_copy_names_the_ledger_not_documents() -> None:
+    # The SQL contract (specs/search-mode-business-sql-contract.md "The copy
+    # for ``sql_no_matching_rows``") requires the copy to NAME the database
+    # and the queried window and say zero rows matched — never ingest,
+    # corpus, or documents. GE-5 (QA-chain) moved the served copy to
+    # general Chinese, so the name is asserted semantically (数据库 names
+    # the database; 时间范围 names the window; 没有匹配 states zero rows)
+    # rather than by the English literals the pre-GE-5 copy happened to use.
     copy = ORDINARY_PERSON_COPY[SQL_NO_MATCHING_ROWS]
+    assert "数据库" in copy
+    assert "时间范围" in copy
+    assert "没有匹配" in copy
     lowered = copy.lower()
-    assert "database" in lowered or "ledger" in lowered
     for forbidden in ("ingest", "corpus", "document"):
         assert forbidden not in lowered, copy
 

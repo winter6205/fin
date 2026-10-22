@@ -1,4 +1,4 @@
-"""Tests for the thread export builder (T4, the tracked change).
+"""Tests for the thread export builder (T4).
 
 Spec Focus 3 / SC6: "one authenticated-to-local GET or POST from the
 thread returns a file body for citations or comparison; missing run ->
@@ -20,6 +20,7 @@ import pytest
 
 from fin.host.export import (
     ExportEmptyError,
+    ExportError,
     MalformedCitationRowError,
     RunNotFoundError,
     UnsupportedComparisonSchemaError,
@@ -107,6 +108,7 @@ def _run(
     *,
     comparisons: list[dict] | None = None,
     citations: list[dict] | None = None,
+    retrieval_window: dict | list | None = None,
 ) -> RunRecord:
     return RunRecord(
         id=run_id,
@@ -116,6 +118,7 @@ def _run(
         answer="a",
         citations=citations or [],
         comparisons=comparisons or [],
+        retrieval_window={} if retrieval_window is None else retrieval_window,
     )
 
 
@@ -307,6 +310,83 @@ def test_comparison_json_export_is_the_envelope_verbatim() -> None:
     assert payload["run_id"] == "run-1"
     assert payload["kind"] == "comparison"
     assert payload["comparisons"] == [envelope]
+
+
+def test_comparison_json_includes_the_run_retrieval_window_strings() -> None:
+    """JSON comparison export copies the three stored window strings."""
+    window = {
+        "retrieval_fingerprint": "fp-9c2",
+        "generation_id": "gen-4",
+        "epoch": "7",
+    }
+    export = build_export(
+        runs=[
+            _run(
+                "run-1",
+                comparisons=[_comparison_envelope()],
+                retrieval_window=window,
+            )
+        ],
+        kind="comparison",
+        thread_id=THREAD_ID,
+        fmt="json",
+    )
+
+    assert json.loads(export.body)["retrieval_window"] == window
+
+
+def test_citation_json_retrieval_window_is_empty_when_the_run_did_not_retrieve() -> None:
+    """A run that did not retrieve still has a retrieval_window object."""
+    export = build_export(
+        runs=[_run("run-1", citations=CITATIONS, retrieval_window={})],
+        kind="citations",
+        thread_id=THREAD_ID,
+        fmt="json",
+    )
+
+    assert json.loads(export.body)["retrieval_window"] == {}
+
+
+def test_json_retrieval_window_omits_non_strings_and_unrelated_keys() -> None:
+    """Only string values of the three window fields are copied."""
+    export = build_export(
+        runs=[
+            _run(
+                "run-1",
+                comparisons=[_comparison_envelope()],
+                retrieval_window={
+                    "retrieval_fingerprint": "fp-9c2",
+                    "generation_id": 4,
+                    "epoch": None,
+                    "trace_status": "ok",
+                },
+            )
+        ],
+        kind="comparison",
+        thread_id=THREAD_ID,
+        fmt="json",
+    )
+
+    assert json.loads(export.body)["retrieval_window"] == {
+        "retrieval_fingerprint": "fp-9c2",
+    }
+
+
+def test_json_export_raises_when_retrieval_window_is_not_a_mapping() -> None:
+    """A list is not the empty window: ``{}`` means no window strings."""
+    with pytest.raises(ExportError):
+        build_export(
+            runs=[
+                _run(
+                    "run-1",
+                    comparisons=[_comparison_envelope()],
+                    retrieval_window=["fp-9c2"],
+                )
+            ],
+            kind="comparison",
+            thread_id=THREAD_ID,
+            fmt="json",
+        )
 
 
 def test_comparison_export_defaults_to_the_latest_run_that_has_one() -> None:
@@ -918,6 +998,7 @@ def test_citations_json_export_is_the_stored_rows_byte_for_byte() -> None:
             "run_id": "run-1",
             "kind": "citations",
             "citations": citations,
+            "retrieval_window": {},
         },
         ensure_ascii=False,
         indent=2,

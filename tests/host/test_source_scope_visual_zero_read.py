@@ -51,17 +51,17 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.parsers._pages import PageRaster
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.attachment_budgets import AttachmentBudgets, VisionCallLedger
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_source_read import AttachmentSourceReader
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_budgets import AttachmentBudgets, VisionCallLedger
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_source_read import AttachmentSourceReader
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     AttachmentStoreError,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
     StoredPageRegion,
 )
-from fin.host.attachment_vision import VisionCallResult, VisionUsage
+from fin.host.attachment.attachment_vision import VisionCallResult, VisionUsage
 from fin.host.graph import (
     _make_read_visual_detail_tool,
     _make_visual_faces_factory,
@@ -199,7 +199,7 @@ class CountingFacesFactory:
 class AuthorityStore:
     """The trusted store as the boundary sees it: metadata reads counted.
 
-    Wraps a real :class:`~fin.host.attachment_store.InMemoryAttachmentStore` so
+    Wraps a real :class:`~fin.host.attachment.attachment_store.InMemoryAttachmentStore` so
     the authority facts come from the store's own answers, then changes that
     answer from the ``shift_after``-th read on: ``advance`` re-issues the row at
     a newer version (a re-preparation landing mid-decision), ``drop`` stops
@@ -281,7 +281,7 @@ class MintedLedgers:
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import fin.host.attachment_budgets as budgets_module
+        import fin.host.attachment.attachment_budgets as budgets_module
 
         minted: list[VisionCallLedger] = []
         real = budgets_module.VisionCallLedger

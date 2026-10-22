@@ -21,12 +21,12 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from langchain_core.messages import HumanMessage
 
-from fin.host.jev_choice import (
+from fin.host.question.jev_choice import (
     JEV_CHOICE_EXIT_SCHEMA,
     JEV_CHOICE_EXIT_TRANSPORT,
     JevChoiceError,
 )
-from fin.host.track_decision import (
+from fin.host.grounded.track_decision import (
     _JEV_TRACK_OPTIONS,
     decide_track,
 )
@@ -43,7 +43,7 @@ def test_empty_messages_keep_deterministic_dialogue_fallback() -> None:
 
 
 @pytest.mark.soft_track
-def test_zero_confidence_judge_clarifies() -> None:
+def test_zero_confidence_judge_falls_back_to_retrieval() -> None:
     fake = FakeJevChoice([("grounded", 0.0)])
 
     decision = decide_track(
@@ -51,7 +51,8 @@ def test_zero_confidence_judge_clarifies() -> None:
         jev_client=fake,
     )
 
-    assert decision.track == "clarify"
+    assert decision.track == "grounded"
+    assert decision.decision_tier == "jev_fallback"
     assert decision.confidence == 0.0
     assert decision.signals["jev_exit"] == "low_confidence"
 
@@ -79,11 +80,11 @@ def test_concurrent_default_decisions_remain_independent() -> None:
         decisions = list(executor.map(classify, range(8)))
 
     assert len(decisions) == 8
-    # ADR 0080: no client at the gray zone is clarify, deterministically
-    # and independently per call.
-    assert all(decision.track == "clarify" for decision in decisions)
+    # GE-1: no client at the gray zone falls back to retrieval,
+    # deterministically and independently per call.
+    assert all(decision.track == "grounded" for decision in decisions)
     assert all(
-        decision.decision_tier == "clarify" for decision in decisions
+        decision.decision_tier == "jev_fallback" for decision in decisions
     )
 
 
@@ -92,7 +93,7 @@ def test_concurrent_default_decisions_remain_independent() -> None:
     "exit_code",
     [JEV_CHOICE_EXIT_TRANSPORT, JEV_CHOICE_EXIT_SCHEMA],
 )
-def test_judge_typed_exit_is_fail_closed_clarify_with_named_code(
+def test_judge_typed_exit_falls_back_to_retrieval_with_named_code(
     exit_code: str,
 ) -> None:
     fake = FakeJevChoice([JevChoiceError("down", exit_code=exit_code)])
@@ -102,14 +103,14 @@ def test_judge_typed_exit_is_fail_closed_clarify_with_named_code(
         jev_client=fake,
     )
 
-    assert decision.track == "clarify"
+    assert decision.track == "grounded"
     assert decision.signals["jev_exit"] == exit_code
-    assert decision.decision_tier == "clarify"
+    assert decision.decision_tier == "jev_fallback"
 
 
 @pytest.mark.soft_track
-def test_unexpected_judge_raise_still_fail_closes() -> None:
-    """A non-typed throw must not crash the cascade — clarify wins."""
+def test_unexpected_judge_raise_still_falls_back_to_retrieval() -> None:
+    """A non-typed throw must not crash the cascade — retrieval wins."""
 
     class _Broken:
         def __init__(self) -> None:
@@ -125,7 +126,7 @@ def test_unexpected_judge_raise_still_fail_closes() -> None:
         jev_client=judge,
     )
 
-    assert decision.track == "clarify"
+    assert decision.track == "grounded"
     assert decision.signals["jev_exit"] == "unexpected_error"
     assert decision.signals["jev_error_type"] == "RuntimeError"
     # The request it broke on carried a discriminator for every leaf the

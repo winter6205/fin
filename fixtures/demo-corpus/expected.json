@@ -1,0 +1,269 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "question": "Under the ZEUS Employee Handbook, how many annual leave days accrue per calendar year, and what happens to unused days at the end of the year?",
+      "source_ref": "zeus-handbook",
+      "locator": "ZEUS Employee Handbook · Page 1, Section 1",
+      "key_facts": [
+        "22 days per calendar year",
+        "5 unused annual leave days",
+        "forfeited on 31 December"
+      ],
+      "expected_kind": "answerable"
+    },
+    {
+      "id": "q2",
+      "question": "What is the list price per unit of the ZEUS AEGIS Edge Gateway, from what date is that price effective, and what median latency does it sustain at full load?",
+      "source_ref": "zeus-product-guide",
+      "locator": "ZEUS Product Guide · Page 1, Section 1",
+      "key_facts": [
+        "USD 12,450 per unit",
+        "2024-03-04",
+        "40 Gbps",
+        "1.8 milliseconds"
+      ],
+      "expected_kind": "answerable"
+    },
+    {
+      "id": "q3",
+      "question": "During which exact UTC window is the ZEUS change freeze in effect, when does the Change Advisory Board meet, and how many of its 5 voting members must be present for a change to be approved?",
+      "source_ref": "zeus-change-process",
+      "locator": "ZEUS Change Management Process · Page 2, Section 2",
+      "key_facts": [
+        "2024-12-20T00:00:00Z",
+        "2025-01-06T00:00:00Z",
+        "every Tuesday at 15:00 UTC",
+        "at least 4 of the 5 voting members"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "lexical"
+    },
+    {
+      "id": "q4",
+      "question": "At the ZEUS board meeting held on 2024-05-09, what quarterly dividend per share was approved, on what payment date, and what was the vote count?",
+      "source_ref": "zeus-board-minutes",
+      "locator": "ZEUS Board Meeting Minutes · Page 2, Section 2",
+      "key_facts": [
+        "USD 0.85 per share",
+        "2024-06-14",
+        "5 in favour",
+        "2 against",
+        "0 abstentions"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "graph"
+    },
+    {
+      "id": "q5",
+      "question": "For the three months ended 2024-09-30, what total revenue, gross profit, net income and diluted earnings per share did ZEUS report?",
+      "source_ref": "zeus-quarterly-summary",
+      "locator": "ZEUS Quarterly Financial Summary · Page 1, Section 1",
+      "key_facts": [
+        "USD 412,300,000",
+        "USD 361,800,000",
+        "13.96%",
+        "USD 247,380,000",
+        "60.0%",
+        "USD 61,845,000",
+        "USD 1.42"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "global"
+    },
+    {
+      "id": "q6",
+      "question": "What was the approved 2024 operating budget of the ZEUS Advanced Propulsion Division, and who led that division?",
+      "source_ref": null,
+      "locator": null,
+      "key_facts": [],
+      "expected_kind": "refusal"
+    },
+    {
+      "id": "q7",
+      "question": "Under the ZEUS Supplier Agreement Template, when is an undisputed invoice payable and how long is the goods conformity warranty?",
+      "source_ref": "zeus-supplier-agreement-template",
+      "locator": "ZEUS Supplier Agreement Template · Page 1, Section 1",
+      "key_facts": [
+        "within 30 calendar days",
+        "90-day warranty"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "graph"
+    },
+    {
+      "id": "q8",
+      "question": "According to the ZEUS Support FAQ, how quickly is a Severity 1 case acknowledged, and what three details should the customer include?",
+      "source_ref": "zeus-support-faq",
+      "locator": "ZEUS Support FAQ · Page 1, Section 1",
+      "key_facts": [
+        "within 30 minutes",
+        "workspace ID",
+        "UTC time",
+        "short description"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "lexical"
+    },
+    {
+      "id": "q9",
+      "question": "For the ZEUS Platform Project week ending 2024-09-27, what was the release readiness, what blocker remained, and when was the next checkpoint?",
+      "source_ref": "zeus-platform-weekly-report",
+      "locator": "ZEUS Platform Project Weekly Report · Page 1, Section 1",
+      "key_facts": [
+        "AMBER",
+        "40-minute delay in audit events from the secondary region",
+        "2024-10-01 at 13:30 UTC"
+      ],
+      "expected_kind": "answerable",
+      "additional_sources": [
+        {
+          "source_ref": "zeus-platform-weekly-report",
+          "locator": "ZEUS Platform Project Weekly Report · Page 2, Section 2"
+        }
+      ]
+    },
+    {
+      "id": "q10",
+      "question": "Which four production-change severities are named by the ZEUS Change Management Process, and where is a change request filed?",
+      "source_ref": "zeus-change-process",
+      "locator": "ZEUS Change Management Process · Page 1, Section 1",
+      "key_facts": [
+        "CR-Tracker queue",
+        "S1 Critical",
+        "S2 Major",
+        "S3 Minor",
+        "S4 Standard"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "lexical"
+    },
+    {
+      "id": "q11",
+      "question": "What is the monthly internet reimbursement cap for a ZEUS remote worker, and what claim timing and receipt rules apply?",
+      "source_ref": "zeus-remote-work-handbook",
+      "locator": "ZEUS Remote Work Handbook · Page 2, Section 2",
+      "additional_sources": [
+        {
+          "source_ref": "zeus-expense-policy",
+          "locator": "ZEUS Business Expense Policy · Page 1, Section 1"
+        }
+      ],
+      "key_facts": [
+        "USD 55 per month",
+        "within 30 calendar days",
+        "receipt is required for each item of USD 25 or more"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "graph"
+    },
+    {
+      "id": "q12",
+      "question": "Summarize delivery progress and remaining risks across the two ZEUS project weekly reports, including each next dated checkpoint or shipment milestone.",
+      "source_ref": "zeus-platform-weekly-report",
+      "locator": "ZEUS Platform Project Weekly Report · Page 1, Section 1",
+      "additional_sources": [
+        {
+          "source_ref": "zeus-platform-weekly-report",
+          "locator": "ZEUS Platform Project Weekly Report · Page 2, Section 2"
+        },
+        {
+          "source_ref": "zeus-aegis-weekly-report",
+          "locator": "ZEUS AEGIS Project Weekly Report · Page 1, Section 1"
+        }
+      ],
+      "key_facts": [
+        "AMBER",
+        "18 of 20 planned integration checks",
+        "2024-10-01 at 13:30 UTC",
+        "24 gateways against a target of 20",
+        "2024-10-11"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "global"
+    },
+    {
+      "id": "q13",
+      "question": "How many days of annual leave accrue to a ZEUS employee per calendar year?",
+      "source_ref": "zeus-handbook",
+      "locator": "ZEUS Employee Handbook · Page 1, Section 1",
+      "key_facts": [
+        "22 days per calendar year"
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "graph",
+      "follow_up": {
+        "question": "How many unused annual leave days may be carried into the next calendar year, and what happens to any amount above that limit?",
+        "source_ref": "zeus-handbook",
+        "locator": "ZEUS Employee Handbook · Page 1, Section 1",
+        "key_facts": [
+          "at most 5 unused annual leave days",
+          "forfeited on 31 December"
+        ]
+      }
+    },
+    {
+      "id": "q14",
+      "question": "Using the ZEUS accounts-payable database, list the supplier invoices posted for 2024 Q3 and the amount paid to each supplier.",
+      "source_ref": null,
+      "locator": null,
+      "key_facts": [],
+      "expected_kind": "refusal",
+      "search_mode": "sql",
+      "boundary": "No ZEUS business database is seeded by this document corpus; do not infer SQL rows from contract or financial prose."
+    },
+    {
+      "id": "q15",
+      "question": "Query the ZEUS business database for active contracts expiring from 2026-01-01 through 2026-04-30 inclusive, including each contract ID, counterparty, expiry date, and notice-by date.",
+      "source_ref": null,
+      "locator": null,
+      "key_facts": [
+        "C-2315",
+        "Northwind Logistics",
+        "2026-01-24",
+        "2026-01-17",
+        "C-2302",
+        "Meridian Analytics GmbH",
+        "2026-02-28",
+        "2025-12-30",
+        "C-2291",
+        "Northwind Logistics",
+        "2026-03-14",
+        "2026-02-12",
+        "C-2024Q1",
+        "Halcyon Print Works",
+        "2026-04-30",
+        "2026-03-31"
+      ],
+      "rows": [
+        {
+          "contract_id": "C-2315",
+          "counterparty": "Northwind Logistics",
+          "expiry_date": "2026-01-24",
+          "notice_by": "2026-01-17"
+        },
+        {
+          "contract_id": "C-2302",
+          "counterparty": "Meridian Analytics GmbH",
+          "expiry_date": "2026-02-28",
+          "notice_by": "2025-12-30"
+        },
+        {
+          "contract_id": "C-2291",
+          "counterparty": "Northwind Logistics",
+          "expiry_date": "2026-03-14",
+          "notice_by": "2026-02-12"
+        },
+        {
+          "contract_id": "C-2024Q1",
+          "counterparty": "Halcyon Print Works",
+          "expiry_date": "2026-04-30",
+          "notice_by": "2026-03-31"
+        }
+      ],
+      "expected_kind": "answerable",
+      "search_mode": "sql",
+      "boundary": "These rows come from the demo-owned synthetic _test ledger; the document corpus does not contain these database rows."
+    }
+  ]
+}

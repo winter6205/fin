@@ -34,6 +34,7 @@ from fin.retrieve import (
     FakeRetrievePort,
     RetrievePort,
 )
+from fin.retrieve.port import DocumentScopeEntry, UNSUPPORTED_SOURCE_SCOPE_CODE
 
 
 def _chunk(text: str, document_id: str = "DOC-2023Q1", unit: int = 1) -> Chunk:
@@ -66,11 +67,15 @@ def test_empty_query_is_a_named_failure() -> None:
 
 def test_unknown_query_returns_empty_chunks() -> None:
     """Boundary 'empty': a non-empty query that the fake has no
-    hits for yields ``{"chunks": []}`` without raising."""
+    hits for yields the ``zero``-distribution empty envelope without
+    raising."""
     port = FakeRetrievePort(
         hits_by_query={"alpha": [_chunk("hit")]},
     )
-    assert port.retrieve("nonexistent query") == {"chunks": []}
+    assert port.retrieve("nonexistent query") == {
+        "chunks": [],
+        "distribution": "zero",
+    }
 
 
 # ----- negative -----
@@ -233,7 +238,7 @@ def test_nonempty_edgar_filters_are_noops_on_fake() -> None:
         ticker="AAPL",
         filing_date="2023-08-04",
     )
-    assert out == {"chunks": chunks}
+    assert out == {"chunks": chunks, "distribution": "hit"}
 
 
 def _mk_chunk(document_id: str, unit: int, text: str):
@@ -349,6 +354,52 @@ def test_fake_records_the_search_mode_it_received() -> None:
     assert port.calls[1]["query"] == "foo"
 
 
+def test_fake_document_scope_filters_hits_by_document_and_version() -> None:
+    allowed = _mk_chunk("DOC-2023Q1", 1, "allowed")
+    wrong_version = Chunk(
+        text="stale version",
+        source_ref=Locator(
+            document_id="DOC-2023Q1", version="old-version", unit=2
+        ),
+        score=2.0,
+    )
+    other_document = _mk_chunk("DOC-2023Q2", 1, "other")
+    port = FakeRetrievePort(
+        hits_by_query={"foo": [wrong_version, other_document, allowed]}
+    )
+
+    result = port.retrieve(
+        "foo",
+        document_scope=(
+            DocumentScopeEntry("DOC-2023Q1", allowed.source_ref.version),
+        ),
+    )
+
+    assert result["chunks"] == [allowed]
+    assert port.calls[0]["document_scope"] == (
+        DocumentScopeEntry("DOC-2023Q1", allowed.source_ref.version),
+    )
+
+
+@pytest.mark.parametrize("search_mode", ["global", "sql"])
+def test_fake_names_scoped_modes_it_cannot_enforce(search_mode: str) -> None:
+    port = FakeRetrievePort(
+        hits_by_query={"foo": [_mk_chunk("DOC-2023Q1", 1, "hit")]},
+        database_rows_by_query={"foo": [{"private": "row"}]},
+    )
+
+    result = port.retrieve(
+        "foo",
+        search_mode=search_mode,
+        document_scope=(DocumentScopeEntry("DOC-2023Q1", "v-" + "a" * 60),),
+        sql_window_start="2026-01-01",
+        sql_window_end="2026-03-31",
+    )
+
+    assert result == {"error": UNSUPPORTED_SOURCE_SCOPE_CODE}
+    assert port.calls == []
+
+
 def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
     """``fin.retrieve.tool.retrieve`` is pass-through: the 档 the host
     assigned must reach the port, not be dropped on the floor."""
@@ -373,6 +424,10 @@ def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
             "search_mode": "lexical",
             "sql_window_start": None,
             "sql_window_end": None,
+            # The generic metadata filter rides the port contract shape
+            # on EVERY call record: ``None`` here = the absent form
+            # (whole authorized scope), matching ``search_mode=None``.
+            "filters": None,
         }
     ]
 
@@ -495,7 +550,8 @@ def test_an_open_tier_never_turns_the_legal_empty_miss_into_an_error() -> None:
         known_document_ids={"DOC-2023Q1"},
     )
     assert port.retrieve("nonexistent query", search_mode="lexical") == {
-        "chunks": []
+        "chunks": [],
+        "distribution": "zero",
     }
     assert port.calls[-1]["search_mode"] == "lexical"
 
@@ -527,7 +583,10 @@ def test_an_omitted_mode_is_not_sent_and_stays_a_legal_miss() -> None:
     )
     # And the same call against a corpus with nothing for it stays the
     # legal empty result — omission is not itself a failure.
-    assert FakeRetrievePort().retrieve("nothing") == {"chunks": []}
+    assert FakeRetrievePort().retrieve("nothing") == {
+        "chunks": [],
+        "distribution": "zero",
+    }
 
 
 def test_the_limit_cap_holds_under_an_open_tier() -> None:
@@ -621,7 +680,7 @@ def test_an_ordinary_fake_never_learns_the_fast_job_key() -> None:
         hits_by_query={"foo": [_chunk("hit")]}
     ).retrieve("foo")
 
-    assert empty == {"chunks": []}
+    assert empty == {"chunks": [], "distribution": "zero"}
     assert RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY not in empty
     assert RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY not in with_hits
 

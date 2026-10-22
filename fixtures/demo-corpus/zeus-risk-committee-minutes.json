@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-risk-committee-minutes",
+  "title": "ZEUS Risk Committee Minutes",
+  "content": "ZEUS Risk Committee Minutes · Page 1\nSection 1: Attendance and agenda\nThe Risk Committee met on 2024-08-14 at 11:00 UTC. Chair Elena Markovic and members Theo Mensah, Lucía Ferrer, and Bo Chen attended; the committee secretary recorded the minutes. The Committee reviewed open operational risks, the quarterly incident register, and the status of prior actions. A quorum requires 3 of 4 voting members. The Committee meets on the second Wednesday of each quarter.\n\nZEUS Risk Committee Minutes · Page 2\nSection 2: Actions and follow-up\nThe Committee accepted the updated incident response procedure and asked the Security Duty Manager to report overdue corrective actions at each quarterly meeting. It assigned the supply continuity review to Amara Diallo, due 2024-10-04. The Committee kept the cloud-region concentration risk at medium likelihood and high impact until a second recovery exercise is complete. The next recovery exercise is due by 2024-11-15. For incident closure steps, see zeus-incident-response, Section 3.",
+  "chunks": [
+    {
+      "content": "ZEUS Risk Committee Minutes · Page 1\nSection 1: Attendance and agenda\nThe Risk Committee met on 2024-08-14 at 11:00 UTC. Chair Elena Markovic and members Theo Mensah, Lucía Ferrer, and Bo Chen attended; the committee secretary recorded the minutes. The Committee reviewed open operational risks, the quarterly incident register, and the status of prior actions. A quorum requires 3 of 4 voting members. The Committee meets on the second Wednesday of each quarter.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Risk Committee Minutes · Page 2\nSection 2: Actions and follow-up\nThe Committee accepted the updated incident response procedure and asked the Security Duty Manager to report overdue corrective actions at each quarterly meeting. It assigned the supply continuity review to Amara Diallo, due 2024-10-04. The Committee kept the cloud-region concentration risk at medium likelihood and high impact until a second recovery exercise is complete. The next recovery exercise is due by 2024-11-15. For incident closure steps, see zeus-incident-response, Section 3.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "meeting_minutes",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "8-K",
+    "period": "2024-08-14",
+    "filing_date": "2024-08-14"
+  },
+  "valid_from": "2024-08-14T00:00:00Z"
+}

@@ -48,9 +48,9 @@ from pydantic import Field
 from fin.corpus.extracted import load_extracted_tree
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.attachment_budgets import AttachmentBudgets
-from fin.host.attachment_prepare import AttachmentPreparationService
-from fin.host.attachment_store import InMemoryAttachmentStore
+from fin.host.attachment.attachment_budgets import AttachmentBudgets
+from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+from fin.host.attachment.attachment_store import InMemoryAttachmentStore
 from fin.host.run_control import RunControl
 from fin.host.thread_store import InMemoryThreadStore
 from fin.host.workspace_http import _resume_one_attachment_wait
@@ -247,6 +247,26 @@ def _retry(client: TestClient, thread_id: str, attachment_id: str):
     )
 
 
+def _retire(client: TestClient, thread_id: str) -> None:
+    """Retire a run parked on the attachment gate, through the real door.
+
+    A pause is a state and not an end, so ``_drive`` deliberately keeps the
+    run's live entry open in the mounted app's ``RunControl`` — that is what
+    makes ``/api/status`` able to publish a non-zero ``paused`` at all. The
+    one production event that retires it is ``DELETE /api/threads/{id}``,
+    which calls ``run_control.forget`` for exactly this reason.
+
+    Every case here parks a run and then walks away, so without this the
+    shared registry carries the pause into every later file in the process
+    and ``/api/status`` publishes a run count nobody in the suite created.
+    The status code is asserted so a refused delete (a second pause, an
+    attachment cleanup failure) cannot hide a leak behind a green test.
+    """
+    response = client.delete(f"/api/threads/{thread_id}")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+
+
 def _parse_sse_events(body: str) -> list[tuple[str, Any]]:
     events: list[tuple[str, Any]] = []
     current: dict[str, str] = {}
@@ -379,6 +399,7 @@ def test_paused_run_closes_stream_on_attachment_wait_with_minted_run_id(
     # durable job exists.
     assert built["service"].status(attachment_id).status == "parsing"
     assert len(built["service"].jobs.incomplete()) == 1
+    _retire(client, thread_id)
 
 
 def test_thread_detail_during_pause_names_the_pending_interrupt_kind(
@@ -397,6 +418,7 @@ def test_thread_detail_during_pause_names_the_pending_interrupt_kind(
     assert detail["pending_interrupt_kind"] == "attachment_preparation"
     assert detail["in_flight"] is False
     assert detail["turns"] == []
+    _retire(client, thread_id)
 
 
 # ----- 3. end-to-end round trip -----
@@ -441,6 +463,10 @@ def test_round_trip_send_drain_resume_completes_same_run_with_hydrated_text(
     detail = client.get(f"/api/threads/{thread_id}").json()
     assert detail["pending_checkpoint"] is False
     assert detail["pending_interrupt_kind"] is None
+    # The resume above drove a THROWAWAY ``RunControl``, so the mounted
+    # app's registry still holds the pause this send left. Only the thread
+    # going away retires it.
+    _retire(client, thread_id)
 
 
 # ----- 4. failed preparation lands as a typed refusal -----
@@ -492,6 +518,7 @@ def test_preparation_failing_mid_run_reaches_row_as_typed_refusal(
     record = built["service"].status(attachment_id)
     assert record.searchable is False
     assert [job.state for job in built["service"].jobs.incomplete()] == []
+    _retire(client, thread_id)
 
 
 # ----- 5. the retry door: ask only, never parse in-request -----
@@ -637,6 +664,13 @@ class _BlockingPutStore:
     The window the send gate must cover is exactly "``put`` has not
     returned yet", so the test has to hold that window open from the
     inside and be told when it is open (mirrors test_thread_attach.py).
+
+    ``delete`` is delegated too, so the proxy is a whole stand-in for the
+    seam it replaces rather than a partial one: the thread delete retires
+    a paused run through ``attachments.delete_thread``, and a proxy missing
+    this method answers ``attachment_cleanup_failed`` — a 500 raised
+    BEFORE ``run_control.forget`` is reached, which leaves the pause in the
+    registry and leaks it into every later file in the process.
     """
 
     def __init__(self, inner: InMemoryObjectStore) -> None:
@@ -656,6 +690,9 @@ class _BlockingPutStore:
 
     def get_pointer(self, key: str):
         return self.inner.get_pointer(key)
+
+    def delete(self, key: str) -> None:
+        self.inner.delete(key)
 
 
 def test_send_still_409_while_an_upload_is_in_flight(
@@ -691,3 +728,4 @@ def test_send_still_409_while_an_upload_is_in_flight(
     released = _send(client, thread_id, attachment_ids=[landed.json()["attachment_id"]])
     assert released.status_code == 200, released.text
     assert any(name == "attachment_wait" for name, _ in _parse_sse_events(released.text))
+    _retire(client, thread_id)

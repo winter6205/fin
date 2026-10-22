@@ -1,0 +1,7 @@
+# 0101. Server lifespan owns runtime resources and one execution lifecycle
+Date: 2026-10-16
+Status: accepted
+
+The existing compiler retains runtime cleanup through process-global stacks while HTTP and background continuation can coordinate different run controls, making partial startup, isolated applications and disconnect recovery difficult to reason about. Put the closeable compiled-runtime handle, shared controls and worker supervision under the creating application's lifespan, and expose one typed per-run execution/cancellation seam to HTTP and background callers; retain the synchronous durable graph and existing task authority. This accepts the cost of an explicit ownership interface and compatibility adapters instead of relying on process exit, a forwarding-only Server wrapper, or a speculative async-persistence rewrite.
+
+Authority: [server lifecycle spec](../../specs/qa-chain-server-runtime.md); evidence and caller burden: [architecture assessment](../../plans/qa-chain-generalization.md). ADR 0015/0026 remain in force. Adopted on 2026-10-16 after operator confirmation and fresh architecture review. The approved design includes the separate receipt table and the sibling catalog/audit and checkpoint extensions; their exact contracts live in the specs. No dependency change or implementation pass is implied. The initial execution-owner boundary is single-process; multi-process ownership requires a separately reviewed implementation.

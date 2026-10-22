@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-handbook",
+  "title": "ZEUS Employee Handbook",
+  "content": "ZEUS Employee Handbook · Page 1\nSection 1 covers working hours, annual leave and sick leave.\nThe standard work week is 40 hours. The standard day runs from\n09:00 to 17:30 local time with a 60-minute unpaid lunch break.\nEmployees work on site three days per week: Tuesday, Wednesday\nand Thursday. Friday is the company-wide remote day.\nAnnual leave accrues at 22 days per calendar year, credited to\nemployees in equal monthly instalments on the last working day\nof each month. At most 5 unused annual leave days may be carried\ninto the next calendar year; any amount above 5 days is\nforfeited on 31 December of the accrual year.\nSick leave is granted at 10 days per calendar year and is unpaid.\nAbsences longer than 3 consecutive working days require a\nmedical certificate submitted to People Operations.\nSection owner: Priya Raghunathan, Head of People Operations.\n\nZEUS Employee Handbook · Page 2\nSection 2 covers the annual compensation review and the conduct\nescalation ladder.\nThe 2025 annual compensation review cycle runs from 2025-02-03\nto 2025-02-28 inclusive. Managers must submit recommendations by\n2025-02-21; late submissions are deferred to the 2026 cycle.\nCycle owner: Marcus Delacroix, Director of Total Rewards.\nA performance or conduct concern is escalated in exactly three\nsteps, and no step may be skipped:\n  Step 1: an informal conversation between the employee and the\n          direct manager, recorded in the manager's notes.\n  Step 2: a written warning issued by the assigned HR Business\n          Partner and acknowledged by the employee in writing.\n  Step 3: suspension of the employee and referral of the case to\n          the Employee Relations Committee, which decides within\n          15 business days.\nAn employee may file a grievance at any time within 45 calendar\ndays after the date of the incident that gave rise to it. A\ngrievance filed later is rejected without review.",
+  "chunks": [
+    {
+      "content": "ZEUS Employee Handbook · Page 1\nSection 1 covers working hours, annual leave and sick leave.\nThe standard work week is 40 hours. The standard day runs from\n09:00 to 17:30 local time with a 60-minute unpaid lunch break.\nEmployees work on site three days per week: Tuesday, Wednesday\nand Thursday. Friday is the company-wide remote day.\nAnnual leave accrues at 22 days per calendar year, credited to\nemployees in equal monthly instalments on the last working day\nof each month. At most 5 unused annual leave days may be carried\ninto the next calendar year; any amount above 5 days is\nforfeited on 31 December of the accrual year.\nSick leave is granted at 10 days per calendar year and is unpaid.\nAbsences longer than 3 consecutive working days require a\nmedical certificate submitted to People Operations.\nSection owner: Priya Raghunathan, Head of People Operations.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Employee Handbook · Page 2\nSection 2 covers the annual compensation review and the conduct\nescalation ladder.\nThe 2025 annual compensation review cycle runs from 2025-02-03\nto 2025-02-28 inclusive. Managers must submit recommendations by\n2025-02-21; late submissions are deferred to the 2026 cycle.\nCycle owner: Marcus Delacroix, Director of Total Rewards.\nA performance or conduct concern is escalated in exactly three\nsteps, and no step may be skipped:\n  Step 1: an informal conversation between the employee and the\n          direct manager, recorded in the manager's notes.\n  Step 2: a written warning issued by the assigned HR Business\n          Partner and acknowledged by the employee in writing.\n  Step 3: suspension of the employee and referral of the case to\n          the Employee Relations Committee, which decides within\n          15 business days.\nAn employee may file a grievance at any time within 45 calendar\ndays after the date of the incident that gave rise to it. A\ngrievance filed later is rejected without review.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "employee_handbook",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "10-K",
+    "period": "2024 FY",
+    "filing_date": "2024-01-15"
+  },
+  "valid_from": "2024-01-15T00:00:00Z"
+}

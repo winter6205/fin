@@ -14,10 +14,10 @@ hand-rolled manifest.
 It yields ``{"catalog_path": ...}`` so callers can splat it straight
 into ``list_files`` / ``list_filings``.
 
-T3 / SC3 / ADR 0035 also live here: after ``apply_dotenv`` populates the
-process env, we DEL ``FIN_MEMORY_ENABLED`` so the default pytest run
-builds an OFF memory port even when the operator ``.env`` has
-``FIN_MEMORY_ENABLED=true``. Memory cases opt back in via the
+T3 / SC3 / ADR 0035 also live here: we DEL ``FIN_MEMORY_ENABLED`` so the
+default pytest run builds an OFF memory port even when
+``~/.fin/settings.yaml`` has ``memory.enabled: true``. Memory cases opt
+back in via the
 ``@pytest.mark.memory_on`` marker + ``memory_on_env`` fixture in
 ``tests/host/conftest.py``.
 
@@ -32,28 +32,53 @@ two copies of a gate drift.
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
 
 import pytest
 
-from fin.corpus.catalog import record_filings
-from fin.host.jev_choice import JevChoiceClient, build_jev_client
-from fin.host.operator_env import apply_dotenv
+# ``tests/host/conftest.py`` is also imported as ``conftest`` and would
+# otherwise force a second execution of this file. Publish this module so
+# ``from tests.conftest import _PROCESS_SNAPSHOT`` sees the snapshot below.
+if __name__ == "conftest":
+    import types
+
+    if "tests" not in sys.modules:
+        _tests_pkg = types.ModuleType("tests")
+        _tests_pkg.__path__ = []
+        _tests_pkg.__package__ = "tests"
+        sys.modules["tests"] = _tests_pkg
+        del _tests_pkg
+    sys.modules.setdefault("tests.conftest", sys.modules[__name__])
+
+from fin.corpus.demo_seed import seed_demo_catalog
+from fin.host.question.jev_choice import JevChoiceClient, build_jev_client
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Load the operator ``.env`` (``FIN_CHECKPOINT_URL`` &c.) before any
-# fixture reads ``os.environ``, so Postgres-backed tests are not
-# skipped just because the shell session did not export the vars.
-# Product boot uses the same ``apply_dotenv`` (SSOT), which is a
-# ``setdefault`` fill: an explicitly exported var still wins, and a
-# missing ``.env`` is a no-op (CI stays hermetic).
-apply_dotenv(start=Path(__file__).resolve().parent.parent)
+# Captured before the hermetic pops. Default pytest and opt-in live gates
+# read this snapshot. They do not open ``~/.fin/settings.yaml``.
+_LIVE_PROCESS_KEYS = (
+    "FIN_API_KEY",
+    "FIN_MODEL",
+    "FIN_BASE_URL",
+    "FIN_JEV_API_KEY",
+    "FIN_JEV_MODEL",
+    "FIN_JEV_BASE_URL",
+    "TYPESAFE_API_KEY",
+    "TYPESAFE_DEFAULT_MODEL",
+    "TYPESAFE_BASE_URL",
+)
+_PROCESS_SNAPSHOT = {
+    key: value
+    for key in _LIVE_PROCESS_KEYS
+    if (value := os.environ.get(key, "").strip())
+}
 
 # SC3 / ADR 0035: default ``uv run pytest -q`` MUST stay OFF even when
-# the operator ``.env`` has ``FIN_MEMORY_ENABLED=true``. We strip the
+# ``~/.fin/settings.yaml`` sets memory on. We strip the
 # var here so any ``build_memory_port()`` call in unmarked tests sees
 # an unset ``FIN_MEMORY_ENABLED`` and resolves to ``OffMemoryAdapter``.
 #
@@ -66,16 +91,16 @@ apply_dotenv(start=Path(__file__).resolve().parent.parent)
 # ``memory_on_env`` fixture in ``tests/host/conftest.py``.
 os.environ.pop("FIN_MEMORY_ENABLED", None)
 
-# Default pytest must stay hermetic (spec: Fake / no live MCP). Operator
-# ``.env`` may point retrieve spawn at a sibling checkout; that hangs
-# unit tests. Product ``fin-serve`` still reads the var via apply_dotenv.
+# Default pytest must stay hermetic (spec: Fake / no live MCP). A shell
+# export may point retrieve spawn at a sibling checkout; that hangs
+# unit tests. Product ``fin-serve`` still reads the var from settings.
 os.environ.pop("FIN_KNOWLEDGE_MCP_CWD", None)
 os.environ.pop("FIN_MODEL", None)
 os.environ.pop("FIN_BASE_URL", None)
 os.environ.pop("FIN_API_KEY", None)
 os.environ.pop("FIN_JEV_API_KEY", None)
 # The structured-evidence identity is operator configuration read at boot. A
-# developer .env that fills it in would otherwise change what `serve()` compiles,
+# developer settings file that fills it in would otherwise change what `serve()` compiles,
 # so every test that stubs `compile_for_http` with a zero-argument lambda would
 # take a branch it does not assert. Strip it: the identity has its own test file.
 for _identity_var in tuple(os.environ):
@@ -95,38 +120,71 @@ os.environ.pop("TYPESAFE_BASE_URL", None)
 os.environ["FIN_CORPUS_INGEST_STORE"] = "memory"
 
 
-def _drop_unreachable_checkpoint_url() -> None:
-    """If ``FIN_CHECKPOINT_URL`` cannot accept a connection, unset it.
+class DatabaseGateError(RuntimeError):
+    """``FIN_TEST_DSN`` points at a database that is not a ``_test`` library."""
 
-    ``apply_dotenv`` loads the operator DSN so Postgres-backed tests can
-    run. A down listener (or a stale port after Compose stop) makes
-    ``psycopg.connect`` block ingest/host tests for minutes. Unset the
-    DSN so those paths use in-memory stores, matching a machine with no
-    ``.env``. A reachable DSN is left in place for CI / live Postgres.
+
+def _postgres_database_name(dsn: str) -> str:
+    """Return libpq's effective database name, or an empty string if absent.
+
+    Psycopg delegates parsing to libpq for URI and keyword conninfo forms.
+    Parse failures become a generic gate error without retaining parser details.
     """
-    url = (os.environ.get("FIN_CHECKPOINT_URL") or "").strip()
-    if not url:
-        return
+    from psycopg.conninfo import conninfo_to_dict
+
     try:
-        import psycopg
-
-        with psycopg.connect(url, connect_timeout=2) as connection:
-            connection.execute("SELECT 1")
+        settings = conninfo_to_dict(dsn)
     except Exception:
-        # EXIT: DSN not reachable; default pytest uses in-memory stores
+        # EXIT: Parser details may retain connection fields; raise the typed error below.
+        settings = None
+
+    if settings is None:
+        raise DatabaseGateError(
+            "FIN_TEST_DSN is not a valid PostgreSQL connection setting."
+        )
+
+    database = settings.get("dbname", "")
+    return database if isinstance(database, str) else ""
+
+
+def _configure_test_database() -> None:
+    """Bind every Postgres-backed test to the ``_test`` library a DSN names.
+
+    The single source for the run's DSN is ``FIN_TEST_DSN`` (spec: AGENTS.md
+    hard boundary 4); a development ``FIN_CHECKPOINT_URL`` left in the shell or
+    ``.env`` is never used. Unset ``FIN_TEST_DSN`` drops the ambient
+    ``FIN_CHECKPOINT_URL``, so the env-gated Postgres suites skip and the default
+    run stays hermetic. A set ``FIN_TEST_DSN`` MUST name a database ending in
+    ``_test``; anything else aborts collection instead of reading or writing the
+    development library, whose seed data a stray test run could clear. The DSN is
+    bridged onto ``FIN_CHECKPOINT_URL`` because that is the key the stores and
+    the durable suites already read.
+    """
+    test_dsn = (os.environ.get("FIN_TEST_DSN") or "").strip()
+    if not test_dsn:
         os.environ.pop("FIN_CHECKPOINT_URL", None)
+        return
+
+    database = _postgres_database_name(test_dsn)
+    if not database.endswith("_test"):
+        raise DatabaseGateError(
+            f"FIN_TEST_DSN names database {database!r}, which does not end in "
+            "``_test``. Tests connect only to a test library; the development "
+            "DSN is off-limits (AGENTS.md hard boundary 4)."
+        )
+
+    os.environ["FIN_CHECKPOINT_URL"] = test_dsn
 
 
-_drop_unreachable_checkpoint_url()
+_configure_test_database()
 
 
 @pytest.fixture(autouse=True)
 def _strip_operator_llm_and_mcp_cwd_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep default pytest off the operator LLM / live-MCP .env.
+    """Keep default pytest off the operator LLM / live-MCP settings.
 
     Session-level ``pop`` is not enough: a sibling test can put the
-    vars back, and ``apply_dotenv`` setdefault would refill them.
-    Tests that need a value call ``monkeypatch.setenv`` after this.
+    vars back. Tests that need a value call ``monkeypatch.setenv`` after this.
     """
     monkeypatch.delenv("FIN_KNOWLEDGE_MCP_CWD", raising=False)
     monkeypatch.delenv("FIN_MODEL", raising=False)
@@ -178,33 +236,29 @@ def _redirect_home_off_operator(
     monkeypatch.setenv("HOME", str(_hermetic_home))
 
 
-# One row per form the operator should be able to see in the library.
-_MULTI_FORM_ROWS: tuple[tuple[str, str, str], ...] = (
-    ("ZEUS-2023-10K", "10-K", "2023 FY"),
-    ("ZEUS-2023-8K", "8-K", "2023-05-04"),
-    ("ZEUS-2023Q1", "10-Q", "2023 Q1"),
-)
+@pytest.fixture(autouse=True)
+def _operator_settings_file_is_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Default pytest must not load the developer ``~/.fin/settings.yaml``.
+
+    ``FIN_SETTINGS_FILE`` is a path, not a settings bag. Pointing it at a
+    file that does not exist makes ``apply_operator_settings`` a no-op.
+    """
+    monkeypatch.setenv("FIN_SETTINGS_FILE", str(tmp_path / "missing-settings.yaml"))
 
 
 @pytest.fixture
 def multi_form_corpus(tmp_path: Path) -> dict[str, Path]:
-    """A catalog of one 10-K, one 8-K and one 10-Q for the same issuer."""
+    """A catalog of one 10-K, one 8-K and one 10-Q for the same issuer.
+
+    The rows come from :func:`fin.corpus.demo_seed.seed_demo_catalog` -- the
+    same generator the ``seed:demo`` command writes into the development
+    catalog -- so the shape asserted here is the shape that lands in
+    development. ``tmp_path`` keeps a routine run off the real catalog file.
+    """
     catalog_path = tmp_path / "catalog.json"
-    rows = [
-        {
-            "document_id": document_id,
-            "company": "ZEUS",
-            "period": period,
-            "version": str(index + 1) * 64,
-            "page_count": 1,
-            "form": form,
-            "cik": "0000000042",
-            "ticker": "ZEUS",
-            "filing_date": "2023-05-04",
-        }
-        for index, (document_id, form, period) in enumerate(_MULTI_FORM_ROWS)
-    ]
-    record_filings(rows, catalog_path=catalog_path)
+    seed_demo_catalog(catalog_path)
 
     return {"catalog_path": catalog_path}
 
@@ -226,7 +280,7 @@ def build_jev_live_client(environ: Mapping[str, str]) -> JevChoiceClient:
     client = build_jev_client(environ=environ)
     if client is None:
         pytest.fail(
-            f"{JEV_LIVE_KEY_MISSING}: set FIN_JEV_API_KEY in the repo .env",
+            f"{JEV_LIVE_KEY_MISSING}: export FIN_JEV_API_KEY",
             pytrace=False,
         )
     assert client is not None  # for type checkers; pytest.fail raises
@@ -237,13 +291,22 @@ def build_jev_live_client(environ: Mapping[str, str]) -> JevChoiceClient:
 def jev_live_client() -> JevChoiceClient:
     """The live client for one ``jev_live`` module.
 
-    This file strips the Jev env at session start, so this re-applies
-    ``apply_dotenv`` exactly like the product boot (``fin-serve``) does
-    before building the client — the same
-    :func:`fin.host.jev_choice.build_jev_client` the product cascade uses.
+    This file strips the Jev env at session start. The gate reads
+    ``_PROCESS_SNAPSHOT``, captured before that strip.
     """
-    apply_dotenv(start=REPO_ROOT)
-    return build_jev_live_client(os.environ)
+    keys = (
+        "FIN_JEV_API_KEY",
+        "FIN_JEV_MODEL",
+        "FIN_JEV_BASE_URL",
+        "TYPESAFE_API_KEY",
+        "TYPESAFE_DEFAULT_MODEL",
+        "TYPESAFE_BASE_URL",
+    )
+    merged = dict(os.environ)
+    merged.update(
+        {key: _PROCESS_SNAPSHOT[key] for key in keys if key in _PROCESS_SNAPSHOT}
+    )
+    return build_jev_live_client(merged)
 
 
 def pytest_collection_modifyitems(

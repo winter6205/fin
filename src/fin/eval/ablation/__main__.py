@@ -138,7 +138,7 @@ def _run(args: argparse.Namespace) -> int:
             for config in run.configurations
             for code in config.error_codes
         }
-        live_codes = {"retrieve_unavailable", "retrieve_degraded_failure"}
+        live_codes = {"retrieve_unavailable", "retrieve_degraded"}
         transport_failure = codes & live_codes
         if transport_failure and all(
             config.error_codes and set(config.error_codes) <= transport_failure

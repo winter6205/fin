@@ -1,18 +1,22 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { afterEach, test } from "node:test";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { startScriptedSseProxy } from "../scripts/lib/scripted-sse-proxy.mjs";
 
 import {
   declaredCheckIds,
   default as runStreamChecks,
 } from "../scripts/playwright-stream-checks.mjs";
+import * as liveSmoke from "../scripts/run-live-smoke.mjs";
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runner = path.join(workspace, "scripts", "run-stream-checks.mjs");
+const scriptedRunner = path.join(workspace, "scripts", "run-scripted-e2e.mjs");
 const fakeCliSource = `#!/usr/bin/env node
 const args = process.argv.slice(2);
 const has = (value) => args.includes(value);
@@ -21,6 +25,8 @@ if (has("--version")) {
   console.log("fake-playwright-cli 1.0.0");
   process.exit(0);
 }
+
+if (process.env.FAKE_RAW_ONLY && has("--json")) process.exit(2);
 
 if (has("open")) {
   console.log(JSON.stringify({ result: {} }));
@@ -44,9 +50,8 @@ if (has("run-code")) {
     pass: id !== failedId,
     detail: id === failedId ? { injected: true } : {},
   }));
-  process.stdout.write(JSON.stringify({
-    result: JSON.stringify({ checks, allPass: checks.every((check) => check.pass) }),
-  }));
+  const report = { checks, allPass: checks.every((check) => check.pass) };
+  process.stdout.write(JSON.stringify(has("--raw") ? report : { result: JSON.stringify(report) }));
   process.exit(Number(process.env.FAKE_RUN_EXIT ?? 0));
 }
 
@@ -55,6 +60,276 @@ process.exit(1);
 `;
 
 const tempDirectories = [];
+
+async function listen(server) {
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return `http://127.0.0.1:${address.port}`;
+}
+
+async function closeServer(server) {
+  if (!server.listening) return;
+  await new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+    server.closeAllConnections();
+  });
+}
+
+test("scripted SSE proxy waits for completion and paces only nonempty answers", async () => {
+  const answerGapMs = 120;
+  const frames = [
+    'event: thinking\ndata: {"text":"thinking"}',
+    'event: answer\ndata: {"text":"safe first piece"}',
+    'event: tool_result\ndata: {"name":"retrieve"}',
+    'event: answer\ndata: {"text":"safe second piece"}',
+    'event: answer\ndata: {"text":""}',
+    "event: citations\ndata: []",
+  ];
+  const expected = Buffer.from(frames.map((frame) => `${frame}\n\n`).join(""));
+  let upstreamCompletedAt = 0;
+  const upstream = createServer(async (_request, response) => {
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "x-upstream-frame": "preserved",
+    });
+    response.write(expected.subarray(0, 17));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    response.end(expected.subarray(17));
+    upstreamCompletedAt = Date.now();
+  });
+  const upstreamBaseUrl = await listen(upstream);
+  const proxy = await startScriptedSseProxy({
+    upstreamBaseUrl,
+    answerFrameDelayMs: answerGapMs,
+  });
+
+  try {
+    const response = await fetch(`${proxy.baseUrl}/api/stream`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const received = [];
+    let joined = Buffer.alloc(0);
+    let firstAnswerAt = 0;
+    let secondAnswerAt = 0;
+    let emptyAnswerAt = 0;
+    for await (const chunk of response.body) {
+      const bytes = Buffer.from(chunk);
+      received.push(bytes);
+      joined = Buffer.concat([joined, bytes]);
+      if (!firstAnswerAt && joined.includes(Buffer.from("safe first piece"))) {
+        firstAnswerAt = Date.now();
+      }
+      if (!secondAnswerAt && joined.includes(Buffer.from("safe second piece"))) {
+        secondAnswerAt = Date.now();
+      }
+      if (!emptyAnswerAt && joined.includes(Buffer.from('data: {"text":""}'))) {
+        emptyAnswerAt = Date.now();
+      }
+    }
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-upstream-frame"), "preserved");
+    assert.equal(response.headers.get("content-length"), String(expected.length));
+    assert.deepEqual(joined, expected);
+    assert.ok(firstAnswerAt >= upstreamCompletedAt, "proxy must buffer to upstream end");
+    assert.ok(secondAnswerAt - firstAnswerAt >= answerGapMs - 20);
+    assert.ok(emptyAnswerAt - secondAnswerAt < answerGapMs - 20);
+    assert.ok(received.length >= 2, "answer frames must remain separately consumable");
+  } finally {
+    await proxy.close();
+    await closeServer(upstream);
+  }
+});
+
+test("scripted SSE proxy rejects empty, invalid, remote, and overflowing inputs", async () => {
+  for (const upstreamBaseUrl of [undefined, "", "not a URL", "file:///tmp/test"]) {
+    await assert.rejects(
+      startScriptedSseProxy({ upstreamBaseUrl }),
+      TypeError,
+    );
+  }
+  for (const upstreamBaseUrl of [
+    "http://example.com",
+    "http://user:password@127.0.0.1:8001",
+    "http://127.0.0.1:8001/prefix",
+  ]) {
+    await assert.rejects(
+      startScriptedSseProxy({ upstreamBaseUrl }),
+      TypeError,
+    );
+  }
+  for (const answerFrameDelayMs of [-1, 0.5, Number.NaN, Number.MAX_SAFE_INTEGER, null]) {
+    await assert.rejects(
+      startScriptedSseProxy({
+        upstreamBaseUrl: "http://127.0.0.1:8001",
+        answerFrameDelayMs,
+      }),
+      RangeError,
+    );
+  }
+});
+
+test("scripted SSE proxy streams non-SSE responses without its answer pacing", async () => {
+  const body = Buffer.from('{"message":"part one and part two"}');
+  let upstreamCompleted = false;
+  const upstream = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.write(body.subarray(0, 16));
+    setTimeout(() => {
+      upstreamCompleted = true;
+      response.end(body.subarray(16));
+    }, 80);
+  });
+  const upstreamBaseUrl = await listen(upstream);
+  const proxy = await startScriptedSseProxy({
+    upstreamBaseUrl,
+    answerFrameDelayMs: 500,
+  });
+
+  try {
+    const response = await fetch(`${proxy.baseUrl}/api/status`);
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.equal(upstreamCompleted, false, "non-SSE body must remain live");
+    const rest = [];
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      rest.push(Buffer.from(next.value));
+    }
+    assert.deepEqual(
+      Buffer.concat([Buffer.from(first.value), ...rest]),
+      body,
+    );
+  } finally {
+    await proxy.close();
+    await closeServer(upstream);
+  }
+});
+
+test("scripted SSE proxy keeps concurrent answer pacing request-local", async () => {
+  const upstream = createServer((request, response) => {
+    const label = new URL(request.url, "http://127.0.0.1").searchParams.get("id");
+    const body = Buffer.from(
+      `event: answer\ndata: {"text":"${label}-one"}\n\n` +
+        `event: answer\ndata: {"text":"${label}-two"}\n\n`,
+    );
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(body);
+  });
+  const upstreamBaseUrl = await listen(upstream);
+  const proxy = await startScriptedSseProxy({
+    upstreamBaseUrl,
+    answerFrameDelayMs: 80,
+  });
+
+  try {
+    const responses = await Promise.all(["first", "second"].map(async (id) => {
+      const response = await fetch(`${proxy.baseUrl}/api/stream?id=${id}`);
+      return Buffer.from(await response.arrayBuffer());
+    }));
+    assert.match(responses[0].toString(), /first-one[\s\S]*first-two/);
+    assert.match(responses[1].toString(), /second-one[\s\S]*second-two/);
+  } finally {
+    await proxy.close();
+    await closeServer(upstream);
+  }
+});
+
+test("scripted SSE proxy reports upstream connection failures without leaking details", async () => {
+  const upstream = createServer();
+  const unavailableBaseUrl = await listen(upstream);
+  await closeServer(upstream);
+  const proxy = await startScriptedSseProxy({ upstreamBaseUrl: unavailableBaseUrl });
+
+  try {
+    const response = await fetch(`${proxy.baseUrl}/api/status`);
+    const body = await response.text();
+    assert.equal(response.status, 502);
+    assert.equal(body, "scripted SSE proxy upstream unavailable");
+    assert.doesNotMatch(body, /ECONNREFUSED|127\.0\.0\.1/);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("scripted SSE proxy closes promptly when the browser cancels during a paced gap", async () => {
+  const upstream = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      'event: answer\ndata: {"text":"safe one"}\n\n' +
+        'event: answer\ndata: {"text":"safe two"}\n\n',
+    );
+  });
+  const upstreamBaseUrl = await listen(upstream);
+  const proxy = await startScriptedSseProxy({
+    upstreamBaseUrl,
+    answerFrameDelayMs: 1_000,
+  });
+
+  try {
+    const response = await fetch(`${proxy.baseUrl}/api/stream`);
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.ok(first.value);
+    await reader.cancel();
+    const started = Date.now();
+    await proxy.close();
+    assert.ok(Date.now() - started < 500, "close must cancel the outstanding timer");
+  } finally {
+    await closeServer(upstream);
+  }
+});
+
+test("only the scripted browser lane routes through the completed-response proxy", async () => {
+  const [scriptedSource, generalSource] = await Promise.all([
+    readFile(scriptedRunner, "utf8"),
+    readFile(runner, "utf8"),
+  ]);
+  assert.match(scriptedSource, /startScriptedSseProxy/);
+  assert.match(scriptedSource, /upstreamBaseUrl: baseUrl/);
+  assert.match(scriptedSource, /`--base-url=\$\{sseProxy\.baseUrl\}`/);
+  assert.match(scriptedSource, /SCRIPTED_MODEL_IDENTITY = "scripted-test-model"/);
+  assert.match(scriptedSource, /env\.FIN_MODEL = SCRIPTED_MODEL_IDENTITY/);
+  const proxyCloseIndex = scriptedSource.indexOf("await sseProxy.close()");
+  const workspaceStopIndex = scriptedSource.indexOf("await stopWorkspace(child)");
+  assert.ok(proxyCloseIndex >= 0);
+  assert.ok(
+    workspaceStopIndex > proxyCloseIndex,
+    "the proxy must be closed before the scripted workspace cleanup",
+  );
+  assert.doesNotMatch(generalSource, /startScriptedSseProxy/);
+});
+
+test("live smoke resolves model identity only from an override or projected settings", () => {
+  const { resolveConfiguredModel } = liveSmoke;
+  assert.equal(typeof resolveConfiguredModel, "function");
+  assert.equal(
+    resolveConfiguredModel({
+      override: "  explicit-model  ",
+      env: { FIN_MODEL: "environment-model" },
+      settings: { FIN_MODEL: "settings-model" },
+    }),
+    "explicit-model",
+  );
+  assert.equal(
+    resolveConfiguredModel({
+      env: { FIN_MODEL: " " },
+      settings: { FIN_MODEL: " configured-model " },
+    }),
+    "configured-model",
+  );
+  assert.equal(
+    resolveConfiguredModel({ env: { FIN_MODEL: " " }, settings: {} }),
+    "",
+  );
+});
 
 async function runHarness(environment = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "stream-checks-test-"));
@@ -117,6 +392,167 @@ test("requires scroll-follow coverage only when streamed growth is required", ()
       "8-scroll-follow-lifecycle",
     ),
     true,
+  );
+});
+
+// The document-choice lane pauses its first send instead of answering it,
+// so the answered-turn checks (2/4/5/3) and the scroll-follow pair have
+// nothing to read there. This pins BOTH directions, because the risk in
+// that scoping is silence: a change that dropped these ids everywhere
+// would still pass a lane that runs them, and one that kept them would
+// report the pause permanently red.
+//
+// The default and bounce lanes must keep declaring the FULL set — that is
+// what makes the scoping a per-lane decision rather than a deletion.
+const ANSWERED_TURN_IDS = [
+  "2-stream-no-retract",
+  "4-dom-separation",
+  "5-trace-collapse",
+  "3-reload-persist",
+];
+const CHROME_IDS = ["1-home-chrome", "6-boot-status"];
+
+test("every non-document-choice lane still declares the full check set", () => {
+  for (const options of [
+    {},
+    { requireStreamGrowth: true },
+    { expectBounce: true },
+    { requireStreamGrowth: true, expectBounce: true },
+  ]) {
+    const ids = declaredCheckIds(options);
+    for (const id of [...CHROME_IDS, ...ANSWERED_TURN_IDS]) {
+      assert.ok(
+        ids.includes(id),
+        `${id} must stay declared for ${JSON.stringify(options)}; got ${ids.join(", ")}`,
+      );
+    }
+    // The scroll-follow pair is opt-in on streamed growth, exactly as it
+    // was before this change — only the document-choice lane drops it.
+    const wantScroll = options.requireStreamGrowth === true;
+    assert.equal(ids.includes("7-stream-scroll-follow"), wantScroll);
+    assert.equal(ids.includes("8-scroll-follow-lifecycle"), wantScroll);
+    // A lane that was not asked for the bounce / document-choice checks
+    // must not report them: a check that always runs would be a FAIL on
+    // a workspace that cannot produce the condition it drives.
+    assert.equal(ids.includes("7-bounce-no-blank"), options.expectBounce === true);
+    assert.equal(
+      ids.includes("7-document-choice-pick"),
+      options.expectDocumentChoice === true,
+    );
+  }
+});
+
+test("the document-choice lane declares the choice check instead of an answered turn", () => {
+  const ids = declaredCheckIds({
+    expectDocumentChoice: true,
+    requireStreamGrowth: true,
+  });
+  // The chrome is route-scoped and holds for every scenario.
+  for (const id of CHROME_IDS) {
+    assert.ok(ids.includes(id), `${id} must stay declared on the choice lane`);
+  }
+  assert.ok(
+    ids.includes("7-document-choice-pick"),
+    "the document-choice lane must declare its own check",
+  );
+  // The answered-turn checks read a turn that streamed to DONE, which
+  // this transcript never produces on its first send.
+  for (const id of ANSWERED_TURN_IDS) {
+    assert.equal(
+      ids.includes(id),
+      false,
+      `${id} reads a completed turn and must not be declared on a lane whose first send pauses`,
+    );
+  }
+  assert.equal(ids.includes("7-stream-scroll-follow"), false);
+  assert.equal(ids.includes("8-scroll-follow-lifecycle"), false);
+  assert.equal(ids.includes("7-bounce-no-blank"), false);
+});
+
+// The check bodies are gated on the same flag the declaration is, so a
+// declared-but-unreported id cannot become a permanent FAIL. These assert
+// the GATE exists in the shipped source: a lane whose transcript pauses
+// while the gate was dropped would run four checks that can never pass.
+test("the answered-turn checks are gated on the same flag they are declared with", () => {
+  const body = runStreamChecks.toString().replace(/^\s*\/\/.*$/gm, "");
+  assert.match(
+    body,
+    /const answeredTurnChecks = !cfg\.expectDocumentChoice/,
+    "the answered-turn gate must exist",
+  );
+  assert.match(
+    body,
+    /if \(answeredTurnChecks\) \{\s*await check\("2-stream-no-retract"/,
+    "check 2 must be inside the answered-turn gate",
+  );
+  assert.match(
+    body,
+    /if \(answeredTurnChecks\) \{\s*await check\("3-reload-persist"/,
+    "check 3 must be inside the answered-turn gate",
+  );
+  assert.match(
+    body,
+    /if \(cfg\.requireStreamGrowth && answeredTurnChecks\)/,
+    "the scroll-follow block must be gated on the answered-turn flag too",
+  );
+});
+
+// The document-choice check is registered under the option name the lane
+// passes, and its id is spelled as a literal inside the function body —
+// the function travels to the browser driver as SOURCE TEXT, so a
+// module-scope constant referenced there would be a ReferenceError at run
+// time rather than a compile error.
+test("the serialized document-choice helper is gated, named, and executable", async () => {
+  const body = runStreamChecks.toString().replace(/^\s*\/\/.*$/gm, "");
+  assert.match(
+    body,
+    /const runDocumentChoiceWorkflow = async \(\) => \{/,
+    "the workflow helper must be defined inside the serialized runStreamChecks function",
+  );
+  assert.match(
+    body,
+    /const maybeRunDocumentChoiceCheck = async \(\) => \{\s*if \(!cfg\.expectDocumentChoice\) return;\s*await check\("7-document-choice-pick", runDocumentChoiceWorkflow\);\s*\};\s*await maybeRunDocumentChoiceCheck\(\);/,
+    "the literal check id and workflow helper must be registered only when requested",
+  );
+  // No module-scope id constant may be referenced inside the body: the
+  // snippet is evaluated on its own in the driver process.
+  assert.doesNotMatch(
+    body,
+    /DOCUMENT_CHOICE_CHECK_ID|SCROLL_CHECK_ID|CHROME_CHECK_IDS|ANSWER_TURN_CHECK_IDS|BASE_CHECK_IDS/,
+  );
+
+  // The browser runner evaluates this function's source in a fresh driver
+  // process. Reconstruct that serialized function and execute its opt-in
+  // branch against the page double: reaching the document-choice card wait
+  // proves the named helper was invoked, not merely present in the source.
+  const serializedRunStreamChecks = new Function(`return (${body});`)();
+  const fixtureOptions = {
+    baseUrl: "http://127.0.0.1:1",
+    navTimeoutMs: 1_000,
+    pollIntervalMs: 0,
+    pollCount: 1,
+  };
+  const disabledReport = await serializedRunStreamChecks(fakeThreadPage(), {
+    ...fixtureOptions,
+    expectDocumentChoice: false,
+  });
+  assert.equal(
+    disabledReport.checks.some((check) => check.id === "7-document-choice-pick"),
+    false,
+    "the serialized helper must remain absent when its option is disabled",
+  );
+  const report = await serializedRunStreamChecks(fakeThreadPage(), {
+    ...fixtureOptions,
+    expectDocumentChoice: true,
+  });
+  const documentChoice = report.checks.find(
+    (check) => check.id === "7-document-choice-pick",
+  );
+  assert.ok(documentChoice, "the opted-in helper must produce its declared check");
+  assert.match(
+    documentChoice.error,
+    /await document choice card/,
+    "the serialized helper must execute its browser workflow",
   );
 });
 
@@ -479,6 +915,35 @@ test("never addresses submit buttons page-wide", () => {
   );
 });
 
+test("scroll lifecycle distinguishes a completed backend run from an open browser SSE reader", () => {
+  const body = runStreamChecks.toString();
+  assert.match(
+    body,
+    /Object\.defineProperty\(body, "getReader"/,
+    "the lifecycle check must observe the real response reader used by the client",
+  );
+  assert.match(body, /backendCompletedBeforeReplay/);
+  assert.match(body, /browserStreamOpenAtResize/);
+  assert.match(body, /browserStreamSettledAfterNavigation/);
+  assert.doesNotMatch(
+    body,
+    /pendingAtResize:.*readThreadInFlight/s,
+    "backend run leases cannot stand in for the browser's still-open SSE response",
+  );
+});
+
+test("bounce browser coverage proves the hidden draft stays private while the retry answer lands", () => {
+  const body = runStreamChecks.toString();
+  assert.match(body, /leakedUngroundedDraft/);
+  assert.match(body, /admittedRetryMarker/);
+  assert.match(body, /sourceReadObserved/);
+  assert.doesNotMatch(
+    body,
+    /pass:\s*drafted\s*&&/,
+    "the bounce lane must not require an unadmitted draft to appear in the browser",
+  );
+});
+
 // T2 header-only collapse: collapsed thinking has toggles + no full
 // burst; expand shows one full. A tail-preview node is not part of
 // the pass contract (specs/turn-trace-folds.md).
@@ -491,4 +956,9 @@ test("5-trace-collapse does not require thinking tail preview nodes", () => {
   );
   assert.match(body, /collapsed\.fulls\s*===\s*0/);
   assert.match(body, /expanded\.fulls\s*===\s*1/);
+});
+
+test("uses the supported raw CLI protocol", async () => {
+  const result = await runHarness({ FAKE_RAW_ONLY: "1" });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });

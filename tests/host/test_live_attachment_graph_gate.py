@@ -20,7 +20,7 @@ a real socket against the real Postgres at ``FIN_CHECKPOINT_URL`` (thread
 store, attachment store, durable job store, checkpointer), with the real
 compiled graph, the real gate node, the real SSE wire, the real prep drain and
 the real auto-resumer, and reads every result back over a SECOND SQL
-connection. ``.env.example`` supplies the deployed attachment bounds, as
+connection. ``settings.example.yaml`` supplies the deployed attachment bounds, as
 ``tests/host/test_live_attachment_upload_door.py`` does.
 
 What is real here, and what is not
@@ -135,7 +135,7 @@ from typing import Any
 
 import pytest
 
-from fin.host.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
+from fin.host.attachment.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLD_DIR = REPO_ROOT / "data" / "corpus" / "g4_attachment_gold"
@@ -199,12 +199,12 @@ pytestmark = pytest.mark.mcp
 
 @pytest.fixture(scope="module")
 def deployed_bounds() -> dict[str, str]:
-    """The attachment bounds exactly as ``.env.example`` ships them."""
-    from fin.host.operator_env import parse_env_file
+    """The attachment bounds exactly as ``settings.example.yaml`` ships them."""
+    from fin.host.operator_settings import shipped_attachment_bounds
 
-    values = parse_env_file((REPO_ROOT / ".env.example").read_text())
+    values = shipped_attachment_bounds(repo_root=REPO_ROOT)
     missing = [key for key in BOUND_KEYS if key not in values]
-    assert not missing, f".env.example lost {missing}"
+    assert not missing, f"settings.example.yaml lost {missing}"
     return {key: values[key] for key in BOUND_KEYS}
 
 
@@ -1031,6 +1031,7 @@ def _start_live_server(
     environ = dict(os.environ)
     environ["FIN_CHECKPOINT_URL"] = postgres_url
     environ["HOME"] = str(live_home)
+    environ["FIN_HOME"] = str(live_home / ".fin")
     environ.update(deployed_bounds)
     environ["FIN_LIVE_MODEL_BASE_URL"] = model_base_url
     environ["FIN_LIVE_CORPUS_MANIFEST"] = str(MANIFEST_PATH)

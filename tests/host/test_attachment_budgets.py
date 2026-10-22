@@ -1,4 +1,4 @@
-"""``fin.host.attachment_budgets`` — the finite attachment budget contract.
+"""``fin.host.attachment.attachment_budgets`` — the finite attachment budget contract.
 
 Basis: ``specs/thread-attachment-source-read.md`` — every deployment
 configures a finite per-attachment page cap and a finite per-run visual-call
@@ -51,7 +51,8 @@ from typing import Any, Mapping
 
 import pytest
 
-from fin.host.attachment_budgets import (
+from fin.host.application.lifetime import RuntimeHandle
+from fin.host.attachment.attachment_budgets import (
     ATTACHMENT_PAGE_LIMIT_EXCEEDED,
     ATTACHMENT_VISION_BUDGET_EXCEEDED,
     AttachmentBudgetConfigError,
@@ -66,7 +67,7 @@ from fin.host.attachment_budgets import (
     send_full_page,
     validate,
 )
-from fin.host.attachment_vision import (
+from fin.host.attachment.attachment_vision import (
     VisionCallFailedError,
     VisionCallResult,
     VisionEmptyTextError,
@@ -1177,7 +1178,6 @@ def test_send_full_page_empty_output_is_never_retried() -> None:
 
 # ----- the deployed bounds, bound to their measurement evidence -----
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ENV_EXAMPLE_PATH = PROJECT_ROOT / ".env.example"
 CORPUS_DISTRIBUTION_PATH = (
     PROJECT_ROOT / "data" / "corpus" / "g4_upload_distribution.json"
 )
@@ -1188,20 +1188,17 @@ CORPUS_PDF_DIR = PROJECT_ROOT / "data" / "corpus" / "pdf"
 
 
 def _deployed_environ() -> dict[str, str]:
-    """The four bounds as ``.env.example`` ships them.
+    """The four bounds as ``settings.example.yaml`` ships them.
 
     The numbers live in the template and in the two measured data files only;
     repeating them here would let a stale test value bless a config that no
     longer matches what was measured.
     """
-    deployed: dict[str, str] = {}
-    for raw in ENV_EXAMPLE_PATH.read_text().splitlines():
-        key, separator, value = raw.partition("=")
-        key = key.strip()
-        if separator and not key.startswith("#") and key in ALL_KEYS:
-            deployed[key] = value.strip()
+    from fin.host.operator_settings import shipped_attachment_bounds
+
+    deployed = shipped_attachment_bounds(repo_root=PROJECT_ROOT)
     unconfigured = sorted(set(ALL_KEYS) - set(deployed))
-    assert unconfigured == [], f".env.example must configure {unconfigured}"
+    assert unconfigured == [], f"settings.example.yaml must configure {unconfigured}"
     return deployed
 
 
@@ -1285,7 +1282,7 @@ def test_deployed_upload_cap_admits_the_measured_corpus() -> None:
     deployed = from_environ(environ=_deployed_environ()).max_upload_bytes
     assert findings["deployed_attachment_cap_bytes"] == deployed
     assert findings["deployed_attachment_cap_source"] == (
-        ".env.example:FIN_ATTACHMENT_MAX_BYTES"
+        "settings.example.yaml:attachment.maxBytes"
     )
     assert findings["files_over_deployed_attachment_cap"] == []
     # The retired constant is historical: the filings it rejected are the
@@ -1385,8 +1382,8 @@ def _stage_environ(
 ) -> None:
     """``os.environ`` carrying exactly the four keys as ``deployment`` has them.
 
-    Every key is cleared first, so an operator ``.env`` loaded by
-    ``tests/conftest.py`` cannot supply a bound a case means to omit. The
+    Every key is cleared first, so a shell-exported operator variable
+    cannot supply a bound a case means to omit. The
     composition root's per-process cache goes back to unread with it:
     ``http`` reads the four bounds once and keeps them, so a case that deploys
     an environ has to pin the cache too or it answers from whatever the
@@ -1394,10 +1391,11 @@ def _stage_environ(
     order instead of by its own input. ``monkeypatch.setattr`` restores the
     previous value at teardown, so these cases neither read nor leak a bound.
     """
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
 
     monkeypatch.setattr(
-        http_module, "_http_attachment_budgets_singleton", None, raising=False
+        composition_module, "_http_attachment_budgets_singleton", None, raising=False
     )
     for key in ALL_KEYS:
         monkeypatch.delenv(key, raising=False)
@@ -1407,34 +1405,60 @@ def _stage_environ(
 
 
 def _stage_serve(
-    monkeypatch: pytest.MonkeyPatch, deployment: Mapping[str, str | None]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    deployment: Mapping[str, str | None],
 ) -> tuple[list[str], list[str]]:
     """Stage ``fin.host.http.serve()`` against one deployment env.
 
-    ``apply_dotenv``, the knowledge-MCP boot probe and the graph compile are
-    stubbed and ``uvicorn.run`` only records that it was entered, so a bound
-    is the only thing in this boot that can abort. Nothing here touches a
-    network, a model, or a database.
+    ``apply_operator_settings``, the knowledge-MCP boot probe, the graph
+    compile and the four workers are stubbed and ``uvicorn.run`` only
+    records that it was entered, so a bound is the only thing in this
+    boot that can abort. Nothing here touches a network, a model, or a
+    database.
 
     Returns the recorders: ``served`` (uvicorn entries) and ``published``
     (probe entries).
     """
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
     import uvicorn
 
     _stage_environ(monkeypatch, deployment)
     served: list[str] = []
     published: list[str] = []
-    monkeypatch.setattr(http_module, "apply_dotenv", lambda: None)
+    # The boot refuses an undeclared durable checkpointer before it opens
+    # anything, so this deployment has to state one. The compile seam
+    # below is the only thing that would connect to it.
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    monkeypatch.setattr(composition_module, "apply_operator_settings", lambda: None)
     monkeypatch.setattr(
-        http_module, "publish_knowledge_mcp", lambda: published.append("probe")
+        composition_module, "publish_knowledge_mcp", lambda: published.append("probe")
     )
-    monkeypatch.setattr(http_module, "compile_for_http", lambda: None)
-    # The ingest worker drain is another boot collaborator, not what a
-    # bound test exercises: stubbed so a staged boot never acquires the
-    # real thread or builds the real service.
-    monkeypatch.setattr(http_module, "start_ingest_worker", lambda: None)
-    monkeypatch.setattr(http_module, "stop_ingest_worker", lambda: None)
+    # The boot seam is the closeable runtime handle, not the graph-only
+    # compile it delegates to, so that is what has to be stubbed here.
+    monkeypatch.setattr(
+        composition_module,
+        "_compile_http_runtime",
+        lambda **_kwargs: RuntimeHandle(None),
+    )
+    # The remaining workers are boot collaborators, not what a bound test
+    # exercises: stubbed so a staged boot never acquires a real thread, a
+    # real service or a real store. The same declared checkpoint URL would
+    # otherwise send every one of them to Postgres.
+    monkeypatch.setattr(composition_module, "start_application_ingest_worker", lambda: None)
+    monkeypatch.setattr(composition_module, "stop_ingest_worker", lambda: None)
+    monkeypatch.setattr(composition_module, "default_attachment_service", lambda: object())
+    monkeypatch.setattr(composition_module, "default_thread_store", lambda: object())
+    monkeypatch.setattr(composition_module, "get_workspace_root", lambda: tmp_path)
+    monkeypatch.setattr(composition_module, "start_application_attachment_prep_worker", lambda _s: None)
+    monkeypatch.setattr(composition_module, "stop_attachment_prep_worker", lambda: None)
+    monkeypatch.setattr(composition_module, "start_application_attachment_resume_worker", lambda **_kw: None)
+    monkeypatch.setattr(composition_module, "stop_attachment_resume_worker", lambda: None)
+    monkeypatch.setattr(
+        composition_module, "start_application_invalidation_drain_worker", lambda **_kw: None
+    )
+    monkeypatch.setattr(composition_module, "stop_invalidation_drain_worker", lambda: None)
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))
     return served, published
 
@@ -1454,12 +1478,12 @@ def _stage_serve(
     ],
 )
 def test_serve_aborts_boot_on_an_unusable_bound_and_never_serves(
-    monkeypatch: pytest.MonkeyPatch, key: str, bad_value: str | None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, bad_value: str | None
 ) -> None:
     """Startup aborts for every bound and every unusable class.
 
     This is the boot-wiring half of the contract: ``serve()`` reads the four
-    bounds through :func:`fin.host.attachment_budgets.from_environ`, so a
+    bounds through :func:`fin.host.attachment.attachment_budgets.from_environ`, so a
     deployment that cannot state a finite positive bound fails there instead
     of opening the upload door with no cap. The recorded lists are the actual
     promise — an exception alone would also come from a boot that had already
@@ -1471,7 +1495,7 @@ def test_serve_aborts_boot_on_an_unusable_bound_and_never_serves(
     import fin.host.http as http_module
 
     served, published = _stage_serve(
-        monkeypatch, {**VALID_ENVIRON, key: bad_value}
+        monkeypatch, tmp_path, {**VALID_ENVIRON, key: bad_value}
     )
 
     with pytest.raises(AttachmentBudgetConfigError) as excinfo:
@@ -1484,6 +1508,7 @@ def test_serve_aborts_boot_on_an_unusable_bound_and_never_serves(
 
 def test_serve_aborts_boot_on_a_total_that_leaves_no_retry_reserve(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """A run budget at the old exact-sum floor is a mis-deployment, not a boot.
 
@@ -1494,7 +1519,9 @@ def test_serve_aborts_boot_on_a_total_that_leaves_no_retry_reserve(
     import fin.host.http as http_module
 
     served, published = _stage_serve(
-        monkeypatch, {**VALID_ENVIRON, VISION_KEY: str(MAX_PAGES + MAX_CROP_CALLS)}
+        monkeypatch,
+        tmp_path,
+        {**VALID_ENVIRON, VISION_KEY: str(MAX_PAGES + MAX_CROP_CALLS)},
     )
 
     with pytest.raises(AttachmentBudgetConfigError) as excinfo:
@@ -1507,6 +1534,7 @@ def test_serve_aborts_boot_on_a_total_that_leaves_no_retry_reserve(
 
 def test_serve_boots_and_serves_when_all_four_bounds_are_finite(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The counter-case that keeps every abort row above honest.
 
@@ -1516,7 +1544,7 @@ def test_serve_boots_and_serves_when_all_four_bounds_are_finite(
     """
     import fin.host.http as http_module
 
-    served, published = _stage_serve(monkeypatch, VALID_ENVIRON)
+    served, published = _stage_serve(monkeypatch, tmp_path, VALID_ENVIRON)
 
     http_module.serve()
 

@@ -20,8 +20,8 @@ from typing import Any
 
 import pytest
 
-from fin.host.structured_evidence_admission import admit_structured_evidence
-from fin.host.structured_evidence_invalidation import (
+from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
+from fin.host.evidence.structured_evidence_invalidation import (
     StructuredInvalidationRefusal,
     drain_invalidation_batch,
 )
@@ -303,7 +303,7 @@ def test_the_turn_table_withholds_an_expired_snapshot() -> None:
     snapshot, so a record whose deadline has passed must project as an
     unavailable citation without a backend outcome (P2-D2).
     """
-    from fin.host.structured_evidence_admission import admit_structured_evidence
+    from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
     from fin.host.workspace_http import _serialize_run
 
     live = admit_structured_evidence(STRUCTURED_RESULT).as_dicts()

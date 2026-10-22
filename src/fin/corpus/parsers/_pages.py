@@ -6,7 +6,7 @@ frozen text unit per physical page, plus that page's geometry, its region
 metadata, and its rendered raster — and nothing else. It returns values
 only: no store, no index, no push, no vision provider, no thread
 lifecycle, no budget decision. A page or call cap belongs to the caller
-that owns budgets (``fin.host.attachment_budgets`` preflights an
+that owns budgets (``fin.host.attachment.attachment_budgets`` preflights an
 attachment run before any page here is scanned).
 
 Three capabilities are injected as ports, so this module stays free of a

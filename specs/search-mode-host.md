@@ -1,113 +1,66 @@
-# Spec: search-mode host (Soft-Track 检索档 + 工作台 choice window)
+# Spec: automatic search-mode assignment in the host
 
-> **Status:** assumption gate confirmed 2026-09-17 (four-spec split; this is spec 4 of 4).
-> **Spelling superseded 2026-09-22:** every 档 token this file names (`A` / `B` / `C` / `D`, and the `A | graph | global | D` set the ADR 0081 amendment quotes) is now `lexical | graph | global | sql`, with no retired letter read at any entry. The assignment cookbook — rules, Jev Choice, inherit, **choice window** — is unchanged; only the spellings moved. See [`specs/search-mode-lexical-sql-tokens.md`](search-mode-lexical-sql-tokens.md).
-> **Siblings:** `specs/extract-window-tree.md` (1/4), `specs/graph-index-standard-fast.md` (2/4), `specs/search-mode-retrieve.md` (3/4).
-> **This file:** fin **host graph** + **工作台** only.
+> **Status:** implemented on `fix/qa-design-correction-20261020` (2026-10-20), including the terminal clarification contract below. The evidence is still being recorded in the [implementation report](../docs/verification/2026-10-20-qa-design-correction-implementation.md); this specification does not claim that all checks pass, and the 26-check real-model browser row remains the open delivery gate: it is Not run because the external model provider is unavailable, and that pull request is open, not merged.
+> **Authority:** [ADR 0104](../docs/adr/0104-internal-search-mode-automatic-fallback.md) amends ADRs 0062/0081. Current tokens are `lexical | graph | global | sql`, as established by [the token spec](search-mode-lexical-sql-tokens.md).
+> **Plan:** [QA design correction](../plans/2026-10-20-qa-design-correction.md).
+> **Scope:** the host and workbench; ranking remains behind the existing retrieve port.
 
-## Objective
+## Objective and interface
 
-After **Soft-Track** has already chosen **grounded**, the **host agent** assigns **检索档** (search mode A/B/C/D) with the **same cascade** as `decide_track` (ADR 0027 / 0062), injects call-scoped search-mode copy (ADR 0061), and — when cascade **clarify** fires — compiles a **HITL** **choice window** on the **v1 surface** so the operator picks, the run **resumes**, then retrieve proceeds. Operators are not forced through a per-turn 档 picker. Invalid structured classify must not silent-open **C 综述**. The host may **propose** **Fast 抽图** in a **choice window**; it must never silent-apply the extract method. Ranking and the extract job stay out.
+After Soft-Track chooses `grounded`, the host assigns the internal retrieval implementation and injects its usage at model-call time. A person asks about enterprise material without learning a retrieval mode or choosing one. Only content ambiguity discovered after retrieval, and only when it can change the answer, warrants clarification with understandable document, subject, or period options.
 
-**Who:** local operator on the **工作台**, talking on a **research thread**.
+The external interface remains question → cited answer, meaningful clarification, or named failure. Mode selection is implementation behind that interface. Receipts preserve how selection happened and how confident the judge was; the ordinary interface does not expose internal mode names or selection controls. Developer receipt presentation shows provenance, confidence, and EXITs without raw mode tokens; raw mode values remain in machine receipts and logs, consistent with [demo presentation](demo-seed.md).
 
-Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
+## Search-mode decision contract
 
-- **track**: The per-turn contract on the host graph: `dialogue`, `clarify`, `off_topic`, or `grounded`. Chosen in-graph before execution; tools and the citation verifier bind only to `grounded`.
-- **grounded**: The Soft-Track leaf that binds corpus tools and the **citation verifier** (ADR 0061). Not a product name, not **search mode**, and not the `retrieve` tool. Wire value `research` is an alias for this leaf.
-- **Soft-Track**: The v1 turn-orchestration shape: one compiled host graph, multi-track routing, tiered track decision (rules → ambiguous LLM → inherit → grounded clarify → conditional policy), flat graph until upgrade triggers in ADR 0027.
-- **检索档** (`search mode`): Which retrieve path a knowledge question uses after it has entered **grounded**: A 查找 (lexical-first), B 知识问答 (iknow graph-priority then vector∥BM25 fill), C 综述 (index-time community summaries; report text ES ∥ report vectors, then optional drop to windows — ADR 0070), D 真数据库 (real SQL/business DB; document tables stay B). Assignment reuses the Soft-Track cascade (ADR 0027 / 0062): rules, then structured classify when ambiguous, then inherit, then clarify or typed fail — not a required picker and not silent C. Cascade **clarify** opens a **choice window** (structured options → operator pick → resume execute). Search-mode copy is call-scoped (ADR 0061): inject once in near context, never rewrite history; after **session compaction**, re-inject the mode this turn needs.
-- **HITL**: LangGraph `interrupt` may be compiled into the host graph. Durability is crash resume of the in-flight run. **Choice window** is the v1 interrupt UX for Soft-Track / search-mode clarify (structured options, operator pick, then execute). Plan-approval and tool-approval UI stay out of v1.
-- **v1 surface**: The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. Crash resume continues the in-flight run on that `thread_id`. Plan-approval and tool-approval HITL are not v1; **choice window** on cascade clarify is (ADR 0062).
-- **Fast 抽图**: The NLP / co-occurrence **extract method** (index job): mixed **Chinese/English noun-phrase regex** (ADR 0076), co-occurrence on **in-window children** then **prune** and Leiden, community reports from **抽图窗** text (ADR 0067 / 0073 / 0077). An **operator switch** selects it (default **standard**, **one method per corpus version** — ADR 0079); the model may propose Fast in a **choice window** and must not silent-apply (ADR 0068).
+1. Run assignment only after `track=grounded`. Preserve non-grounded behavior and the existing single compiled graph.
+2. Preserve explicit rules, including the existing mode-marker adjacency requirement, and the documented request `tiers` override for tests/debugging; a bare mode label does not become an implicit pin. Invalid or unavailable explicit selections retain named failures; the fallback does not silently reinterpret them. The workbench offers no mode picker.
+3. Preserve same-retrieve-job inheritance. Determine inheritance eligibility before calling Jev so a judge cannot steal a short follow-up's assigned mode. Do not inherit across a new job or cleared context.
+4. When neither rules nor inheritance decides, ask the existing Jev closed-set Choice over `lexical | graph | global | sql`. Preserve the configured confidence floor and the existing typed handling of a confident unavailable result. Do not introduce a second judge or MiniMax classify fallback.
+5. If the cascade still cannot assign a mode, return `search_mode="graph"`, `decision_tier="fallback"`, `confidence=0.0`, and no mode-selection options. This is a recorded policy default; 0.0 does not claim that the judge predicted graph. Blank/underspecified input that has already reached grounded also follows this residual contract.
+6. Preserve all collected signals, including `mode_jev_exit`, `mode_jev_label`, `mode_jev_confidence`, and `mode_jev_error_type` when present. Do not manufacture a judge result when no call occurred. EXIT values remain `no_jev_client`, `transport`, `schema`, `invalid_label`, `invalid_search_mode`, `low_confidence`, and `unexpected_error`.
+7. Project the full decision through the existing graph state, invoke result, and terminal SSE/status receipt paths. The web decision type and receipt parser accept `fallback`; old receipt tiers remain readable. Preserve and validate a bounded allowlist of diagnostic signal fields in the web parser rather than discarding all signals. Historical RunRecord/TurnRow reads currently omit this decision; the inherit snapshot carries only mode, so this amendment does not claim receipt durability across reload/history or change those storage contracts. Developer/log evidence must allow the original EXIT and judge confidence to be inspected; the public answer does not display raw diagnostics.
+8. A retrieval or citation failure after fallback retains its existing named outcome. Do not turn routing fallback into cross-mode retries, fabricate evidence, or suppress readiness/availability failures.
 
-Choice-window language above is the SSOT phrase this spec implements: **structured options → operator pick → resume execute**.
+## Model-facing enterprise language
 
-## Confirmed assumptions (gate)
+Jev option criteria and routing instructions describe ordinary enterprise documents: policies, handbooks, product guides, meeting notes, reports, contracts, and structured records. Distinguish exact lookup, connected explanation, broad synthesis, and structured query without assuming a finance corpus.
 
-1. Four-spec split (2026-09-17): this file is spec **4 of 4**. Window tree is spec 1; extract job / Leiden / Fast NLP is spec 2 (`graph-index-standard-fast.md`); A/B/C/D ranking behind the **retrieve port** is spec 3 (`search-mode-retrieve.md`).
-2. Search-mode assignment runs **only after** Soft-Track `track=grounded`. Non-grounded tracks do not assign a 档 and do not open a search-mode **choice window**.
-3. Cascade shape copies `src/fin/host/track_decision.py` `decide_track`: high-confidence **rules** first; **structured classify** only when ambiguous and inherit/clarify would not already decide; **inherit** on short follow-ups that stay in the same retrieve job; else **clarify or typed fail**. Residual policy must **not** silent-open **C**.
-4. Optional pin/override may set a 档 without opening the window. There is **no** required per-turn 档 picker on the **工作台**.
-5. Search-mode **usage copy** is host contract (ADR 0061): call-scoped inject in this spec. Ranking is not.
-6. **Fast 抽图** vs **standard** is an **operator switch** on the **index job** (ADR 0068) with **one method per corpus version** (ADR 0079). Host may propose Fast via **choice window**; never silent-apply. Ambiguous or no pick keeps **standard**. Actual extract job is spec 2.
-7. Default `uv run pytest -q` stays green. Search-mode host suites extend Soft-Track as **opt-in** marks (not collected by default pytest).
-8. **Choice window** payload is a host/HTTP contract even if the SPA is a stub this increment.
-9. No GraphRAG product names in this spec or its tests.
+`agent_instructions.py` must not claim that the corpus is 10-Q filings or require a financial company/form/metric for ordinary questions. Catalog discovery remains available when it resolves a real document ambiguity; it is not a mandatory first call before every retrieval. Domain-neutral instructions preserve citation requirements, tool safety, and legitimate financial material as one possible source category.
 
-## Boundaries
+Search-mode usage remains call-scoped: inject near the current model call, re-inject after compaction, and never rewrite checkpointed messages. Internal usage instructions must not ask the answering model to explain routing machinery to the person.
 
-- **Does:**
-  - After Soft-Track `decide_track` returns **grounded**, run a search-mode decision cascade (new host helper, same tier names as `DecisionTier` / ADR 0027): **rules** → **structured classify** if still ambiguous → **inherit** → **clarify or typed fail**. Then the grounded leaf may call retrieve (one existing `retrieve` tool / **retrieve port**, not four host retrieve nodes).
-  - **Rules (high-confidence only):** explicit A/B/C/D or CONTEXT 检索档 labels in the utterance (and any documented pin/override field) assign that 档 without LLM. Do not invent C from residual “knowledge question” shape.
-  - **Structured classify:** only when rules miss **and** inherit/clarify would not already decide; reuse `FIN_MODEL` / existing classify client pattern; JSON names exactly one of `A` | `B` | `C` | `D` (product labels 查找 / 知识问答 / 综述 / 真数据库). Typed EXITs (`invalid_search_mode` / `schema_parse` / `model_error` / `low_confidence`) fall through the cascade; they must **not** crash the run and must **not** silent-open C. **Amended by ADR 0081 (landed):** this tier is a closed-set **Jev** Choice over `A | graph | global | D` — no `FIN_MODEL` reuse, no JSON `A|B|C|D`, no MiniMax fallback — and the EXIT family is `signals["mode_jev_exit"]`: `transport` / `schema` / `invalid_label` from the client plus `no_jev_client` / `invalid_search_mode` / `low_confidence` / `unexpected_error` from the cascade, all still falling through. Default pytest injects the shared Fake Choice; the live round-trip is the named `jev_live` suite.
-  - **Inherit:** short / underspec follow-up on the same `thread_id` that stays in the same retrieve job (latest **status snapshot** still has research context; no company-change wipe of that job) reuses the last assigned 档. Do not inherit across a new retrieve job or a cleared snapshot.
-  - **Clarify:** host emits a **structured option list** (A/B/C/D ids + operator-visible labels; C/D may be present but marked unopened). Compile LangGraph `interrupt` as **choice window** **HITL** (ADR 0062). **工作台** (or CLI equivalent on the same compiled graph) shows the window; operator pick resumes the in-flight **run**; then retrieve. Free-text clarify with no selectable options is not the v1 confirm path. **Amended by `specs/search-mode-graph-global.md` (landed):** the option ids come from `LASTING_RETRIEVE_TIERS` = `A | graph | global | D` (operator labels 查找 / 知识问答 / 综述 / 真数据库 unchanged), and a pick is resolved onto a lasting token before retrieve; only `A` / `graph` are open.
-  - **Typed fail:** if the cascade cannot name A/B/C/D, or the named 档 is not open, return CONTEXT **具名失败** (**档未开** / **真库未接** as applicable) and **do not** invent a 档. Residual **conditional_policy** must not default to C.
-  - Persist an auditable search-mode decision on the run (mirror Soft-Track `track_decision`): at least `search_mode` (or explicit null on typed fail), `confidence`, `decision_tier`, structured `signals`. `track` remains the Soft-Track leaf; search mode is not a fifth **track**.
-  - **Call-scoped injection (this spec):** when a 档 is assigned, inject search-mode usage **once** into near context at model-call time (same pattern as per-track prompts). Never rewrite checkpointed history / old `SystemMessage`s when the mode changes. After **session compaction**, re-inject the **search mode this turn needs**; a later different mode injects once again (ADR 0061).
-  - Optional override pin: request/state field may pin a 档 and skip the window; still record `decision_tier` / signals. No chrome **required** per-turn 档 picker.
-  - **Fast 抽图 propose (host only):** the model/host may open a **choice window** whose options distinguish Fast (cheaper / noisier B) vs **standard**. No pick or ambiguous pick keeps **standard** (ADR 0068). Host must not treat Fast as a **检索档** and must not flip the corpus version’s extract method without the operator switch / confirmed pick. Applying extract, Leiden, or rebuilding the version is out (spec 2).
-  - **工作台:** render **choice window** from the interrupt payload (structured options). SPA stub is allowed if the payload contract test still passes. No Chat|Research picker; no required 档 picker.
-  - Test classes (opt-in, ≥1 case each): empty (blank/underspec utterance after grounded with no inherit); negative (judge answer outside the closed 档 set / off-domain already off_topic so no search-mode / pin of unopened C); overflow (search-mode `step_cap` does not apply — reuse grounded caps only; snapshot inherit does not wipe history); concurrent (same-thread send still 409 / `ConcurrentRunError`); exception (unreachable judge, unparseable judge payload, or a judge that abstains → typed EXIT, not crash or silent C). **Amended by ADR 0081 (landed):** the EXIT named in these classes is `signals["mode_jev_exit"]` — `no_jev_client` / `transport` / `schema` / `invalid_label` / `invalid_search_mode` / `low_confidence` / `unexpected_error` — not a JSON classify, so no case here may require one.
+## Clarification and Fast proposal
 
-- **Confirms with human:** none remaining (four-spec split + cascade/injection/HITL/Fast-propose confirmed 2026-09-17). Exact pytest mark string is an implementer/plan choice.
+Content ambiguity and mode uncertainty are different conditions. A mode judge's uncertainty, outage, or missing configuration produces the receipt-backed graph fallback, never a mode-selection window. Content ambiguity that changes the answer may produce one terminal question; it is not a retrieval-mode control and never a picker.
 
-- **Out of this spec:**
-  - Leiden / Fast NLP / **抽图窗** tree cut (`extract-window-tree.md`, `graph-index-standard-fast.md`).
-  - Four LangGraph retrieve nodes; retrieve ranking / A lexical-first / B graph-priority / C report ES∥vectors / D SQL execution (`search-mode-retrieve.md`; ranking stays behind the **retrieve port**).
-  - Plan-approval and tool-approval **HITL** (not **v1 surface**).
-  - Rewriting checkpoint history or mutating old messages when **检索档** changes.
-  - Silent auto Fast; dual extract methods on one corpus version (ADR 0079 — owned by spec 2).
-  - Making search-mode suites part of every default pytest invocation.
+### Clarification contract
 
-## Success Criteria
+1. **Retrieval first.** The host retrieves before deciding to ask. When exactly one candidate document can answer — the corpus has one document covering the question, for example — it answers directly and states that document; it does not open a question. Only multiple real candidates whose choice would change the answer justify a clarification.
+2. **One terminal question, not a pause.** After retrieval the host publishes one pending question with purpose `task_clarification` as the turn's terminal outcome. It opens no graph interrupt and holds no paused run; the Runtime architecture may add interactive resumable pauses later, and this branch does not implement them for content clarification.
+3. **New-message continuation.** The reply arrives on the normal send door (`POST /api/threads/{id}/messages`) with `question_id` and the selected `choice_id` and/or `free_text`. Acceptance advances input history once and opens a new turn in the same thread; the answered turn stays terminal, and the unchanged task goal plus the thread transcript carry the original question as context. The reply does not resume the answered turn's run or reuse its receipt.
+4. **Options are catalog documents.** Every option is a real catalog document: its title, or its `document_id` when the catalog records no title, from the catalog or this turn's retrieval hits. The option set does not depend on the `company` / `period` fields; those are optional descriptive metadata and do not define public document identity. The model may phrase the question, but it must not invent an option, and neither the prompt nor an option names an internal slot such as `company` or `period`. When no real option exists, the question still accepts free text: `other` with non-blank `free_text`. A blank free-text reply is invalid.
+5. **Identity.** The host writes the turn's real `task_id` on the pending question and never publishes a task clarification with an empty one; the web decoder keeps rejecting a task clarification whose `task_id` is empty. A send that carries an unknown `question_id` and no answer value is treated as a normal follow-up message, not a clarification reply and not a silently dropped input. An answer attempt naming an unknown or superseded question, or a question that already has an accepted answer, remains a typed refusal under the existing stale-reply rules.
 
-1. `uv run pytest -q` exits 0 (search-mode host cases deselected by default; existing non-opt-in suite stays green).
-2. Opt-in suite (mark name fixed in plan; extending Soft-Track opt-in is allowed) exits 0 under ScriptedChatModel + InMemorySaver, includes the five boundary classes named in Boundaries, and includes at least:
-   - **grounded then 档:** Soft-Track `track=grounded` + high-confidence rule or pin → assigned `search_mode` in `{A,B,C,D}` **before** retrieve; non-grounded scripted greeting still `track=dialogue` with **no** search-mode assignment. **Amended by `specs/search-mode-graph-global.md` (landed):** the assignment set is `{A, graph, global, D}` — `B` / `C` are retired input spellings the host normalizes to `graph` / `global` before the port, so no audit row can ever hold them.
-   - **inherit:** prior grounded run with an assigned 档 + short same-job follow-up → same 档 via `decision_tier=inherit` without a required picker.
-   - **clarify window:** ambiguous grounded ask with no inherit → interrupt payload contains a structured option list (ids + labels for selectable 档); resume with a pick → that 档 is assigned, then retrieve may run.
-   - **abstain or fail closed, never silent C:** the scripted 档 **Jev** Choice answers outside the closed set, returns an unparseable payload, is unreachable, is never configured (no key), or lands under the confidence floor → recorded `signals["mode_jev_exit"]` typed EXIT; terminal 档 is **not** `C` unless rules, inherit, pin, or operator pick named C; residual path is clarify **choice window** or **具名失败**, never silent C. **Amended by ADR 0081 (landed):** this is the Jev Choice EXIT family, not `schema_parse` / `model_error` from the deleted JSON classify.
-   - **call-scoped copy:** after a 档 is assigned, checkpointed `messages` do not contain that turn’s search-mode usage as a durable rewritten history `SystemMessage`; a second turn with a different 档 still leaves the first checkpointed messages unedited.
-   - **choice window payload:** host/HTTP (or graph interrupt) contract test asserts the payload exists with `options` (non-empty list of `{id, label}` at minimum) even if `web/` is a stub and does not paint the window.
-3. Fast propose: scripted propose path emits a **choice window**; with no pick, extract method remains **standard**; host state does not set **检索档** to Fast.
-4. Optional pin: request that pins `B` (or A) assigns that 档 without opening the window.
-5. `compile_graph` remains one compiled graph shared by CLI / HTTP / **工作台**; v1 HTTP still uses sync `invoke` (existing **v1 surface** contract). No new four retrieve nodes appear on that graph.
-6. No GraphRAG identifiers in this spec’s production code paths or test names added for this increment.
+The document-choice question is the deliberate exception and is unchanged. Its interrupt still pauses the graph, and an accepted pick or `other` reply still continues the same paused run and receipt through the existing resume path (`Command(resume=...)`, the machinery `POST /resume` exposes). Reload still reads the committed pending question without a bodyless resume. Its admitted candidate set, deterministic labels, four-choice bound and Other label stay as the shared wire contract defines them. The terminal continuation above must not be applied to it, and no content clarification may borrow its interrupt.
 
-## Open Questions
+### Fast extraction proposal
 
-(none — assumption gate confirmed 2026-09-17)
+Keep `compile.py`'s `enable_choice_window` enabled for the Fast proposal; content clarification no longer depends on it. The existing Fast extraction proposal still needs the window: standard remains the default, no pick or an ambiguous pick keeps standard, and no corpus extraction method changes without the existing confirmed action. Fast is an extraction method, not a retrieval mode. Preserve pending-window resume and `/ask`'s typed `409 {"error":"choice_pending"}` refusal for valid remaining windows. The optional `propose_extract_method:"fast"` seed remains run-scoped and cannot leak into a later send; without it, no Fast proposal is introduced. CLI handling of a valid paused window retains its title, structured options, and resume guidance.
 
-## Inherits / Changes
+## Acceptance
 
-**Inherits:** `specs/soft-track.md` four tracks + `decide_track` cascade in `src/fin/host/track_decision.py`; `TrackDecision` / `RunRecord.track_decision`; call-scoped prompts (`agent_instructions.messages_for_model`); **status snapshot** append-only history; ScriptedChatModel + InMemorySaver; ADR 0027, ADR 0061, ADR 0062, ADR 0068, ADR 0079; CONTEXT terms quoted above; `specs/first-closed-loop.md` 具名失败 / 档未开 as product exits (codes may still be plan-named); **工作台** research-thread HTTP on the same compiled **host graph**.
+- An unpinned grounded question reaches retrieval automatically on low confidence, unavailable judge, invalid judge response, or judge exception, with a fallback receipt and the original available signals. No mode interrupt is emitted.
+- Rules, inheritance, accepted Jev results, explicit debug pins, non-grounded tracks, unavailable-mode failures, and call-scoped injection retain their respective contracts.
+- Backend tests cover `test_search_mode_choice_window.py`, `test_search_mode_gray_zone_jev.py`, and the affected cascade, before-port, named-exit, call-scoped, and Fast-proposal suites. Replace obsolete picker expectations with stronger fallback/no-interrupt/receipt assertions; retain equivalent coverage for Fast and the terminal content clarification.
+- Web receipt tests cover `fallback`, confidence limits, malformed input, and legacy receipt tiers. Verify actual graph/result/status projection as well as the parser; a type-only assertion is insufficient.
+- A real-model browser run asks the demo homepage's annual-leave question and additional representative document questions without request `tiers` or mode-labelled text. Answers include supported facts, inline citations, and a working versioned source link, with no internal mode names or mode picker in the ordinary interface throughout the run.
+- A content question with one answerable candidate document is answered directly with that document stated and opens no clarification. Only multiple real candidates that change the answer open one terminal question whose options are catalog document titles (or `document_id` fallbacks), do not depend on `company` / `period`, and whose prompt and options contain no internal slot names. The shipped approximation is structural: on a `clarify`-track follow-up the host retrieves with the original question (at most 20 hits), maps the hits to distinct catalog document labels (case-insensitive), answers directly when exactly one label is named, and — when the turn has a current task to bind the question to — opens the terminal question for two or more labels (at most five listed) or the free-text-only `other` form when no label is named. The host does not run a second semantic judgement of whether the choice changes the answer, so that condition remains a product requirement rather than an asserted runtime check.
+- A clarification reply naming the pending `question_id` is accepted as a new input and starts a new turn in the same thread, leaving the answered turn terminal; no interrupt or resume participates. A follow-up that carries an unknown `question_id` but no answer value is not silently dropped; a stale answer attempt keeps its typed refusal. The host never publishes a task clarification with an empty `task_id`, and the web decoder still rejects one.
+- The document-choice interrupt still pauses and resumes its original run, and an explicit Fast proposal still waits for confirmation. Scripted model results do not satisfy real-model acceptance.
 
-**Changes this spec adds:** search-mode cascade after **grounded**; auditable search-mode decision on the run; call-scoped 档 injection + post-compaction re-inject; **choice window** interrupt payload + **工作台**/CLI resume; optional pin; Fast **propose** window that cannot silent-apply; opt-in tests extending Soft-Track.
+## Scope and verification
 
-**Does not change:** retrieve ranking; extract/Leiden jobs; Soft-Track track enum; citation verifier; checkpoint message history rewrite policy (still forbidden).
+The paired [demo spec amendment](demo-seed.md#adopted-qa-design-correction-2026-10-20) owns startup restore, stream visibility, and return-home behavior. CLI, HTTP, and workbench continue using one compiled graph; the existing HTTP sync `invoke` contract for the sync PostgresSaver remains. Search-mode opt-in suite collection stays explicit, and newly introduced production/test names retain the existing prohibition on GraphRAG identifiers. This correction changes no ranking algorithm, corpus storage representation, dependencies, extraction implementation, confidence threshold, or transcript rewrite policy.
 
-**Landed contract notes (implementation decisions, recorded 2026-09-20):**
-
-1. **Rules-tier marker adjacency:** an explicit 档 letter or CONTEXT label triggers the rules tier only adjacent to a `档` marker (e.g. `B档` / `档B` / `知识问答档`); a bare label with no marker falls through to classify / inherit / clarify — legal cascade paths, never silent-C.
-2. **`/ask` on a paused run:** the unattended v1 surface answers typed `409 {"error":"choice_pending"}`; it never picks a 档 on the operator's behalf.
-3. **Pin field:** send body `tiers` with exactly one OPEN 档 is the documented pin (assumption 4's "request/state field"): assigns that 档 without opening the window; `["C"]` / `["D"]` keep the existing 具名 400.
-4. **Fast propose seed:** send body optional `propose_extract_method:"fast"` seeds the propose window on grounded turns; absent field keeps the run byte-identical to before, and the seed is run-scoped (never leaks to the next send).
-5. **CLI on a paused run:** the CLI renders the paused window (title + options + where to pick) instead of the terminal status/answer/citations triple; interactive CLI pick is not this increment (pick happens on the 工作台 / HTTP resume).
-
-## 待写入 (persist after ACR)
-
-empty — CONTEXT **检索档** / **HITL** / **v1 surface** / **Fast 抽图** / **grounded** and ADRs 0061 / 0062 / 0068 / 0079 already landed.
-
-## architecture-change-reviewer
-
-Affected surfaces: `src/fin/host/track_decision.py` (pattern), `graph.py`, workspace HTTP interrupt, `web/` choice-window stub.
-
-bounded-context-guardian: yes — host graph + 工作台; ranking and extract jobs in sibling specs.
-input-contract-tests: yes — Boundaries + SC2 name empty / negative / overflow / concurrent / exception.
-error-handling-enforcer: yes — search-mode classify EXITs; 档未开 / 真库未接; no silent C.
-complexity-anti-drift: yes — cascade helper mirrors `decide_track`; not four retrieve nodes.
-minimal-change-verifier: yes — one increment (档 + choice window + Fast propose).
-
-OVERALL: PASS — 2026-09-17 ACR (second pass after 5-class matrix). Next: writing-plans.
+Implementation must follow the repository's code/test rules: typechecks, relevant focused regressions, full default Python and web suites, S5, and the applicable real-model suites (`eval`, `memory_on`, and search-mode `jev_live`). Use isolated `_test` targets and temporary application roots. Report actual pass/fail/skip counts and missing environments; this specification records requirements rather than successful execution.

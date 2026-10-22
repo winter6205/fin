@@ -1,6 +1,6 @@
 {
-  "source": "fin.host.task_runtime_types.TASK_FAILURE_KINDS",
-  "generated_by": "uv run python -c 'import json; from fin.host.task_runtime_types import TASK_FAILURE_KINDS; print(json.dumps({...}, indent=2))' > web/src/taskFailureKinds.golden.json (regenerate when the Python vocabulary changes)",
+  "source": "fin.host.task.task_runtime_types.TASK_FAILURE_KINDS",
+  "generated_by": "uv run python -c 'import json; from fin.host.task.task_runtime_types import TASK_FAILURE_KINDS; print(json.dumps({...}, indent=2))' > web/src/taskFailureKinds.golden.json (regenerate when the Python vocabulary changes)",
   "kinds": [
     "task_already_reconciled",
     "task_applicability_unresolved",

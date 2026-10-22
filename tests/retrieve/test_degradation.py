@@ -399,7 +399,10 @@ def test_undegraded_response_carries_no_extra_fields() -> None:
 
     result = adapter.retrieve("net sales")
 
-    assert set(result) == {"chunks"}
+    # ``distribution`` is part of the success envelope (spec
+    # qa-chain-corpus-retrieval), not an extra degradation field.
+    assert set(result) == {"chunks", "distribution"}
+    assert result["distribution"] == "hit"
     assert len(result["chunks"]) == 1
 
 
@@ -422,7 +425,7 @@ def test_degraded_response_with_no_hits_key_is_a_named_failure() -> None:
 
     result = adapter.retrieve("net sales")
 
-    assert result["error"] == "retrieve_degraded_failure"
+    assert result["error"] == "retrieve_degraded"
     assert result["degraded"] is True
     assert result["degraded_reasons"] == list(REASONS)
     assert "chunks" not in result
@@ -440,7 +443,7 @@ def test_degraded_jsonrpc_error_is_a_named_degraded_failure() -> None:
 
     result = adapter.retrieve("net sales")
 
-    assert result["error"] == "retrieve_degraded_failure"
+    assert result["error"] == "retrieve_degraded"
     assert result["degraded_reasons"] == list(REASONS)
 
 
@@ -450,7 +453,7 @@ def test_the_degraded_failure_is_raised_typed_on_the_async_seam() -> None:
     with pytest.raises(RetrieveDegradedFailureError) as excinfo:
         asyncio.run(adapter.aretrieve("net sales"))
 
-    assert excinfo.value.code == "retrieve_degraded_failure"
+    assert excinfo.value.code == "retrieve_degraded"
     assert excinfo.value.signal.degraded_reasons == REASONS
     # Same family as the existing typed EXIT, so callers that already
     # branch on "retrieve did not answer" keep working.

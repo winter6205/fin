@@ -1,4 +1,4 @@
-"""Thread / run metadata storage for the workspace surface (T1, #28).
+"""Thread / run metadata storage for the workspace surface (T1).
 
 The workspace HTTP routes need a place to keep the product-level
 metadata that does NOT belong to the LangGraph checkpointer:
@@ -48,12 +48,15 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator, Literal, Protocol, Sequence
 
 import psycopg
 
-from fin.host.citation_gate import COMPANY_KIND, DATABASE_ROW_KIND
-from fin.host.evidence_contract import (
+from fin.host.grounded.citation_gate import COMPANY_KIND, DATABASE_ROW_KIND
+from fin.host.fin_home import resolve_fin_home
+from fin.host.instance_identity import ensure_instance_identity
+from fin.host.evidence.evidence_contract import (
     CITATION_CHANNEL_SCHEMA,
     CITATION_OVERFLOW,
     CITATION_SNAPSHOT_KEY,
@@ -66,8 +69,8 @@ from fin.host.evidence_contract import (
     seed_context_from_rows,
     validate_evidence,
 )
-from fin.host.structured_evidence import project_stored_structured_evidence
-from fin.host.visual_evidence import VISUAL_CLAIM_FIELDS, VISUAL_EVIDENCE_KIND
+from fin.host.evidence.structured_evidence import project_stored_structured_evidence
+from fin.host.evidence.visual_evidence import VISUAL_CLAIM_FIELDS, VISUAL_EVIDENCE_KIND
 
 # WHY the §7 frozen-shape grace at the durable write does NOT cover these:
 # the legacy-shapes escape exists for a pre-cutover writer's STRUCTURE
@@ -298,7 +301,7 @@ class RunRecord:
     answer: str = ""
     citations: list[dict[str, Any]] = field(default_factory=list)
     thinking_text: str = ""
-    # T4 (#37, spec line 31): total streamed-thinking duration in
+    # T4 (spec line 31): total streamed-thinking duration in
     # milliseconds. Accumulated by the route's ThinkingClock during
     # the run; persisted so a reload restores the collapsed
     # one-line duration label. 0 when the model surfaced no
@@ -328,7 +331,7 @@ class RunRecord:
     # JSON (rows / cells / deltas / locators), not a dataclass, so
     # the JSONB round-trip is lossless without a codec.
     comparisons: list[dict[str, Any]] = field(default_factory=list)
-    # Trust (the tracked change, spec SC8): the locators this run retrieved or
+    # Trust (spec SC8): the locators this run retrieved or
     # read, one ``{document_id, version, unit}`` dict per distinct
     # unit, in first-touch order. Wider than ``citations`` on
     # purpose — a refused run records what it looked at, so the
@@ -342,7 +345,7 @@ class RunRecord:
     analysis_results: list[dict[str, Any]] = field(default_factory=list)
     # ADR 0089 / spec thread-attachment-source-read: the visual claims this
     # run read, one provenance row per observation returned to the current
-    # run (shape SSOT: ``fin.host.visual_evidence.VISUAL_CLAIM_FIELDS``).
+    # run (shape SSOT: ``fin.host.evidence.visual_evidence.VISUAL_CLAIM_FIELDS``).
     # Kept SEPARATE from ``citations`` on purpose — a generated visual
     # observation is never a source quote — so history and a restart still
     # show the claim link without the quote channel. Persisted as JSONB so
@@ -357,6 +360,14 @@ class RunRecord:
     # never authorize a quotation, so it must not ride the quote channel.
     # ``[]`` (never ``None``) so a consumer never branches on absence.
     structured_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # iknow retrieve window for this run: retrieval_fingerprint,
+    # generation_id, and epoch, each only when iknow sent a string.
+    # ``{}`` when the run did not retrieve.
+    retrieval_window: dict[str, Any] = field(default_factory=dict)
+    # R3: NULL (``None``) is unknown. The only other value the outcome
+    # node writes is ``insufficient_evidence``. No default string, so a
+    # row from before the column stays unknown instead of a backfill.
+    semantic_outcome: str | None = None
 
 
 # ----- EP9/EP10 invalidation checkpoint state -----
@@ -766,6 +777,10 @@ class InMemoryThreadStore:
         # append. ``_validate_status`` enforces the closed
         # enum at this seam so a typo at the call site fails
         # here, not at the next reader (Standards #9).
+        # WHY a repeated run id is ignored: the same
+        # ``ON CONFLICT DO NOTHING`` the durable write does, so
+        # two finalizers for one logical turn are a no-op on
+        # both stores and neither raises nor duplicates history.
         _validate_status(record.status)
         with self._lock:
             thread = self._threads.get(record.thread_id)
@@ -773,7 +788,10 @@ class InMemoryThreadStore:
                 raise ThreadNotFoundError(
                     f"cannot append run to unknown thread {record.thread_id!r}"
                 )
+            if record.id in thread.run_ids:
+                return
             thread.runs.append(record)
+            thread.run_ids.add(record.id)
 
     def list_runs(self, thread_id: str) -> list[RunRecord]:
         # WHY deepcopy (not just ``list(thread.runs)``):
@@ -938,6 +956,10 @@ class _MutableThread:
     title: str
     created_at: datetime
     runs: list[RunRecord] = field(default_factory=list)
+    # WHY the id set beside the list: ``append_run`` must answer
+    # "is this run id already stored" without walking every row of
+    # every turn, and the list's order stays the read order.
+    run_ids: set[str] = field(default_factory=set)
 
 
 # ----- postgres implementation -----
@@ -978,7 +1000,7 @@ CREATE TABLE IF NOT EXISTS fin_run (
     -- this run's compare_facts calls. JSONB so the turn table can
     -- render structure instead of re-parsing prose.
     comparisons       JSONB NOT NULL DEFAULT '[]'::jsonb,
-    -- Trust (the tracked change): the locators this run retrieved or read, not
+    -- Trust: the locators this run retrieved or read, not
     -- only the verifier-passed citations.
     evidence_locators JSONB NOT NULL DEFAULT '[]'::jsonb,
     -- T6: structured host analysis envelopes.
@@ -989,7 +1011,12 @@ CREATE TABLE IF NOT EXISTS fin_run (
     -- structured-corpus-evidence: the run's bounded structured-result
     -- snapshots, kept off the citations channel for the same reason
     -- visual claims are.
-    structured_evidence JSONB NOT NULL DEFAULT '[]'::jsonb
+    structured_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
+    -- iknow retrieve window (fingerprint, generation_id, epoch). ``{}``
+    -- when the run did not retrieve.
+    retrieval_window JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- R3: NULL is unknown. No default, so existing rows are not backfilled.
+    semantic_outcome TEXT
 );
 
 -- structured-corpus-evidence EP9/EP10: the per-consumer position in the
@@ -1035,7 +1062,7 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS tool_summaries JSONB NOT NULL DEFAU
 -- rows are terminal so the default ``FALSE`` is always correct.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS in_flight BOOLEAN NOT NULL DEFAULT FALSE;
 
--- T4 (#37) column migration: thinking duration for the post-run
+-- T4 column migration: thinking duration for the post-run
 -- collapse label. 0 = no thinking streamed.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS thinking_duration_ms INTEGER NOT NULL DEFAULT 0;
 
@@ -1053,7 +1080,7 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS status_classified TEXT NOT NULL DEF
 -- as ``[]`` — those turns never called compare_facts.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS comparisons JSONB NOT NULL DEFAULT '[]'::jsonb;
 
--- Trust (the tracked change, spec SC8): run-scoped evidence locators on existing
+-- Trust (spec SC8): run-scoped evidence locators on existing
 -- tables. Pre-migration rows read back as ``[]`` — the run happened
 -- before the column existed, so "no recorded locators" is the only
 -- honest value.
@@ -1072,6 +1099,17 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS visual_claims JSONB NOT NULL DEFAUL
 -- reads back as ``[]``, which is the only honest value for "this run
 -- carried no structured snapshot".
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS structured_evidence JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS retrieval_window JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- R3: nullable semantic outcome. No DEFAULT, so a pre-column row stays
+-- NULL (unknown) instead of a backfilled token. IF NOT EXISTS keeps a
+-- second open of the store from failing.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS semantic_outcome TEXT;
+
+CREATE TABLE IF NOT EXISTS fin_instance (
+    id UUID PRIMARY KEY
+);
 """
 
 
@@ -1128,6 +1166,43 @@ def _jsonb_list(row: Sequence[object], index: int) -> list[Any]:
     if not isinstance(decoded, list):
         raise PersistenceUnavailableError(
             f"list runs: JSONB list column at row index {index} is not an array"
+        )
+    return copy.deepcopy(decoded)
+
+
+def _semantic_outcome_cell(row: Sequence[object]) -> str | None:
+    """``fin_run.semantic_outcome``. Missing or NULL is unknown, not a token."""
+    if len(row) <= 21:
+        return None
+    value = row[21]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise PersistenceUnavailableError(
+            "list runs: semantic_outcome is not text"
+        )
+    return value
+
+
+def _jsonb_object(row: Sequence[object], index: int) -> dict[str, Any]:
+    """One JSONB object column, decoded, deep-copied, never ``None``.
+
+    A short row from a SELECT that predates the column reads as ``{}``.
+    NULL or a non-object is persisted corruption.
+    """
+    if len(row) <= index:
+        # EXIT: legacy SELECT tuples omit columns added after their schema cutover.
+        return {}
+    raw = row[index]
+    try:
+        decoded: Any = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+        raise PersistenceUnavailableError(
+            f"list runs: JSONB object column at row index {index} could not be decoded"
+        ) from exc
+    if not isinstance(decoded, dict):
+        raise PersistenceUnavailableError(
+            f"list runs: JSONB object column at row index {index} is not an object"
         )
     return copy.deepcopy(decoded)
 
@@ -1214,6 +1289,107 @@ def _outgoing_visual_error(
     return None
 
 
+def insert_run_row(conn: Any, record: "RunRecord") -> None:
+    """Write one transcript row on ``conn``, ignoring a repeated run id.
+
+    Extracted from :meth:`PostgresThreadStore.append_run` so a store
+    that must commit a transcript row in the SAME transaction as
+    another durable write (the turn receipt's terminal commit) reuses
+    this one INSERT, its validation and its idempotency instead of
+    keeping a second copy that can drift.
+
+    The row is keyed by ``fin_run.id`` and a repeat of the same id is
+    ignored: two finalizers for one logical turn are a no-op, not a
+    crash, and a reader must never see a second transcript row for a
+    run id it already has.
+    """
+    _validate_status(record.status)
+    refusal = _outgoing_evidence_error(record)
+    if refusal is not None:
+        raise refusal
+    import json
+
+    conn.execute(
+        "INSERT INTO fin_run (id, thread_id, question, status, "
+        "status_reason, answer, citations, thinking_text, "
+        "tool_summaries, assistant_message, created_at, in_flight, "
+        "thinking_duration_ms, track_decision, status_classified, "
+        "comparisons, evidence_locators, analysis_results, "
+        "visual_claims, structured_evidence, retrieval_window, "
+        "semantic_outcome) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+        "%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (id) DO NOTHING",
+        (
+            record.id,
+            record.thread_id,
+            record.question,
+            record.status,
+            record.status_reason,
+            record.answer,
+            json.dumps(record.citations),
+            record.thinking_text,
+            json.dumps(record.tool_summaries),
+            record.assistant_message,
+            record.created_at,
+            # Persisted rows are terminal; always False.
+            False,
+            record.thinking_duration_ms,
+            json.dumps(record.track_decision),
+            record.status_classified,
+            json.dumps(record.comparisons),
+            json.dumps(record.evidence_locators),
+            json.dumps(record.analysis_results),
+            json.dumps(record.visual_claims),
+            json.dumps(record.structured_evidence),
+            json.dumps(record.retrieval_window or {}),
+            record.semantic_outcome,
+        ),
+    )
+
+
+@contextmanager
+def guarded_connection(
+    connection_url: str, action: str, *, component: str = "the thread store"
+) -> Iterator[Any]:
+    """Open one connection for a durable store operation.
+
+    A store failure the contract does not name becomes the typed
+    ``persistence_unavailable`` outcome instead of a bare driver crash.
+    FK violations keep their operation's own meaning (the thread is
+    gone) and pass through for the caller to map.
+
+    ``component`` names the store in the typed error: this seam is shared
+    with the receipt store, and a receipt action that failed would
+    otherwise be reported as the thread store having been unreachable.
+    """
+    try:
+        with psycopg.connect(connection_url) as conn:
+            yield conn
+    except psycopg.errors.ForeignKeyViolation:
+        raise
+    except psycopg.Error as exc:
+        raise PersistenceUnavailableError(
+            f"{action}: {component} could not be reached"
+        ) from exc
+
+
+def ensure_thread_schema(
+    connection_url: str, *, fin_home: Path | None = None
+) -> None:
+    """Create the host-owned tables once per connection URL.
+
+    Idempotent, so every store that writes one of these tables may
+    call it without coordinating: the DDL is ``IF NOT EXISTS``
+    throughout and the instance identity is itself idempotent.
+    """
+    home = Path(fin_home) if fin_home is not None else resolve_fin_home()
+    with psycopg.connect(connection_url) as conn:
+        conn.execute(_SCHEMA_SQL)
+        conn.commit()
+        ensure_instance_identity(conn, fin_home=home)
+
+
 def _outgoing_structured_error(record: "RunRecord") -> "EvidenceContractWriteError | None":
     # The structured lane has no grace path: a stored snapshot whose digest
     # does not recompute is corruption, and a corrupted snapshot must never
@@ -1237,35 +1413,34 @@ class PostgresThreadStore:
     Schema creation is idempotent and runs once per construction.
     """
 
-    def __init__(self, connection_url: str) -> None:
+    def __init__(
+        self, connection_url: str, *, fin_home: Path | None = None
+    ) -> None:
         self._url = connection_url
         self._setup_lock = threading.Lock()
+        home = Path(fin_home) if fin_home is not None else resolve_fin_home()
         with self._setup_lock:
-            with self._connect() as conn:
-                conn.execute(_SCHEMA_SQL)
-                conn.commit()
+            ensure_thread_schema(connection_url, fin_home=home)
+
+    @property
+    def connection_url(self) -> str:
+        """The durable URL this store writes to.
+
+        A second store that must commit into the same database reads
+        it from here rather than taking it from the environment, so
+        the two halves of one transaction cannot name different
+        libraries.
+        """
+        return self._url
 
     def _connect(self) -> Any:
         return psycopg.connect(self._url)
 
     @contextmanager
     def _guarded(self, action: str) -> Iterator[Any]:
-        """Every public call's driver work runs through here.
-
-        A store failure the contract does not name becomes the typed
-        ``persistence_unavailable`` outcome instead of a bare driver
-        crash. FK violations keep their operation's own meaning (the
-        thread is gone) and pass through for the caller to map.
-        """
-        try:
-            with self._connect() as conn:
-                yield conn
-        except psycopg.errors.ForeignKeyViolation:
-            raise
-        except psycopg.Error as exc:
-            raise PersistenceUnavailableError(
-                f"{action}: the thread store could not be reached"
-            ) from exc
+        """Every public call's driver work runs through here."""
+        with guarded_connection(self._url, action) as conn:
+            yield conn
 
     @staticmethod
     def _row_to_thread(row: Any) -> ThreadRecord:
@@ -1320,7 +1495,7 @@ class PostgresThreadStore:
             created_at=row[10],
             # T4: coerce a pre-migration NULL to False defensively.
             in_flight=bool(row[11]) if len(row) > 11 else False,
-            # T4 (#37): duration column; 0 when the row
+            # T4: duration column; 0 when the row
             # predates the migration (no measurable thinking).
             thinking_duration_ms=int(row[12] or 0) if len(row) > 12 else 0,
             # Soft-Track T5: empty dict when pre-migration / unset.
@@ -1340,7 +1515,7 @@ class PostgresThreadStore:
             # T3: ``[]`` when the row predates the migration or the
             # run never called ``compare_facts``.
             comparisons=_jsonb_list(row, 15),
-            # Trust (the tracked change): empty list when pre-migration / the run
+            # Trust: empty list when pre-migration / the run
             # touched no locator.
             evidence_locators=_jsonb_list(row, 16),
             analysis_results=_jsonb_list(row, 17),
@@ -1351,6 +1526,8 @@ class PostgresThreadStore:
             # Same rule as visual_claims: a pre-lane or claim-free row
             # reads back as ``[]``, never ``None``.
             structured_evidence=_jsonb_list(row, 19),
+            retrieval_window=_jsonb_object(row, 20),
+            semantic_outcome=_semantic_outcome_cell(row),
         )
 
     # -- threads --
@@ -1463,51 +1640,14 @@ class PostgresThreadStore:
         # across implementations lets the HTTP layer
         # uniformly treat it as "thread gone" without
         # branching on the underlying engine.
-        # WHY evidence is validated here, before storage: durable
-        # storage is the last point a corrupt row can be stopped
-        # cheaply. Once it is in the JSONB column every replay has to
-        # carry a refusal for it; refused here it never enters history.
-        import json
-
-        _validate_status(record.status)
-        refusal = _outgoing_evidence_error(record)
-        if refusal is not None:
-            raise refusal
+        # WHY evidence is validated inside ``insert_run_row``,
+        # before storage: durable storage is the last point a
+        # corrupt row can be stopped cheaply. Once it is in the
+        # JSONB column every replay has to carry a refusal for
+        # it; refused here it never enters history.
         try:
             with self._guarded("append run") as conn:
-                conn.execute(
-                    "INSERT INTO fin_run (id, thread_id, question, status, "
-                    "status_reason, answer, citations, thinking_text, "
-                    "tool_summaries, assistant_message, created_at, in_flight, "
-                    "thinking_duration_ms, track_decision, status_classified, "
-                    "comparisons, evidence_locators, analysis_results, "
-                    "visual_claims, structured_evidence) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                    "%s, %s, %s, %s, %s, %s)",
-                    (
-                        record.id,
-                        record.thread_id,
-                        record.question,
-                        record.status,
-                        record.status_reason,
-                        record.answer,
-                        json.dumps(record.citations),
-                        record.thinking_text,
-                        json.dumps(record.tool_summaries),
-                        record.assistant_message,
-                        record.created_at,
-                        # Persisted rows are terminal; always False.
-                        False,
-                        record.thinking_duration_ms,
-                        json.dumps(record.track_decision),
-                        record.status_classified,
-                        json.dumps(record.comparisons),
-                        json.dumps(record.evidence_locators),
-                        json.dumps(record.analysis_results),
-                        json.dumps(record.visual_claims),
-                        json.dumps(record.structured_evidence),
-                    ),
-                )
+                insert_run_row(conn, record)
                 conn.commit()
         except psycopg.errors.ForeignKeyViolation as exc:
             raise ThreadNotFoundError(
@@ -1537,7 +1677,8 @@ class PostgresThreadStore:
                 "assistant_message, created_at, in_flight, "
                 "thinking_duration_ms, track_decision, status_classified, "
                 "comparisons, evidence_locators, analysis_results, "
-                "visual_claims, structured_evidence "
+                "visual_claims, structured_evidence, retrieval_window, "
+                "semantic_outcome "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()
@@ -1826,5 +1967,8 @@ __all__ = [
     "ThreadStore",
     "ThreadStoreError",
     "default_thread_store",
+    "ensure_thread_schema",
+    "guarded_connection",
+    "insert_run_row",
     "project_stored_citation",
 ]

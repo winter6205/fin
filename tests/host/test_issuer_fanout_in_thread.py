@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -33,6 +34,7 @@ from fin.host.tools.issuer_fanout import (
 from fin.host.workspace_http import _node_frame_payloads
 from fin.retrieve import FakeRetrievePort
 from fin.retrieve.port import Chunk
+from search_mode_pins import RETIRED_LETTERS
 
 
 QUERY = "services revenue"
@@ -114,7 +116,9 @@ class RecordingPort:
         self._unavailable_for = unavailable_for
         self.queries: list[str] = []
         # The 档 each branch call carried (search-mode SC2): ``None`` is
-        # "no assignment", which the port records as no key sent.
+        # "no assignment" — the typed fail — which the port records as no
+        # key sent. The routing residual is an assignment now (ADR 0104),
+        # so it arrives as the recorded default ``graph``.
         self.modes: list[Any] = []
 
     def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]:
@@ -241,15 +245,57 @@ def test_fanout_branches_retrieve_under_the_assigned_档() -> None:
     assert port.modes == ["graph", "graph"], port.modes
 
 
-def test_fanout_branches_send_no_档_when_nothing_is_assigned() -> None:
-    """The absent half of the same hop: an unassigned turn must not have
-    a 档 invented for its branches."""
+def test_fanout_branches_carry_the_fallback_档_when_the_cascade_cannot_decide() -> None:
+    """The residual IS an assignment (ADR 0104): a turn the cascade could
+    not route gets the recorded default ``graph`` at the ``fallback`` tier,
+    so every branch call carries that 档.
+
+    This replaces the old "nothing is assigned -> no 档 on the branches"
+    premise: the routing residual is no longer an unassigned turn, and a
+    branch hop may not invent a 档 of its own either — the ONE token the
+    audit names is the token every branch rides, on every branch.
+    """
     port = RecordingPort(issuers=["AAPL", "MSFT"])
-    _run(
+    out = _run(
         _fanout_script(issuers=["AAPL", "MSFT"], answer=_synthesis(["AAPL", "MSFT"])),
         adapter=port,
         thread_id="t-fanout-no-mode",
     )
+    audit = out["search_mode_decision"]
+    assert audit["decision_tier"] == "fallback", audit
+    assert audit["search_mode"] == "graph", audit
+    assert audit["confidence"] == 0.0, audit
+    # No mode picker is opened by a routing decision, so the options stay
+    # empty — the residual may not resurrect the retired window.
+    assert audit["options"] == [], audit
+    assert port.modes, "the branches still retrieved"
+    assert port.modes == ["graph", "graph"], port.modes
+
+
+@pytest.mark.parametrize("letter", RETIRED_LETTERS)
+def test_fanout_branches_carry_no_档_when_the_pin_is_refused(letter: str) -> None:
+    """The typed fail is the only hop that still sends no 档: an
+    explicitly pinned token outside the closed set stays a NAMED
+    rejection (``invalid_search_mode``), so the port is handed ``None``
+    instead of the recorded default.
+
+    This keeps the coverage the retired "nothing is assigned" case used
+    to carry: the fallback must never reinterpret a refused explicit
+    selection as an answer, and the branches must not paper over it.
+    The out-of-set spelling is the shared retired-letter pin, so the
+    refusal is proven for every spelling the closed set dropped.
+    """
+    port = RecordingPort(issuers=["AAPL", "MSFT"])
+    out = _run(
+        _fanout_script(issuers=["AAPL", "MSFT"], answer=_synthesis(["AAPL", "MSFT"])),
+        adapter=port,
+        thread_id=f"t-fanout-refused-pin-{letter}",
+        config_extra={"pinned_search_mode": letter},
+    )
+    audit = out["search_mode_decision"]
+    assert audit["decision_tier"] == "typed_fail", audit
+    assert audit["failure_code"] == "invalid_search_mode", audit
+    assert audit["search_mode"] is None, audit
     assert port.modes, "the branches still retrieved"
     assert set(port.modes) == {None}, port.modes
 

@@ -51,16 +51,16 @@ IKNOW_ENTRY = IKNOW_ROOT / "dist" / "index.js"
 # Both worktree roots have collapsed back to the main checkout: the surfaces
 # they once carried ahead of main are now merged and rebuilt there. The
 # operator-console ``read_source`` tool, the corpus-ready push/资料 surface,
-# and the search-mode retrieve stack (the tracked change/the tracked change/the tracked change/#245) all live in
+# and the search-mode retrieve stack all live in
 # main's ``dist`` now, so the live acceptance runs against the single
-# authoritative main build (issue fin the tracked change task 1: "对合并后的 iknow main
+# authoritative main build (task 1: "对合并后的 iknow main
 # build"). The aliases are kept because the opt-in tests import them by name,
 # and they follow ``IKNOW_ROOT`` so one run never mixes two builds.
 IKNOW_WORKTREE_ROOT = IKNOW_ROOT
 IKNOW_CORPUS_READY_ROOT = IKNOW_ROOT
 EMBED_DIMENSIONS = 8
 
-# Live backing services for the ``pg_es`` storage branch (fin the tracked change task 2).
+# Live backing services for the ``pg_es`` storage branch (task 2).
 # These are the docker-compose dev endpoints of the iknow checkout above —
 # local test infra, not production credentials — and each is env-overridable
 # so the operator can point the live run at another cluster without an edit.
@@ -287,7 +287,6 @@ def _node_executable() -> str:
         shutil.which("node"),
         str(Path.home() / ".bun" / "bin" / "bun"),
         shutil.which("node.exe"),
-        "/mnt/f/software/nodejs/node.exe",
     ]
     for candidate in candidates:
         if candidate and (Path(candidate).is_file() or shutil.which(candidate)):
@@ -442,7 +441,7 @@ def live_iknow(
             # Elasticsearch; iknow ADR-0007 makes the BM25/precision layer
             # default-on-with-no-address an out-of-contract config (the in-process
             # memory BM25 is a test seam, not a sanctioned fallback), so a
-            # graph-档 retrieve escalates to retrieve_degraded_failure
+            # graph-档 retrieve escalates to retrieve_degraded
             # (keyword_bm25:attempted-and-failed). Disabling BM25 is the
             # ADR-sanctioned vector-only escape hatch; the lexical 档 is still
             # exercised because mode-a-arm sources lexical from the memory backend

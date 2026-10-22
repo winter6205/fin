@@ -4,8 +4,10 @@ The retrieve half — reading the envelope and recording the reasons — is
 ``tests/retrieve/test_degradation.py``. This module covers what the user
 and the citation gate see:
 
-* every item of ``degraded_reasons`` is recorded **and** reaches a
-  user-visible surface, so SC39's「既未记录原因也未暴露可见信号的次数」is 0;
+* every item of ``degraded_reasons`` is recorded verbatim in the ledger
+  **and** the user-visible surface announces the degradation (spec
+  qa-chain-corpus-retrieval: the safe copy, never the raw reasons), so
+  SC39's「既未记录原因也未暴露可见信号的次数」is 0;
 * a degraded response whose request failed arrives as a named failure,
   never as ``{"chunks": []}``;
 * the flag does not relax the citation gate by one judgement.
@@ -26,10 +28,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 from fin.corpus.extracted import Locator
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.degradation_notice import (
+    DEGRADATION_NOTICE_FIELD,
     consume_degradation,
     degradation_notice_line,
 )
 from fin.host.graph import _make_retrieve_tool
+from fin.host.grounded.readable_projection import DEGRADATION_SAFE_COPY
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.state import reset_input_state
 from fin.host.stream_map import format_tool_summary
@@ -76,7 +80,7 @@ def _degraded_hit_result() -> dict[str, Any]:
 
 def _degraded_failure_result() -> dict[str, Any]:
     return {
-        "error": "retrieve_degraded_failure",
+        "error": "retrieve_degraded",
         "degraded": True,
         "degraded_reasons": list(REASONS),
     }
@@ -113,13 +117,18 @@ def _invoke_retrieve_tool(
 # ----- the notice helper -----
 
 
-def test_notice_line_names_every_reason() -> None:
+def test_notice_line_carries_the_safe_copy_and_no_raw_reason() -> None:
+    """SC39's visible half changed shape: the ledger keeps every reason
+    verbatim, and the rendered line says only that the result is partial.
+    A reason names a backend capability the reader cannot act on, so it
+    rides the access-controlled ledger and not the default view."""
     line = degradation_notice_line(
         DegradationSignal(degraded=True, degraded_reasons=REASONS)
     )
 
+    assert line == DEGRADATION_SAFE_COPY
     for reason in REASONS:
-        assert reason in line
+        assert reason not in line
 
 
 def test_consume_records_both_stages_and_exposes_the_line() -> None:
@@ -136,7 +145,7 @@ def test_consume_records_both_stages_and_exposes_the_line() -> None:
     assert ledger.reasons_at(DEGRADATION_STAGE_RETRIEVE) == REASONS
     assert ledger.reasons_at(DEGRADATION_STAGE_USER_NOTICE) == REASONS
     assert unsignalled_degradation_count(ledger) == 0
-    assert shown and all(reason in shown[0] for reason in REASONS)
+    assert shown == [DEGRADATION_SAFE_COPY]
 
 
 def test_consume_records_nothing_for_a_healthy_response() -> None:
@@ -208,7 +217,7 @@ def test_a_degraded_failure_is_not_an_empty_chunk_list() -> None:
     command = _invoke_retrieve_tool(_degraded_failure_result(), ledger)
 
     payload = json.loads(command.update["messages"][0].content)
-    assert payload["error"] == "retrieve_degraded_failure"
+    assert payload["error"] == "retrieve_degraded"
     assert payload["degraded_reasons"] == list(REASONS)
     assert "chunks" not in payload
     assert not command.update.get("evidence")
@@ -225,9 +234,17 @@ def test_a_degraded_failure_is_recorded_and_signalled_too() -> None:
 # ----- the user-visible surface -----
 
 
-def test_the_tool_trace_line_names_every_reason() -> None:
-    """The tools region of the workspace renders this string, so the
-    reasons reach a human without reading raw JSON."""
+def test_the_tool_trace_line_carries_the_copy_and_no_raw_reason() -> None:
+    """The tools region of the workspace renders this string, and T10
+    says the DEFAULT view must not forward a raw reason.
+
+    The envelope here reached the renderer WITHOUT the rendered notice —
+    no ``degradation_notice`` key — so this is the fallback branch, and
+    the fallback is exactly where a reason used to reach the reader as
+    ``degraded: vector:attempt_failed``. It must still say the result is
+    partial, because a degraded row that reads as an ordinary hit count
+    is its own lie; what it must not do is name the backend.
+    """
     summary = format_tool_summary(
         "retrieve",
         result={
@@ -238,20 +255,57 @@ def test_the_tool_trace_line_names_every_reason() -> None:
         args={"query": "what was revenue"},
     )
 
+    assert DEGRADATION_SAFE_COPY in summary
     for reason in REASONS:
-        assert reason in summary
+        assert reason not in summary
 
 
-def test_the_failure_trace_line_names_every_reason() -> None:
+def test_the_failure_trace_line_carries_the_copy_and_no_raw_reason() -> None:
+    """The typed EXIT still names itself — that is a product copy token
+    the SPA renders, not a backend capability — but the degradation
+    reasons beside it do not reach the reader."""
     summary = format_tool_summary(
         "retrieve",
         result=_degraded_failure_result(),
         args={"query": "what was revenue"},
     )
 
-    assert "retrieve_degraded_failure" in summary
+    assert "retrieve_degraded" in summary
+    assert DEGRADATION_SAFE_COPY in summary
     for reason in REASONS:
-        assert reason in summary
+        assert reason not in summary
+
+
+def test_the_notice_branch_of_the_fold_still_renders_the_notice() -> None:
+    """Enforcement must not cost the notice the host already rendered:
+    a result that DOES carry ``degradation_notice`` keeps that exact
+    line, so the fix cannot be a blanket delete of the clause."""
+    summary = format_tool_summary(
+        "retrieve",
+        result={
+            "chunks": [],
+            "degraded": True,
+            "degraded_reasons": list(REASONS),
+            DEGRADATION_NOTICE_FIELD: DEGRADATION_SAFE_COPY,
+        },
+        args={"query": "what was revenue"},
+    )
+
+    assert DEGRADATION_SAFE_COPY in summary
+    for reason in REASONS:
+        assert reason not in summary
+
+
+def test_an_undegraded_row_carries_no_degradation_clause() -> None:
+    """The fallback is gated on degradation, so the safe copy is never
+    printed for a healthy row."""
+    summary = format_tool_summary(
+        "retrieve",
+        result={"chunks": [_chunk()]},
+        args={"query": "what was revenue"},
+    )
+
+    assert DEGRADATION_SAFE_COPY not in summary
 
 
 def _graph(port: Any, answer: str, ledger: DegradationLedger, **kwargs: Any):
@@ -282,11 +336,12 @@ def _graph(port: Any, answer: str, ledger: DegradationLedger, **kwargs: Any):
     )
 
 
-def test_end_to_end_the_reasons_reach_the_user_payload(
+def test_end_to_end_the_reasons_are_persisted_and_only_the_copy_is_shown(
     tmp_path: Path,
 ) -> None:
-    """Both halves of SC39 in one run: the reasons are on disk afterwards
-    AND every one of them is in the run payload the user sees."""
+    """Both halves of SC39 in one run: the reasons are on disk afterwards,
+    and the run payload the user sees carries the safe sentence instead of
+    them."""
     path = tmp_path / "degradation.jsonl"
     ledger = DegradationLedger(path=path)
     graph = _graph(
@@ -302,11 +357,13 @@ def test_end_to_end_the_reasons_reach_the_user_payload(
 
     payload = _run_to_response_payload(out)
     rendered = json.dumps(payload["tool_summaries"], ensure_ascii=False)
+    assert DEGRADATION_SAFE_COPY in rendered
     for reason in REASONS:
-        assert reason in rendered
+        assert reason not in rendered
 
     reloaded = DegradationLedger(path=path)
     assert reloaded.count() > 0
+    assert reloaded.reasons_at(DEGRADATION_STAGE_RETRIEVE) == REASONS
     assert unsignalled_degradation_count(reloaded) == 0
 
 
@@ -366,8 +423,9 @@ def test_the_fanout_branch_records_and_signals_degradation() -> None:
     rendered = json.dumps(
         _run_to_response_payload(out)["tool_summaries"], ensure_ascii=False
     )
+    assert DEGRADATION_SAFE_COPY in rendered
     for reason in REASONS:
-        assert reason in rendered
+        assert reason not in rendered
 
 
 # ----- the citation gate is not relaxed -----
@@ -457,6 +515,7 @@ def test_the_citation_gate_module_never_reads_the_flag() -> None:
         / "src"
         / "fin"
         / "host"
+        / "grounded"
         / "citation_gate.py"
     )
 
@@ -484,5 +543,5 @@ def test_a_degraded_run_leaves_the_tool_message_history_readable() -> None:
     ]
     assert tool_messages
     payload = json.loads(tool_messages[0].content)
-    assert payload["error"] == "retrieve_degraded_failure"
+    assert payload["error"] == "retrieve_degraded"
     assert payload["degraded_reasons"] == list(REASONS)

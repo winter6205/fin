@@ -48,6 +48,8 @@ class MetadataStore(Protocol):
 
     def get_pointer(self, document_id: str) -> MetadataPointer: ...
 
+    def delete_pointer(self, document_id: str, *, object_key: str) -> None: ...
+
 
 def _validate_document_id(document_id: str) -> None:
     if not isinstance(document_id, str) or not document_id.strip():
@@ -80,6 +82,14 @@ class InMemoryMetadataStore:
                 f"no metadata pointer for {document_id!r}"
             )
         return pointer
+
+    def delete_pointer(self, document_id: str, *, object_key: str) -> None:
+        """Remove the row only while it names ``object_key``; otherwise a no-op."""
+        _validate_document_id(document_id)
+        with self._lock:
+            pointer = self._pointers.get(document_id)
+            if pointer is not None and pointer.object.key == object_key:
+                del self._pointers[document_id]
 
 
 _SCHEMA_SQL = """
@@ -152,6 +162,17 @@ class PostgresMetadataStore:
                 content_type=row[3],
             ),
         )
+
+    def delete_pointer(self, document_id: str, *, object_key: str) -> None:
+        """Remove the row only while it names ``object_key``; otherwise a no-op."""
+        _validate_document_id(document_id)
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM fin_corpus_object_pointer "
+                "WHERE document_id = %s AND object_key = %s",
+                (document_id, object_key),
+            )
+            connection.commit()
 
 
 def metadata_store_from_env(

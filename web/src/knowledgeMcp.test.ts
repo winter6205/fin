@@ -35,6 +35,7 @@ const BASE: WorkspaceStatus = {
   model_identity: "fin/MiniMax-M3",
   corpus_filing_count: 12,
   bound_collection_name: "默认资料集合",
+  run_counts: { active: 2, paused: 1, suspected_stuck: 0 },
 };
 
 describe("knowledgeMcpLine", () => {
@@ -183,8 +184,55 @@ describe("boundCollectionLine", () => {
 });
 
 describe("parseWorkspaceStatus", () => {
-  it("accepts the five pinned /api/status fields", () => {
+  it("accepts the pinned /api/status fields including run counts", () => {
     expect(parseWorkspaceStatus({ ...BASE })).toEqual(BASE);
+  });
+
+  it("accepts zero run counts as valid values", () => {
+    const status = {
+      ...BASE,
+      run_counts: { active: 0, paused: 0, suspected_stuck: 0 },
+    };
+    expect(parseWorkspaceStatus(status)).toEqual(status);
+  });
+
+  it("rejects missing or incomplete run counts", () => {
+    const { run_counts: _dropped, ...partial } = BASE;
+    expect(parseWorkspaceStatus(partial)).toBeNull();
+    expect(parseWorkspaceStatus({ ...BASE, run_counts: null })).toBeNull();
+    expect(parseWorkspaceStatus({ ...BASE, run_counts: [] })).toBeNull();
+    for (const missingField of ["active", "paused", "suspected_stuck"] as const) {
+      const runCounts = { ...BASE.run_counts };
+      delete runCounts[missingField];
+      expect(
+        parseWorkspaceStatus({ ...BASE, run_counts: runCounts }),
+        `${missingField} is required`,
+      ).toBeNull();
+    }
+  });
+
+  it("rejects negative, non-integer, unsafe, and non-finite run counts", () => {
+    const invalidCounts: unknown[] = [
+      -1,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      "1",
+      true,
+    ];
+
+    for (const field of ["active", "paused", "suspected_stuck"] as const) {
+      for (const value of invalidCounts) {
+        expect(
+          parseWorkspaceStatus({
+            ...BASE,
+            run_counts: { ...BASE.run_counts, [field]: value },
+          }),
+          `${field} rejects ${String(value)}`,
+        ).toBeNull();
+      }
+    }
   });
 
   it("ignores unknown extra keys rather than failing the payload", () => {

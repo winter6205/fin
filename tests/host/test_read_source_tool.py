@@ -31,10 +31,12 @@ from typing import Any, Mapping
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import Locator
-from fin.host.citation_gate import (
+from fin.host.attachment.attachment_source_read import AttachmentSourceReader
+from fin.host.grounded.citation_gate import (
     EvidenceItem,
     MalformedEvidenceError,
     verify_citations,
@@ -47,6 +49,7 @@ from fin.host.graph import (
 )
 from fin.host.stream_map import format_tool_summary
 from fin.host.tools.read_source import read_source
+from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.source_read import (
     ATTACHMENT_KIND,
     INVALID_LOCATOR,
@@ -490,6 +493,72 @@ def test_typed_error_produces_no_evidence_and_reaches_the_model(
     assert _tool_payload(command) == error
 
 
+@pytest.mark.parametrize(
+    ("source_ref", "reason"),
+    [
+        pytest.param({}, "locator_keys_malformed", id="empty-company-locator"),
+        pytest.param(
+            {"document_id": COMPANY_ID, "version": COMPANY_VERSION},
+            "locator_keys_malformed",
+            id="missing-company-unit",
+        ),
+        pytest.param(
+            _company_ref(unit=0),
+            "locator_fields_malformed",
+            id="company-unit-zero",
+        ),
+        pytest.param(
+            _company_ref(unit="3"),
+            "locator_fields_malformed",
+            id="company-unit-string",
+        ),
+        pytest.param(
+            _company_ref(unit=True),
+            "locator_fields_malformed",
+            id="company-unit-bool",
+        ),
+        pytest.param(
+            _company_ref(extra="unexpected"),
+            "locator_keys_malformed",
+            id="company-extra-key",
+        ),
+        pytest.param(
+            _attachment_ref(unit=0),
+            "locator_unit",
+            id="attachment-unit-zero",
+        ),
+        pytest.param(
+            _attachment_ref(unit="2"),
+            "locator_unit",
+            id="attachment-unit-string",
+        ),
+        pytest.param(
+            _attachment_ref(unit=True),
+            "locator_unit",
+            id="attachment-unit-bool",
+        ),
+        pytest.param(
+            _attachment_ref(extra="unexpected"),
+            "locator_keys",
+            id="attachment-extra-key",
+        ),
+    ],
+)
+def test_malformed_locators_keep_typed_refusal_and_admit_no_evidence(
+    source_ref: Mapping[str, Any], reason: str
+) -> None:
+    company_reader = FakeRetrievePort()
+    tool = _make_read_source_tool(
+        _fixed(company_reader),
+        lambda thread_id: AttachmentSourceReader(object(), thread_id),
+    )
+
+    command = _invoke_tool(tool, source_ref=source_ref)
+
+    assert _tool_payload(command) == {"error": "invalid_locator", "reason": reason}
+    assert _command_update(command)["evidence"] == []
+
+
 def test_terminal_empty_slice_admits_no_evidence() -> None:
     """``position == len(text)`` is a legal slice with no text; there is
     nothing to quote, and empty text would trip the gate's
@@ -699,6 +768,55 @@ def test_the_model_sees_read_source_and_never_read_file() -> None:
     assert "read_source" in names
     assert "read_file" not in names
     assert names[-1] == "read_source"
+
+
+def test_graph_bound_read_source_schema_describes_both_locator_shapes() -> None:
+    """The actual model-bound tool schema closes both source locator shapes."""
+    graph = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=_RecordingModel(),
+        adapter=_FakeCompanyAdapter(),
+    )
+
+    tool = graph._tool_node.tools_by_name["read_source"]
+    schema = tool.tool_call_schema.model_json_schema()
+    source_ref = schema["properties"]["source_ref"]
+
+    assert source_ref == {
+        "title": "Source Ref",
+        "anyOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "minLength": 1},
+                    "version": {"type": "string", "minLength": 1},
+                    "unit": {"type": "integer", "minimum": 1},
+                },
+                "required": ["document_id", "version", "unit"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["attachment"]},
+                    "attachment_id": {"type": "string", "minLength": 1},
+                    "version": {
+                        "anyOf": [
+                            {"type": "string", "pattern": "^(0|[1-9][0-9]*)$"},
+                            {"type": "integer", "minimum": 0},
+                        ]
+                    },
+                    "unit": {"type": "integer", "minimum": 1},
+                },
+                "required": ["kind", "attachment_id", "version", "unit"],
+                "additionalProperties": False,
+            },
+        ]
+    }
+    model_schema = convert_to_openai_tool(tool)["function"]["parameters"]
+    assert model_schema["properties"]["source_ref"] == {
+        key: value for key, value in source_ref.items() if key != "title"
+    }
 
 
 class _RecordingModel:
@@ -953,7 +1071,7 @@ def test_attachment_read_goes_through_the_injected_factory() -> None:
 
 
 def test_idempotence_cache_holds_the_reader_factory_object_itself() -> None:
-    """The cache keys on the factory with a strong reference (the tracked change).
+    """The cache keys on the factory with a strong reference.
 
     A numeric ``id()`` slot lets a later factory allocated at a recycled
     address hit a stale cached compile; holding the object in the key

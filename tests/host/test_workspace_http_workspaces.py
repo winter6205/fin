@@ -43,12 +43,10 @@ from fin.host.workspace_registry import DEFAULT_ROOT_NAME, default_workspace_roo
 
 @pytest.fixture
 def fake_home(tmp_path: Path) -> Path:
-    """An isolated ``$HOME`` under ``tmp_path``.
+    """An isolated home under ``tmp_path``.
 
-    The suite never touches the operator's real home: the
-    ``$HOME``-reading dependencies resolve via
-    ``default_workspace_root_for_process``, which reads ``HOME`` at
-    call time — monkeypatched here.
+    The process seam follows ``FIN_HOME``. The fixture points that at
+    ``<fake>/.fin`` so the workspace stays ``<fake>/.fin/default``.
     """
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
@@ -57,10 +55,11 @@ def fake_home(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def http_app(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
-    """The prod app with ``HOME`` pointed at ``fake_home``."""
+    """The prod app with the fin home under ``fake_home``."""
     from fin.host.http import app
 
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("FIN_HOME", str(fake_home / ".fin"))
     yield app
     app.dependency_overrides.clear()
 

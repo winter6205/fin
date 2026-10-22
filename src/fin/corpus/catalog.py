@@ -10,8 +10,11 @@ tree — the serve-time HTML tree is not the catalog SSOT (ADR 0046 /
 
 Rows are written through :func:`record_filings` (upsert keyed by
 ``document_id`` + ``version``), the seam the ingest endpoint (T3)
-calls to register pushed filings. Each version records exactly one
-extract method (ADR 0079, stored-only): new rows default to
+calls to register pushed filings. A writer that owns a whole
+document -- the demo seed, whose rows are generated from the fixture --
+writes through :func:`replace_filings`, which replaces that document's
+rows instead of adding a second row per version. Each version records
+exactly one extract method (ADR 0079, stored-only): new rows default to
 ``standard`` and :func:`switch_extract_method` is the operator's
 change path. Rows may additionally carry the EDGAR-shaped fields
 ``cik`` / ``form`` / ``ticker`` / ``filing_date`` (ADR 0031): ``form``
@@ -49,23 +52,81 @@ from fin.corpus.extract_method import (
     DEFAULT_EXTRACT_METHOD,
     EXTRACT_METHODS,
 )
+from fin.corpus.params import DOC_TYPES
 
 
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "corpus"
 DEFAULT_CATALOG_PATH = _DEFAULT_DATA_DIR / "catalog.json"
 
-# The cross-ticket row contract. ``page_count`` is handled separately
-# (int, not bool, >= 0); the string fields must be non-empty strings.
+
+def default_corpus_ledger_path(
+    filename: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+    repo_root: Path | None = None,
+    user_home: Path | None = None,
+) -> Path:
+    """Ledger path for ``filename``.
+
+    A primary checkout with ``FIN_HOME`` unset uses
+    ``<user_home>/.fin/corpus``. A linked worktree uses
+    ``<worktree>/.fin-home/corpus``. An explicit absolute ``FIN_HOME``
+    wins. Resolving does not create the path or copy bytes. An explicit
+    caller path is not decided here.
+    """
+    from fin.host.fin_home import resolve_fin_home
+
+    home = resolve_fin_home(
+        environ=environ, repo_root=repo_root, user_home=user_home
+    )
+    return home / "corpus" / filename
+
+# The physical row contract. ``document_id`` / ``version`` / ``title``
+# / ``doc_type`` must be non-empty strings; ``page_count`` is handled
+# separately (int, not bool, >= 0).
+#
+# ``company`` and ``period`` are OPTIONAL (T6): an ordinary enterprise
+# document has no financial identity, and a metadata-free upload has to
+# be catalog-visible anyway. A present value must still be a string, and
+# a missing one is OMITTED — never invented as ``""``, which would read
+# as "a company that is the empty string" to every consumer.
 _REQUIRED_ROW_STRING_FIELDS = (
     "document_id",
+    "version",
+    "title",
+    "doc_type",
+)
+
+#: Fields a WRITE requires that a READ tolerates missing on a row the
+#: table's earlier writers (the financial ingest) never recorded. The
+#: read is the compatibility surface for those existing rows — spec
+#: "Preserve existing ... legacy financial fields when present" — so a
+#: row the old writer stored stays readable. Absence only: a present
+#: value still must be a non-empty string.
+_WRITE_ONLY_ROW_STRING_FIELDS = (
+    "title",
+    "doc_type",
+)
+
+#: Optional string fields: absent is fine, present must be a string.
+#: They are NOT checked for emptiness — an existing financial writer
+#: that stored ``""`` keeps its value rather than failing a read of the
+#: table it wrote itself.
+_OPTIONAL_ROW_STRING_FIELDS = (
     "company",
     "period",
-    "version",
 )
 
 # The one EDGAR-shaped field emitted on a hit (spec SC3). ``cik`` /
 # ``ticker`` / ``filing_date`` / ``accession`` / ``source_sha256``
 # stay stored-only.
+#
+# This is the FINANCIAL compatibility projection for the existing
+# ``list_files`` callers, unchanged by T6: same six keys, same AND
+# combination, same empty-hits-not-exceptions rule. The generic read
+# model is :func:`list_catalog_entries` — the two are deliberately
+# separate so a financial read cannot grow ``title`` / ``doc_type`` and
+# a generic read cannot inherit the four legacy filter arguments.
 _OUTPUT_KEYS = (
     "document_id",
     "company",
@@ -74,6 +135,62 @@ _OUTPUT_KEYS = (
     "page_count",
     "form",
 )
+
+#: The generic read model's always-present keys. ``company`` /
+#: ``period`` join it only when the row carries them.
+_GENERIC_OUTPUT_KEYS = (
+    "document_id",
+    "title",
+    "doc_type",
+    "version",
+    "page_count",
+)
+
+#: The doc_type reported for a legacy row that never recorded one: the
+#: closed-vocabulary member meaning "no reliable type recorded"
+#: (:data:`fin.corpus.params.DOC_TYPES`). The membership check pins the
+#: literal to the vocabulary — removing ``unknown`` from DOC_TYPES
+#: fails here instead of drifting silently.
+_LEGACY_DOC_TYPE = "unknown"
+assert _LEGACY_DOC_TYPE in DOC_TYPES
+
+#: Grouping candidates, in presentation order. ``title`` is a
+#: display/filter value and is NEVER a grouping dimension; department and
+#: time-range dimensions are outside this contract.
+GROUPING_KEYS = ("doc_type", "company", "period")
+
+#: The public metadata-filter allowlist (spec qa-chain-corpus-retrieval
+#: §"Retrieve request and metadata filters"): the only keys a generic
+#: metadata filter may name, in contract order. Catalog-owned so the
+#: filter contract and the catalog's own row fields cannot drift apart.
+METADATA_FILTER_KEYS: tuple[str, ...] = (
+    "title",
+    "doc_type",
+    "company",
+    "period",
+)
+
+#: Where a grouping bucket puts a row with no value for the dimension.
+UNCLASSIFIED_LABEL = "未分类"
+
+
+def _legacy_display_title(row: Mapping[str, Any]) -> str:
+    """Display title for a legacy row that never recorded one.
+
+    Built from the financial identity the row does carry — company,
+    period, form — so the operator sees the same identity the
+    financial projection shows. Deterministic; degrades to the
+    document id when even the identity is absent.
+    """
+    company = row.get("company")
+    period = row.get("period")
+    form = row.get("form")
+    identity = " ".join(
+        str(part)
+        for part in (company, period, form)
+        if isinstance(part, str) and part
+    )
+    return identity if identity else str(row.get("document_id", ""))
 
 
 def list_filings(
@@ -185,10 +302,247 @@ def record_filings(
 
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
     with _table_lock(catalog_path):
-        merged = {_row_key(row): row for row in _load_rows(catalog_path)}
-        for row in validated:
-            merged[_row_key(row)] = _with_recorded_method(row, merged)
+        merged = _upsert_rows(_load_rows(catalog_path), validated)
         _write_rows(catalog_path, sorted(merged.values(), key=_row_key))
+    return len(validated)
+
+
+def list_catalog_entries(
+    *, catalog_path: Path | str | None = None
+) -> list[dict[str, Any]]:
+    """The GENERIC read model: every row as a catalog document.
+
+    One entry per physical row, sorted by ``(document_id, version)`` for
+    deterministic output. Each entry carries ``document_id``, ``title``,
+    ``doc_type``, ``version`` and ``page_count``, plus ``company`` and
+    ``period`` ONLY when the row has them — an absent value is omitted
+    rather than reported as ``None`` or ``""``, so a consumer can tell
+    "this document claims no company" from "this document's company is
+    blank".
+
+    Legacy financial fields (``cik`` / ``form`` / ``ticker`` /
+    ``filing_date`` / ``source_sha256`` / ``extract_method``) stay
+    stored-only: they exist for :func:`list_filings`, not for the generic
+    surface, and the four old filter arguments are never generic metadata
+    keys. A missing table is the empty list; a broken table is the typed
+    ``CatalogCorruptError``, exactly as for the financial read.
+
+    A legacy row that never recorded ``title`` / ``doc_type`` — the rows
+    the pre-generic financial writer stored — still yields a complete
+    generic entry: the title is derived from the row's financial
+    identity (company / period / form, falling back to the document id)
+    and ``doc_type`` is the closed-vocabulary member ``unknown``. The
+    synthesized values exist for this projection only; the physical row
+    on disk is never rewritten with them.
+    """
+    if catalog_path is None:
+        catalog_path = DEFAULT_CATALOG_PATH
+    entries: list[dict[str, Any]] = []
+    for row in sorted(_load_rows(Path(catalog_path)), key=_row_key):
+        entries.append(_generic_entry(row))
+    return entries
+
+
+def catalog_document_titles(
+    *, catalog_path: Path | str | None = None
+) -> dict[str, str | None]:
+    """Each catalog document's STORED title, keyed by ``document_id``.
+
+    Every document id in the table is a key. A document whose rows never
+    recorded a title maps to ``None`` rather than to the generic read
+    model's synthesized display value: that value is derived from
+    company/period identity, which a caller may not depend on. An
+    untitled document's caller is expected to fall back to the document
+    id, and an id absent from this mapping is not in the catalog at all.
+
+    A missing table is the empty mapping; a broken table is the typed
+    ``CatalogCorruptError`` exactly as for the other reads.
+    """
+    if catalog_path is None:
+        catalog_path = DEFAULT_CATALOG_PATH
+    titles: dict[str, str | None] = {}
+    for row in _load_rows(Path(catalog_path)):
+        document_id = row.get("document_id")
+        if not isinstance(document_id, str) or not document_id:
+            continue
+        title = row.get("title")
+        if isinstance(title, str) and title.strip():
+            titles.setdefault(document_id, title.strip())
+        else:
+            titles.setdefault(document_id, None)
+    return titles
+
+
+def _generic_entry(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One physical row as a generic read-model entry.
+
+    Legacy synthesis happens here — and only here, on the projection:
+    a row that never recorded ``title`` / ``doc_type`` gets the derived
+    display title and the ``unknown`` doc_type, so every generic
+    consumer (read model, grouping) sees the same complete entry while
+    the physical row on disk is never rewritten with the synthesized
+    values.
+    """
+    entry = {key: row.get(key) for key in _GENERIC_OUTPUT_KEYS}
+    if "title" not in row:
+        entry["title"] = _legacy_display_title(row)
+    if "doc_type" not in row:
+        entry["doc_type"] = _LEGACY_DOC_TYPE
+    for field in _OPTIONAL_ROW_STRING_FIELDS:
+        if field in row:
+            entry[field] = row[field]
+    return entry
+
+
+def catalog_grouping(
+    rows: Iterable[Mapping[str, Any]] | None = None,
+    *,
+    catalog_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Group the catalog for presentation.
+
+    Returns ``{"dimensions": [...], "flat_titles": [...]}``:
+
+    * ``dimensions`` — one entry per QUALIFYING candidate, in the fixed
+      :data:`GROUPING_KEYS` order. A candidate qualifies only with at
+      least two distinct non-empty values, so a corpus where every
+      document shares one ``doc_type`` offers no ``doc_type`` grouping
+      rather than a single-item one. Each entry is
+      ``{"key", "label", "groups": [{"value", "document_ids"}]}`` with
+      values sorted, and rows with no value for that dimension grouped
+      under :data:`UNCLASSIFIED_LABEL`;
+    * ``flat_titles`` — every row's ``title``, sorted and de-duplicated,
+      used only when NO dimension qualifies.
+
+    ``title`` is never a dimension: it is a display/filter value, and a
+    per-title grouping would be the identity function over the corpus.
+
+    Rows are the physical rows (pass them) or the table's rows (name
+    ``catalog_path``); both forms read the same fields. The table form
+    projects through the generic read model first, so a legacy row
+    groups by its synthesized ``doc_type`` (``unknown``) exactly as it
+    would when the caller passes :func:`list_catalog_entries` output —
+    one corpus, one presentation.
+    """
+    if rows is None:
+        if catalog_path is None:
+            catalog_path = DEFAULT_CATALOG_PATH
+        rows = [_generic_entry(row) for row in _load_rows(Path(catalog_path))]
+    ordered = sorted(rows, key=_row_key)
+    dimensions: list[dict[str, Any]] = []
+    for key in GROUPING_KEYS:
+        groups = _groups_for(ordered, key)
+        if len(groups) < 2:
+            continue  # EXIT: one bucket is not a grouping
+        dimensions.append(
+            {
+                "key": key,
+                "label": GROUPING_LABELS[key],
+                "groups": groups,
+            }
+        )
+    return {
+        "dimensions": dimensions,
+        "flat_titles": _flat_titles(ordered),
+    }
+
+
+#: Operator-facing names for the grouping candidates. Pinned here so the
+#: label and the key cannot drift apart between the host route and the
+#: SPA, which both render from this projection.
+GROUPING_LABELS: dict[str, str] = {
+    "doc_type": "文档类型",
+    "company": "公司",
+    "period": "期间",
+}
+
+
+def _groups_for(
+    rows: list[Mapping[str, Any]], key: str
+) -> list[dict[str, Any]]:
+    """One dimension's buckets, sorted by value with 未分类 last.
+
+    A blank / non-string value is "missing", not a bucket of its own:
+    ``""`` and ``None`` both land under 未分类, so the operator sees one
+    unclassified bucket instead of several indistinguishable empties.
+    """
+    buckets: dict[str, list[str]] = {}
+    for row in rows:
+        value = row.get(key)
+        label = value if isinstance(value, str) and value else UNCLASSIFIED_LABEL
+        buckets.setdefault(label, []).append(str(row.get("document_id", "")))
+    ordered = sorted(
+        (label for label in buckets if label != UNCLASSIFIED_LABEL)
+    )
+    if UNCLASSIFIED_LABEL in buckets:
+        ordered.append(UNCLASSIFIED_LABEL)
+    return [
+        {"value": label, "document_ids": sorted(buckets[label])}
+        for label in ordered
+    ]
+
+
+def _flat_titles(rows: list[Mapping[str, Any]]) -> list[str]:
+    """The sorted, de-duplicated titles of rows with one."""
+    titles = {
+        title
+        for title in (row.get("title") for row in rows)
+        if isinstance(title, str) and title
+    }
+    return sorted(titles)
+def replace_filings(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    document_ids: Iterable[str],
+    catalog_path: Path | str | None = None,
+) -> int:
+    """Replace the rows of ``document_ids`` with ``rows``; return the count written.
+
+    :func:`record_filings` upserts on ``(document_id, version)``, so a new
+    version of a document is a *second* row. A writer that owns a whole
+    document -- the demo seed, whose rows are generated from the fixture --
+    must not leave the previous version's row behind, or one document shows
+    up twice in :func:`list_filings`. This replaces every row of
+    ``document_ids`` with the given rows; the rows of other documents are
+    carried through untouched.
+
+    A row whose ``(document_id, version)`` is already in the table keeps the
+    extract method the table records (ADR 0068): replacing a row is not a
+    method switch. A row of a document outside ``document_ids`` is a named
+    ``CatalogRowError``, not a silent write the caller did not ask for.
+
+    Concurrency follows the same ``flock`` + atomic-rewrite discipline as
+    :func:`record_filings`.
+    """
+    if catalog_path is None:
+        catalog_path = DEFAULT_CATALOG_PATH
+    catalog_path = Path(catalog_path)
+
+    validated = [
+        _validated_row(row, index) for index, row in enumerate(rows)
+    ]
+    if not validated:
+        return 0
+
+    replaced = set(document_ids)
+    outside = sorted({row["document_id"] for row in validated} - replaced)
+    if outside:
+        raise CatalogRowError(
+            f"rows for documents {outside} are outside the replaced set "
+            f"{sorted(replaced)}; replace_filings only replaces the "
+            "documents it is given"
+        )
+    incoming = {_row_key(row) for row in validated}
+
+    catalog_path.parent.mkdir(parents=True, exist_ok=True)
+    with _table_lock(catalog_path):
+        merged = _upsert_rows(_load_rows(catalog_path), validated)
+        kept = [
+            row
+            for key, row in merged.items()
+            if key[0] not in replaced or key in incoming
+        ]
+        _write_rows(catalog_path, sorted(kept, key=_row_key))
     return len(validated)
 
 
@@ -251,6 +605,21 @@ def _row_key(row: Mapping[str, Any]) -> tuple[str, str]:
     return (row["document_id"], row["version"])
 
 
+def _upsert_rows(
+    existing: list[dict[str, Any]],
+    validated: list[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Merge ``validated`` into ``existing`` on the ``(document_id, version)`` key.
+
+    One merge for every writer, so the upsert key and the extract-method
+    resolution stay single-sourced in this module.
+    """
+    merged = {_row_key(row): row for row in existing}
+    for row in validated:
+        merged[_row_key(row)] = _with_recorded_method(row, merged)
+    return merged
+
+
 def _with_recorded_method(
     row: dict[str, Any],
     merged: Mapping[tuple[str, str], Mapping[str, Any]],
@@ -291,7 +660,55 @@ def _validated_row(row: Mapping[str, Any], index: int) -> dict[str, Any]:
     Returns a plain-dict copy. Raises ``CatalogRowError`` naming the
     row index and the offending field — the error message is part of
     the contract, so the ingest side can surface which row drifted.
+
+    The ``source_sha256 == version`` equality is enforced HERE and not
+    on the read path: the spec's rule is about what a NEW row writes
+    (qa-chain-corpus-retrieval §"Catalog fields and compatibility
+    projection"), and the read path already tolerates the rows earlier
+    writers stored. A row whose two digests disagree is one the writer
+    must not create; an existing one stays readable so a compatibility
+    read cannot be broken by a rule aimed at new writes.
     """
+    validated = _validated_row_where(
+        row,
+        index,
+        tolerated_absent=(),
+    )
+    source_sha256 = validated.get("source_sha256")
+    if source_sha256 is not None and source_sha256 != validated.get("version"):
+        raise CatalogRowError(
+            f"row #{index} field 'source_sha256' must equal 'version' when "
+            f"present, got {source_sha256!r} against version "
+            f"{validated.get('version')!r}"
+        )
+    return validated
+
+
+def _validated_read_row(row: Mapping[str, Any], index: int) -> dict[str, Any]:
+    """Validate one row as it may exist ON DISK, across writers.
+
+    The write path (:func:`_validated_row`) demands every field the
+    current writer records; the read path also serves the rows that
+    writer's predecessors stored, which never carried ``title`` /
+    ``doc_type``. Only ABSENCE is forgiven: every other constraint,
+    and a present-but-invalid value for these fields too, stays at
+    write strength, so a genuinely corrupt row still reads as the
+    typed ``CatalogRowError`` (wrapped as ``CatalogCorruptError`` by
+    the loader).
+    """
+    return _validated_row_where(
+        row,
+        index,
+        tolerated_absent=_WRITE_ONLY_ROW_STRING_FIELDS,
+    )
+
+
+def _validated_row_where(
+    row: Mapping[str, Any],
+    index: int,
+    *,
+    tolerated_absent: tuple[str, ...],
+) -> dict[str, Any]:
     where = f"row #{index}"
     if not isinstance(row, Mapping):
         raise CatalogRowError(
@@ -299,11 +716,19 @@ def _validated_row(row: Mapping[str, Any], index: int) -> dict[str, Any]:
         )
     validated = dict(row)
     for field in _REQUIRED_ROW_STRING_FIELDS:
+        if field in tolerated_absent and field not in validated:
+            continue
         value = validated.get(field)
         if not isinstance(value, str) or not value:
             raise CatalogRowError(
                 f"{where} field {field!r} must be a non-empty string, "
                 f"got {value!r}"
+            )
+    for field in _OPTIONAL_ROW_STRING_FIELDS:
+        if field in validated and not isinstance(validated[field], str):
+            raise CatalogRowError(
+                f"{where} field {field!r} must be a string or absent, "
+                f"got {validated[field]!r}"
             )
     page_count = validated.get("page_count")
     if (
@@ -360,7 +785,7 @@ def _load_rows(catalog_path: Path) -> list[dict[str, Any]]:
         )
     for index, row in enumerate(payload["filings"]):
         try:
-            _validated_row(row, index)
+            _validated_read_row(row, index)
         except CatalogRowError as exc:
             raise CatalogCorruptError(
                 f"catalog table at {catalog_path} holds an invalid row: {exc}"
@@ -404,7 +829,16 @@ def _table_lock(catalog_path: Path):
 
 __all__ = [
     "DEFAULT_CATALOG_PATH",
+    "GROUPING_KEYS",
+    "GROUPING_LABELS",
+    "METADATA_FILTER_KEYS",
+    "UNCLASSIFIED_LABEL",
+    "catalog_document_titles",
+    "catalog_grouping",
+    "default_corpus_ledger_path",
+    "list_catalog_entries",
     "list_filings",
     "record_filings",
+    "replace_filings",
     "switch_extract_method",
 ]

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from fin.retrieve.port import RetrievePort
+from fin.retrieve.port import DocumentScope, RetrievePort
 
 
 def retrieve(
@@ -41,6 +41,8 @@ def retrieve(
     structured_request: Mapping[str, Any] | None = None,
     sql_window_start: str | None = None,
     sql_window_end: str | None = None,
+    filters: Mapping[str, Any] | None = None,
+    document_scope: DocumentScope | None = None,
     adapter: RetrievePort | None = None,
 ) -> dict[str, Any]:
     """Adapter-bound retrieve: returns the ADR 0009 contract shape.
@@ -67,7 +69,7 @@ def retrieve(
         the host cascade's job) nor validates one (the port's named
         failures stay single-sourced behind the port). The host graph
         resolves the value PER CALL off that run's cascade audit
-        (``fin.host.search_mode_decision.assigned_retrieve_mode``), so the
+        (``fin.host.grounded.search_mode_decision.assigned_retrieve_mode``), so the
         wrapper is the seam, not the source: an omitted value means "send
         no 档" and iknow answers with its own default.
     sql_window_start / sql_window_end
@@ -80,6 +82,22 @@ def retrieve(
         Optional typed structured-query object. It is passed through
         unchanged to the adapter when present and omitted from legacy
         calls to preserve their existing adapter contract.
+    filters
+        The generic metadata filter object (spec
+        ``qa-chain-corpus-retrieval``): at most the four catalog-owned
+        keys ``title`` / ``doc_type`` / ``company`` / ``period``,
+        passed through untouched — the port seam validates it BEFORE
+        any I/O and answers ``{"error": "invalid_filter"}`` for an
+        out-of-contract map. ``None`` (the default) is absent: whole
+        authorized scope.
+    document_scope
+        Optional trusted allowlist of ``(document_id, version)`` entries.
+        ``None`` preserves the legacy unrestricted call and is omitted from
+        adapter kwargs; a present empty or malformed scope is refused as
+        ``unsupported_source_scope``. An explicit ``document_id`` intersects
+        this scope; a blank id keeps its legacy miss shape. Adapters refuse
+        modes that cannot enforce the version pairs, such as global, SQL, or
+        scoped reports.
     adapter
         The shared ``RetrievePort`` implementation. The host graph
         (T6) constructs one adapter per run and threads it through
@@ -112,9 +130,12 @@ def retrieve(
         "search_mode": search_mode,
         "sql_window_start": sql_window_start,
         "sql_window_end": sql_window_end,
+        "filters": filters,
     }
     if structured_request is not None:
         arguments["structured_request"] = structured_request
+    if document_scope is not None:
+        arguments["document_scope"] = document_scope
     return adapter.retrieve(**arguments)
 
 

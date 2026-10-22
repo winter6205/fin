@@ -517,7 +517,7 @@ def test_the_consumer_bound_is_the_same_bound_the_drain_applies() -> None:
     RULES, which the number alone never did.
     """
 
-    from fin.host.structured_evidence_invalidation import (
+    from fin.host.evidence.structured_evidence_invalidation import (
         MAX_INVALIDATION_TOKEN_CHARS,
         _is_bounded_token as drain_bound_rule,
     )
@@ -564,12 +564,12 @@ def test_the_envelope_version_is_the_single_authority_the_drain_derives() -> Non
     ``invalidations`` is an ACTION of this envelope (ADR 0097 §2.1), so its
     version is this envelope's version; a second literal in the drain is a
     number that answers one reader and refuses the other. The drain derives its
-    name from :data:`~fin.host.evidence_contract.EVIDENCE_SCHEMA_VERSION`, and
+    name from :data:`~fin.host.evidence.evidence_contract.EVIDENCE_SCHEMA_VERSION`, and
     this case is what stops that derivation from becoming a stale copy.
     """
 
-    from fin.host.evidence_contract import EVIDENCE_SCHEMA_VERSION
-    from fin.host.structured_evidence_invalidation import (
+    from fin.host.evidence.evidence_contract import EVIDENCE_SCHEMA_VERSION
+    from fin.host.evidence.structured_evidence_invalidation import (
         INVALIDATION_EVENT_SCHEMA_VERSION,
     )
 

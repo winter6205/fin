@@ -95,6 +95,34 @@ function DeleteThreadDialog({
   );
 }
 
+/**
+ * The homepage door (T3).
+ *
+ * It is the way back to "/" that does not depend on the browser
+ * history, so an operator who answered a question can always reach
+ * the homepage again. ``end`` matters: a NavLink to "/" without it
+ * matches EVERY route, so the link would read as "the page you are
+ * on" on every thread.
+ */
+function HomeLink() {
+  return (
+    <NavLink
+      to="/"
+      end
+      data-testid="sidebar-home-link"
+      className={({ isActive }) =>
+        `mt-3 inline-block border px-2 py-1 text-xs ${
+          isActive
+            ? "border-accent bg-accent text-white"
+            : "border-black hover:bg-tool hover:text-white"
+        }`
+      }
+    >
+      首页
+    </NavLink>
+  );
+}
+
 export default function Sidebar() {
   const threads = useWorkspaceStore((s) => s.threads);
   const createThread = useWorkspaceStore((s) => s.createThread);
@@ -152,6 +180,11 @@ export default function Sidebar() {
           >
             {bindLine.text}
           </p>
+          {/* The homepage door (T3). It is the way back to "/" that
+              does not depend on the browser history, so an operator
+              who answered a question can always reach the homepage
+              again. */}
+          <HomeLink />
         </div>
       </div>
       {/* T2: the 会话 disclosure — 新建 + thread links live inside the

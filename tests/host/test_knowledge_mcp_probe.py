@@ -31,6 +31,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fin.host.knowledge_mcp import (
+    DEFAULT_PROBE_TIMEOUT_SECONDS,
     KNOWLEDGE_MCP_FAULT,
     KNOWLEDGE_MCP_MISSING,
     KNOWLEDGE_MCP_REACHABLE,
@@ -79,6 +80,16 @@ def empty_bin(tmp_path: Path) -> str:
 
 
 # ----- probe: the three states from a real handshake -----
+
+
+def test_default_probe_timeout_covers_a_cold_stdio_handshake() -> None:
+    """One cold stdio handshake must fit inside the default attempt budget.
+
+    Config, generation id, and server connect run past 2s. A shorter
+    default kills the child before ``tools/list``, and the retry starts
+    another cold process, latching fault.
+    """
+    assert DEFAULT_PROBE_TIMEOUT_SECONDS >= 8.0
 
 
 def test_probe_missing_when_command_absent_from_path(empty_bin: str) -> None:
@@ -544,12 +555,15 @@ def test_status_serves_200_with_the_published_state(state: str) -> None:
 
     body = _status()
 
+    # The three lifecycle counts are aggregates with no identity, so they
+    # are admitted here; every other key still has to reopen this set.
     assert set(body.keys()) == {
         "knowledge_mcp",
         "retrieve_adapter_kind",
         "model_identity",
         "corpus_filing_count",
         "bound_collection_name",
+        "run_counts",
     }
     assert body["knowledge_mcp"] == state
 
@@ -557,6 +571,15 @@ def test_status_serves_200_with_the_published_state(state: str) -> None:
 def test_status_fake_adapter_is_missing_not_reachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The fake lane reports 缺 and never 可达 (ADR 0033 amendment).
+
+    缺 is published explicitly instead of being inherited from the
+    never-probed snapshot: this process never probed, so the route reports
+    未探测 for that case (see
+    ``tests/host/test_knowledge_mcp_status_not_probed.py``), and the
+    point here is the fake lane's own 缺.
+    """
+    publish_knowledge_mcp_state(KNOWLEDGE_MCP_MISSING)
     monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
 
     body = _status()

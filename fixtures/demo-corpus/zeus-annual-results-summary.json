@@ -1,0 +1,28 @@
+{
+  "source_ref": "zeus-annual-results-summary",
+  "title": "ZEUS Annual Results Summary",
+  "content": "ZEUS Annual Results Summary · Page 1\nSection 1: Consolidated results\nZEUS reported fictional full-year 2023 revenue of USD 1,482,000,000 and gross profit of USD 873,400,000. Operating expenses were USD 701,200,000 and operating income was USD 172,200,000. Net income was USD 128,900,000. These internally prepared summary figures are unaudited teaching data and are not a representation of any real issuer or published filing. All amounts are in USD.\n\nZEUS Annual Results Summary · Page 2\nSection 2: Segments and cash\nAEGIS contributed USD 1,032,000,000 of revenue and HELIOS contributed USD 450,000,000. Cash and cash equivalents at 2023-12-31 were USD 186,700,000; borrowings were USD 40,000,000. Capital investment during the year was USD 74,500,000, primarily for gateway manufacturing equipment and two data-centre regions. For the following quarter's fictional comparison figures, see zeus-quarterly-summary, Section 1.\n\nZEUS Annual Results Summary · Page 3\nSection 3: Outlook\nThe internal planning range for 2024 revenue was USD 1,550,000,000 to USD 1,630,000,000, subject to product delivery and customer renewal assumptions. The range was prepared by Finance Planning on 2024-02-26 and approved for internal use by the Chief Financial Officer. This planning range is not a public forecast and may be revised when operating conditions change. No per-share guidance was issued in this summary.",
+  "chunks": [
+    {
+      "content": "ZEUS Annual Results Summary · Page 1\nSection 1: Consolidated results\nZEUS reported fictional full-year 2023 revenue of USD 1,482,000,000 and gross profit of USD 873,400,000. Operating expenses were USD 701,200,000 and operating income was USD 172,200,000. Net income was USD 128,900,000. These internally prepared summary figures are unaudited teaching data and are not a representation of any real issuer or published filing. All amounts are in USD.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Annual Results Summary · Page 2\nSection 2: Segments and cash\nAEGIS contributed USD 1,032,000,000 of revenue and HELIOS contributed USD 450,000,000. Cash and cash equivalents at 2023-12-31 were USD 186,700,000; borrowings were USD 40,000,000. Capital investment during the year was USD 74,500,000, primarily for gateway manufacturing equipment and two data-centre regions. For the following quarter's fictional comparison figures, see zeus-quarterly-summary, Section 1.",
+      "index": 1
+    },
+    {
+      "content": "ZEUS Annual Results Summary · Page 3\nSection 3: Outlook\nThe internal planning range for 2024 revenue was USD 1,550,000,000 to USD 1,630,000,000, subject to product delivery and customer renewal assumptions. The range was prepared by Finance Planning on 2024-02-26 and approved for internal use by the Chief Financial Officer. This planning range is not a public forecast and may be revised when operating conditions change. No per-share guidance was issued in this summary.",
+      "index": 2
+    }
+  ],
+  "metadata": {
+    "document_type": "financial_report_summary",
+    "page_count": 3,
+    "company": "ZEUS",
+    "form": "10-K",
+    "period": "2023 FY",
+    "filing_date": "2024-02-28"
+  },
+  "valid_from": "2024-02-28T00:00:00Z"
+}

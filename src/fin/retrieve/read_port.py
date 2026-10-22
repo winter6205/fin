@@ -11,7 +11,9 @@ The bounded ``read_source`` legs (ADR 0088, spec
 * :func:`unit_text_from_pages` — the in-memory ``{document_id: pages}``
   lookup of one frozen unit's text that the fake serve path
   (:class:`fin.retrieve.fake_port.FakeRetrievePort`) reads its
-  ``pages_by_doc`` manifest through.
+  ``pages_by_doc`` manifest through. An identifier that is an ALIAS
+  resolves to its canonical id at the lookup, so both identifier forms
+  of one document read the same text.
 
 The legacy ``read_file`` seam — the whole-page ``ReadPort.read``
 pagination contract over a generic ``page`` ordinal — was removed with
@@ -22,6 +24,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from fin.corpus.document_identity import (
+    DocumentIdentityStore,
+    canonical_document_id,
+)
 from fin.corpus.extracted import ExtractedPage
 from fin.corpus.parsers._common import UnitLocator
 from fin.corpus.push import serialize_source_ref
@@ -99,6 +105,8 @@ def unit_text_from_pages(
     document_id: str,
     version: str,
     unit: int,
+    *,
+    identity_store: DocumentIdentityStore | None = None,
 ) -> str | None:
     """The text of one frozen unit of one document, or ``None``.
 
@@ -107,8 +115,19 @@ def unit_text_from_pages(
     ``None`` names every miss: unknown ``document_id``, a version that
     does not match the table's own rows, ``unit < 1``, and a unit past
     the table. Never raises.
+
+    A document id that is an ALIAS resolves to its canonical id BEFORE the
+    lookup, so a reader holding either identifier finds the same text. The
+    locator stays exactly ``{document_id, version, unit}``: the resolution
+    happens at the lookup, never by widening a locator.
+
+    The mapping is ADDITIVE and OPTIONAL, so an identity database that is
+    down never fails this read: the identifier stays unresolved — an alias
+    then misses, the canonical id still answers — and the outage reaches
+    the log.
     """
-    pages = pages_by_doc.get(document_id)
+    resolved_id = canonical_document_id(document_id, store=identity_store)
+    pages = pages_by_doc.get(resolved_id)
     if not pages or unit < 1:
         return None
 

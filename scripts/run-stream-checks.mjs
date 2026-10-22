@@ -42,6 +42,11 @@ Options:
   --expect-bounce      also run the bounce boundary check; only valid against a
                        workspace whose transcript bounces the citation gate
                        (FIN_SCRIPTED_SCENARIO=bounce)
+  --expect-document-choice
+                       also run the document-choice check (send -> card ->
+                       pick -> resumed answer); only valid against a workspace
+                       whose transcript pauses on a grounded document choice
+                       (FIN_SCRIPTED_SCENARIO=document_choice)
   --session=NAME       playwright-cli session    (default fin-stream-checks)
   --browser=NAME       playwright-cli browser    (default: playwright-cli's own default)
   --keep-open          leave the browser session open for debugging
@@ -51,8 +56,8 @@ Options:
 Prerequisites: a workspace served at --base-url (uv run fin-serve, with
 web/dist built) and a global playwright-cli (npm install -g @playwright/cli).`;
 
-function parseArgs(argv) {
-  const opts = {
+function defaultOptions() {
+  return {
     baseUrl: process.env.FIN_E2E_BASE_URL ?? "http://127.0.0.1:8000",
     pollCount: Number(process.env.FIN_E2E_POLL_COUNT ?? 120),
     pollIntervalMs: Number(process.env.FIN_E2E_POLL_INTERVAL_MS ?? 1_000),
@@ -61,41 +66,93 @@ function parseArgs(argv) {
       : null,
     requireStreamGrowth: false,
     expectBounce: false,
+    expectDocumentChoice: false,
     session: "fin-stream-checks",
     browser: "",
     keepOpen: false,
     json: false,
     help: false,
   };
-  for (const arg of argv) {
-    const [flag, value] = arg.startsWith("--") ? arg.slice(2).split("=", 2) : [arg, ""];
-    switch (flag) {
-      case "base-url": opts.baseUrl = value; break;
-      case "poll-count": opts.pollCount = Number(value); break;
-      case "poll-interval-ms": opts.pollIntervalMs = Number(value); break;
-      case "require-stream-growth": opts.requireStreamGrowth = true; break;
-      case "expect-bounce": opts.expectBounce = true; break;
-      case "timeout-ms": opts.timeoutMs = Number(value); break;
-      case "session": opts.session = value; break;
-      case "browser": opts.browser = value; break;
-      case "keep-open": opts.keepOpen = true; break;
-      case "json": opts.json = true; break;
-      case "h": case "-h": case "help": opts.help = true; break;
-      default: throw new Error(`unknown argument: ${arg}`);
-    }
+}
+
+function splitArgument(arg) {
+  return arg.startsWith("--")
+    ? arg.slice(2).split("=", 2)
+    : [arg, ""];
+}
+
+function assignValueOption(opts, flag, value) {
+  switch (flag) {
+    case "base-url": opts.baseUrl = value; return true;
+    case "poll-count": opts.pollCount = Number(value); return true;
+    case "poll-interval-ms": opts.pollIntervalMs = Number(value); return true;
+    case "timeout-ms": opts.timeoutMs = Number(value); return true;
+    case "session": opts.session = value; return true;
+    case "browser": opts.browser = value; return true;
+    default: return false;
   }
+}
+
+function assignBooleanOption(opts, flag) {
+  switch (flag) {
+    case "require-stream-growth": opts.requireStreamGrowth = true; return true;
+    case "expect-bounce": opts.expectBounce = true; return true;
+    case "expect-document-choice": opts.expectDocumentChoice = true; return true;
+    case "keep-open": opts.keepOpen = true; return true;
+    case "json": opts.json = true; return true;
+    default: return false;
+  }
+}
+
+function assignHelpOption(opts, flag) {
+  if (flag === "h" || flag === "-h" || flag === "help") {
+    opts.help = true;
+    return true;
+  }
+  return false;
+}
+
+function applyArgument(opts, arg) {
+  const [flag, value] = splitArgument(arg);
+  if (assignValueOption(opts, flag, value)) return;
+  if (assignBooleanOption(opts, flag)) return;
+  if (assignHelpOption(opts, flag)) return;
+  throw new Error(`unknown argument: ${arg}`);
+}
+
+function validatePollCount(opts) {
   if (!Number.isFinite(opts.pollCount) || opts.pollCount < 1) {
     throw new Error(`--poll-count must be a positive number`);
   }
+}
+
+function validatePollInterval(opts) {
   if (!Number.isFinite(opts.pollIntervalMs) || opts.pollIntervalMs < 1) {
     throw new Error(`--poll-interval-ms must be a positive number`);
   }
+}
+
+function validateTimeout(opts) {
   if (opts.timeoutMs === null) {
     opts.timeoutMs = opts.pollCount * opts.pollIntervalMs + 90_000;
   }
   if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs < 1_000) {
     throw new Error(`--timeout-ms must be at least 1000`);
   }
+}
+
+function validateOptions(opts) {
+  validatePollCount(opts);
+  validatePollInterval(opts);
+  validateTimeout(opts);
+}
+
+function parseArgs(argv) {
+  const opts = defaultOptions();
+  for (const arg of argv) {
+    applyArgument(opts, arg);
+  }
+  validateOptions(opts);
   return opts;
 }
 
@@ -141,7 +198,7 @@ function snippetFor(checkFn, checkOptions) {
 function parseRunCodeResult(stdout) {
   const payload = JSON.parse(stdout);
   if (payload.isError) throw new Error(payload.error ?? "playwright-cli reported an error");
-  const value = payload.result;
+  const value = payload.result ?? payload;
   return typeof value === "string" ? JSON.parse(value) : value;
 }
 
@@ -219,6 +276,7 @@ async function main(argv) {
     pollIntervalMs: opts.pollIntervalMs,
     requireStreamGrowth: opts.requireStreamGrowth,
     expectBounce: opts.expectBounce,
+    expectDocumentChoice: opts.expectDocumentChoice,
   };
   const declaredIds = declaredCheckIds(checkOptions);
 
@@ -227,7 +285,7 @@ async function main(argv) {
   const sessionArgs = [`-s=${opts.session}`];
 
   try {
-    const openArgs = [...sessionArgs, "--json", "open", "about:blank"];
+    const openArgs = [...sessionArgs, "open", "about:blank"];
     if (opts.browser) openArgs.push(`--browser=${opts.browser}`);
     const opened = await runCli(bin, openArgs, { cwd: workDir, timeoutMs: 120_000 });
     if (opened.code !== 0) {
@@ -239,7 +297,7 @@ async function main(argv) {
 
     const run = await runCli(
       bin,
-      [...sessionArgs, "--json", "run-code", `--filename=${snippetPath}`],
+      [...sessionArgs, "--raw", "run-code", `--filename=${snippetPath}`],
       { cwd: workDir, timeoutMs: opts.timeoutMs },
     );
     if (run.timedOut) {

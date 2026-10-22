@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-expense-policy",
+  "title": "ZEUS Business Expense Policy",
+  "content": "ZEUS Business Expense Policy · Page 1\nSection 1: Claims and approvals\nAn employee submits a business expense in the Finance Portal within 30 calendar days of the purchase. A receipt is required for each item of USD 25 or more. The employee's line manager approves claims within 5 working days; claims over USD 2,500 also require approval from the relevant department director. A claimant may not approve their own expense. Remote-work internet reimbursements use the monthly cap in zeus-remote-work-handbook, Section 2.\n\nZEUS Business Expense Policy · Page 2\nSection 2: Travel and exceptions\nEconomy rail or air travel is the default for a single journey under 6 hours. A hotel booking must be at or below USD 240 per night before tax unless the destination has no available room at that rate. Alcohol, personal entertainment, and companion travel are not reimbursable. The Finance Operations lead may approve a documented exception before purchase. A rejected claim includes a reason code and may be resubmitted once within 10 working days.",
+  "chunks": [
+    {
+      "content": "ZEUS Business Expense Policy · Page 1\nSection 1: Claims and approvals\nAn employee submits a business expense in the Finance Portal within 30 calendar days of the purchase. A receipt is required for each item of USD 25 or more. The employee's line manager approves claims within 5 working days; claims over USD 2,500 also require approval from the relevant department director. A claimant may not approve their own expense. Remote-work internet reimbursements use the monthly cap in zeus-remote-work-handbook, Section 2.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Business Expense Policy · Page 2\nSection 2: Travel and exceptions\nEconomy rail or air travel is the default for a single journey under 6 hours. A hotel booking must be at or below USD 240 per night before tax unless the destination has no available room at that rate. Alcohol, personal entertainment, and companion travel are not reimbursable. The Finance Operations lead may approve a documented exception before purchase. A rejected claim includes a reason code and may be resubmitted once within 10 working days.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "policy_process",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "10-K",
+    "period": "2024 FY",
+    "filing_date": "2024-03-08"
+  },
+  "valid_from": "2024-03-08T00:00:00Z"
+}

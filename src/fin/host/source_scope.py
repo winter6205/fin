@@ -61,10 +61,18 @@ no limit applies.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import Any, Final, Literal
+import unicodedata
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace as dataclass_replace
+from typing import Any, Final, Literal, Protocol, runtime_checkable
 
+from fin.host.task.task_runtime_types import (
+    TASK_APPLICABILITY_UNRESOLVED,
+    TASK_DEPENDENCY_FAILURE,
+    TASK_INPUT_INVALID,
+    TASK_PERMISSION_DENIED,
+    TaskRuntimeError,
+)
 from fin.retrieve.source_read import ATTACHMENT_KIND
 
 # The two reasons an operator's restriction is in force. ``explicit`` records a
@@ -88,7 +96,7 @@ ScopeOutcome = Literal[
 ]
 
 # The model-facing typed exits. One code per distinct cause, mirroring how
-# :mod:`fin.host.visual_evidence` closes ``VISUAL_REFUSAL_CODES``: the model
+# :mod:`fin.host.evidence.visual_evidence` closes ``VISUAL_REFUSAL_CODES``: the model
 # sees the code, and no code is ever reused for two causes. ``readiness`` is a
 # distinct code from every denial because it says "cannot answer yet" rather
 # than "not allowed".
@@ -103,6 +111,14 @@ SCOPE_OPERATION_UNSUPPORTED: Final[str] = "scope_operation_unsupported"
 SCOPE_DEPENDENCY_FAILED: Final[str] = "scope_dependency_failed"
 SCOPE_SELECTION_EMPTY: Final[str] = "scope_selection_empty"
 SCOPE_PERMITTED: Final[str] = "scope_permitted"
+# A stored snapshot that could not be READ as a snapshot at all — a
+# malformed value, an unknown schema version, an unrecognised mode. It is a
+# distinct cause from every refusal above: those all describe a source that
+# was successfully checked and then refused, while this one says there was no
+# valid selection to check. A reader that met one MUST refuse rather than
+# treat the absence of a readable selection as the absence of a restriction,
+# which is the widening this code exists to name.
+SCOPE_SNAPSHOT_UNREADABLE: Final[str] = "scope_snapshot_unreadable"
 
 # Operations that read the thread-attachment branch alone. A broad request for
 # one of these (no ``source_ref``) against an effective scope with no
@@ -128,7 +144,7 @@ COMPANY_CAPABILITY: Final[str] = "company_sources"
 # The operations a wired adapter is proven to express the approved restriction
 # through. Membership is a discovery result, each member named for the seam that
 # proves it: ``search_attachments`` takes an id narrowing
-# (:meth:`fin.host.attachment_retrieval.AttachmentSearchPort.search`),
+# (:meth:`fin.host.attachment.attachment_retrieval.AttachmentSearchPort.search`),
 # ``search_corpus``, ``list_files``, ``redline``, ``extract_tables`` and
 # ``three_year_statement`` read the corpus, the catalog or the company bodies
 # and fact table the branch decision governs, ``read_source`` and
@@ -277,6 +293,17 @@ class EffectiveScope:
     boundary reads it and answers :data:`SCOPE_DEPENDENCY_FAILED` instead of a
     successful empty, so "authority could not be consulted" is never consumed
     as "authority answered, nothing matched".
+    ``snapshot_refusal_code`` is the refusal EVERY boundary must answer when an
+    accepted versioned selection could not be confirmed against current
+    authority, or could not be read as a selection at all. It is separate from
+    ``resolution_fault`` because that one describes THIS graph's inability to
+    enumerate the attachment branch, while this one describes a SELECTION that
+    was accepted and is no longer confirmable: the branch answers the code
+    directly, with no ids and no permitted corpus path, so a dead selection is
+    never released into the unrestricted posture it was meant to replace. It
+    is ``None`` for every resolution that did not come from a stored snapshot,
+    which is what keeps a run with no accepted selection byte-identical to the
+    pre-snapshot behaviour.
     ``excluded_ids`` is the ids an in-force restriction named that current
     authority answered it does NOT stand behind (blank and duplicate names are
     not ids and never appear). They are the saved intent that could NOT be
@@ -292,6 +319,7 @@ class EffectiveScope:
     basis: str
     resolution_fault: str | None = None
     excluded_ids: tuple[str, ...] = ()
+    snapshot_refusal_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -610,6 +638,7 @@ class ScopeGate:
             SCOPE_COMPANY_NOT_PERMITTED,
             SCOPE_OPERATION_UNSUPPORTED,
             SCOPE_DEPENDENCY_FAILED,
+            SCOPE_SNAPSHOT_UNREADABLE,
         }
     )
 
@@ -635,6 +664,17 @@ class ScopeGate:
         consulted at all; company-scoped operations follow ``company_allowed``
         and capability.
         """
+        if self._effective.snapshot_refusal_code is not None:
+            # EXIT: an accepted selection exists but could not be confirmed
+            # against current authority (or could not be read as a selection).
+            # EVERY operation answers this one cause the same way, ahead of any
+            # per-source ruling, because the alternative — ruling on whatever
+            # each source happens to name — is exactly the widening a confirmed
+            # selection exists to prevent: it would answer "permitted" for a
+            # source outside a selection nobody can now honour.
+            return ScopeDecision(
+                "dependency_failed", self._effective.snapshot_refusal_code
+            )
         if source_ref is None:
             return self._check_broad(operation)
         if not isinstance(source_ref, Mapping):
@@ -947,6 +987,7 @@ __all__ = [
     "SCOPE_PERMITTED",
     "SCOPE_SELECTION_EMPTY",
     "SCOPE_SOURCE_REF_UNREADABLE",
+    "SCOPE_SNAPSHOT_UNREADABLE",
     "SCOPE_THREAD_UNBOUND",
     "ScopeDecision",
     "ScopeGate",
@@ -958,4 +999,604 @@ __all__ = [
     "propose_scope_change",
     "resolve_scope",
     "scope_denied_error",
+]
+
+
+# ----- versioned thread source-scope snapshot (shared wire contract) -----
+
+# The schema version stamped on every snapshot the Runtime writes. A reader
+# that meets a different version refuses the value rather than reinterpreting
+# it under today's rules: the wire shape is frozen, and an unknown shape must
+# not silently acquire new meaning.
+SOURCE_SCOPE_SCHEMA_VERSION: Final[int] = 1
+
+# The maximum number of DISTINCT source identities a restricted selection may
+# name (shared wire contract: "one to 200 distinct source identities"). The
+# bound keeps one clarified choice — and one snapshot — representable without
+# unbounded growth.
+MAX_SCOPE_SOURCES: Final[int] = 200
+
+# The maximum size, in UTF-8 bytes, of one ``source_id`` or ``version`` value.
+# The shared contract freezes this bound for choice source identities; a
+# snapshot identity is the same wire value, so the same bound applies.
+MAX_SCOPE_FIELD_BYTES: Final[int] = 256
+
+# The inclusive top of the nonnegative signed-64-bit counter range the wire
+# freezes for ``accepted_input_version``; 2**63 is overflow.
+_INT64_MAX: Final[int] = 2**63 - 1
+
+# The closed set of source classes a snapshot identity can name. The contract
+# freezes exactly these two: the shared company corpus and the active thread's
+# attachments. Anything else is invalid rather than a new class.
+ScopeSourceKind = Literal["corpus", "attachment"]
+
+# ``SourceKind`` is the alias the snapshot slice exposes under the contract's
+# spelling; :data:`ScopeSourceKind` is the same closed set.
+SourceKind = ScopeSourceKind
+
+_SCOPE_SOURCE_KINDS: Final[frozenset[str]] = frozenset({"corpus", "attachment"})
+
+# Snapshot-specific codes, in the same one-cause-one-code style as the
+# SCOPE_* vocabulary above. Each is surfaced through the task failure kinds
+# named by the shared contract (task_input_invalid for every malformed or
+# out-of-contract envelope value); they are reason detail, never a second
+# error convention.
+SCOPE_SNAPSHOT_NOT_AN_OBJECT: Final[str] = "scope_snapshot_not_an_object"
+SCOPE_SNAPSHOT_SCHEMA_UNSUPPORTED: Final[str] = "scope_snapshot_schema_unsupported"
+SCOPE_SNAPSHOT_MODE_INVALID: Final[str] = "scope_snapshot_mode_invalid"
+SCOPE_SNAPSHOT_SOURCES_INVALID: Final[str] = "scope_snapshot_sources_invalid"
+SCOPE_SNAPSHOT_KIND_UNKNOWN: Final[str] = "scope_snapshot_kind_unknown"
+SCOPE_SNAPSHOT_INPUT_INVALID: Final[str] = "scope_snapshot_input_invalid"
+SCOPE_SNAPSHOT_VERSION_INVALID: Final[str] = "scope_snapshot_version_invalid"
+
+# The task failure kinds the contract names for this slice, re-exported so a
+# caller of this module reads one vocabulary instead of two.
+SCOPE_SNAPSHOT_FAILURE_KINDS: Final[frozenset[str]] = frozenset(
+    {TASK_INPUT_INVALID, TASK_PERMISSION_DENIED, TASK_APPLICABILITY_UNRESOLVED}
+)
+
+
+def _field_is_identifier(value: object) -> bool:
+    """True only for a nonempty, ≤256-byte, control-character-free string.
+
+    This is the shared contract's identity rule for ``source_id`` and
+    ``version``: nonempty strings of at most 256 UTF-8 bytes with no control
+    characters. A non-string never identifies a source, so it is invalid
+    rather than coerced.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if len(value.encode("utf-8")) > MAX_SCOPE_FIELD_BYTES:
+        return False
+    return not any(
+        unicodedata.category(char) == "Cc"  # Unicode Other-control
+        for char in value
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceIdentity:
+    """One versioned source a restricted selection names — a value, not a grant.
+
+    ``version`` is the wire's opaque version string (the store's own spelling),
+    the identity Source Scope rechecks against current authority. Holding an
+    identity is a record of intent: it confers no permission and is never
+    read as "this source is currently readable".
+    """
+
+    source_kind: ScopeSourceKind
+    source_id: str
+    version: str
+
+    def to_state_dict(self) -> dict[str, str]:
+        """The wire object exactly as the shared contract freezes it."""
+        return {
+            "source_kind": self.source_kind,
+            "source_id": self.source_id,
+            "version": self.version,
+        }
+
+    @classmethod
+    def from_state_dict(cls, raw: object) -> SourceIdentity:
+        """The identity ``raw`` carries, or a typed error — never a guess.
+
+        A non-object, an unknown kind, or a field that is not a nonempty
+        ≤256-byte control-free string raises ``task_input_invalid`` with the
+        specific snapshot code as ``detail["code"]``. Nothing is defaulted:
+        a malformed identity is a refusal, not a repaired one.
+        """
+        if not isinstance(raw, Mapping):
+            raise TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "a source identity must be an object",
+                code=SCOPE_SNAPSHOT_NOT_AN_OBJECT,
+            )
+        if raw.get("source_kind") not in _SCOPE_SOURCE_KINDS:
+            raise TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "unknown source kind",
+                code=SCOPE_SNAPSHOT_KIND_UNKNOWN,
+            )
+        for field in ("source_id", "version"):
+            if not _field_is_identifier(raw.get(field)):
+                raise TaskRuntimeError(
+                    TASK_INPUT_INVALID,
+                    f"{field} must be a nonempty string of at most "
+                    f"{MAX_SCOPE_FIELD_BYTES} UTF-8 bytes with no control characters",
+                    code=SCOPE_SNAPSHOT_INPUT_INVALID,
+                )
+        return cls(
+            source_kind=raw["source_kind"],  # type: ignore[index]
+            source_id=raw["source_id"],  # type: ignore[index]
+            version=raw["version"],  # type: ignore[index]
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceScopeValidation:
+    """The snapshot ``raw`` carries, or the typed reason it does not.
+
+    Exactly one side is populated: ``snapshot`` is ``None`` whenever ``code``
+    names a failure, so a caller can never read a half-valid snapshot. The
+    code is one of this module's snapshot codes and ``kind`` is the task
+    failure kind it surfaces through.
+    """
+
+    snapshot: SourceScopeSnapshot | None
+    code: str | None
+    kind: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceScopeSnapshot:
+    """The append-only versioned selection the Runtime persists in the thread.
+
+    One snapshot records the WHOLE accepted intent: the mode, the exact
+    versioned identities when restricted, and the accepted input that
+    established it. It is INTENT plus provenance, never a permission —
+    every read rechecks current authority through :func:`recheck_scope`,
+    because ``accepted_input_version`` records WHICH accepted input
+    established the intent and never confers permission on its own.
+
+    ``mode="unrestricted"`` requires ``sources == ()`` and means the currently
+    authorized corpus plus eligible thread sources. ``mode="restricted"``
+    requires one to :data:`MAX_SCOPE_SOURCES` DISTINCT identities. A clear is
+    written as ``mode="unrestricted"`` with ``sources=()`` — an explicit key,
+    never an omitted one. The snapshot is frozen: a new accepted intent
+    writes a new snapshot, it never edits this one.
+    """
+
+    schema_version: int
+    mode: Literal["unrestricted", "restricted"]
+    sources: tuple[SourceIdentity, ...]
+    accepted_input_version: int
+
+    @property
+    def in_force(self) -> bool:
+        """Whether this snapshot narrows the selection at all.
+
+        ``True`` only for a restricted selection. Unrestricted is the default
+        whole-corpus-plus-thread posture, so it is not "in force" — and an
+        empty ``document_ids`` projection must never be read as the opposite.
+        """
+        return self.mode == "restricted"
+
+    def to_state_dict(self) -> dict[str, Any]:
+        """The frozen wire shape exactly as the shared contract spells it."""
+        return {
+            "schema_version": self.schema_version,
+            "mode": self.mode,
+            "sources": [source.to_state_dict() for source in self.sources],
+            "accepted_input_version": self.accepted_input_version,
+        }
+
+    @classmethod
+    def from_state_dict(cls, raw: object) -> SourceScopeSnapshot:
+        """The snapshot ``raw`` carries, or a typed error — never a guess.
+
+        Every contract rule is enforced here: object envelope, frozen schema
+        version, mode/source agreement, one to :data:`MAX_SCOPE_SOURCES`
+        distinct identities, identifier-shaped fields, and a nonnegative
+        signed-64-bit ``accepted_input_version``. Any violation raises
+        ``task_input_invalid``; nothing falls back to unrestricted.
+        """
+        if not isinstance(raw, Mapping):
+            raise TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "a source scope snapshot must be an object",
+                code=SCOPE_SNAPSHOT_NOT_AN_OBJECT,
+            )
+        if raw.get("schema_version") != SOURCE_SCOPE_SCHEMA_VERSION:
+            raise TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "unsupported source_scope schema version",
+                code=SCOPE_SNAPSHOT_SCHEMA_UNSUPPORTED,
+            )
+        mode = raw.get("mode")
+        if mode not in ("unrestricted", "restricted"):
+            raise TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "mode must be unrestricted or restricted",
+                code=SCOPE_SNAPSHOT_MODE_INVALID,
+            )
+        version = raw.get("accepted_input_version")
+        if (
+            type(version) is not int
+            or version < 0
+            or version > _INT64_MAX
+        ):
+            raise TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "accepted_input_version must be a nonnegative signed 64-bit integer",
+                code=SCOPE_SNAPSHOT_VERSION_INVALID,
+            )
+        raw_sources = raw.get("sources")
+        if not isinstance(raw_sources, (list, tuple)):
+            raise TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "sources must be a list of source identities",
+                code=SCOPE_SNAPSHOT_SOURCES_INVALID,
+            )
+        sources = tuple(
+            SourceIdentity.from_state_dict(entry) for entry in raw_sources
+        )
+        if mode == "unrestricted" and sources:
+            raise TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "an unrestricted scope names no sources",
+                code=SCOPE_SNAPSHOT_MODE_INVALID,
+            )
+        if mode == "restricted":
+            if not sources:
+                # EXIT: an empty restricted selection is a refusal — never a
+                # silent fallback to unrestricted, which would widen exactly
+                # where the user asked to narrow.
+                raise TaskRuntimeError(
+                    TASK_INPUT_INVALID,
+                    "a restricted scope names at least one source",
+                    code=SCOPE_SNAPSHOT_SOURCES_INVALID,
+                )
+            if len(sources) > MAX_SCOPE_SOURCES:
+                raise TaskRuntimeError(
+                    TASK_INPUT_INVALID,
+                    f"a restricted scope names at most {MAX_SCOPE_SOURCES} sources",
+                    code=SCOPE_SNAPSHOT_SOURCES_INVALID,
+                )
+            distinct = set(sources)
+            if len(distinct) != len(sources):
+                raise TaskRuntimeError(
+                    TASK_INPUT_INVALID,
+                    "a restricted scope names each source once",
+                    code=SCOPE_SNAPSHOT_SOURCES_INVALID,
+                )
+        return cls(
+            schema_version=SOURCE_SCOPE_SCHEMA_VERSION,
+            mode=mode,  # type: ignore[arg-type]
+            sources=sources,
+            accepted_input_version=version,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeInput:
+    """An EXPLICITLY scoped input: the scope it names, accepted or not.
+
+    This is the input type that makes "the user named a scope in this input"
+    representable. It carries the whole requested intent so an accepted
+    replacement cannot quietly lose half of it. It grants nothing on its own.
+    """
+
+    mode: Literal["unrestricted", "restricted"]
+    sources: tuple[SourceIdentity, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UnsetScopeInput:
+    """The explicit absence of scope intent in one input.
+
+    A fresh unscoped question, a short follow-up, and a search-mode-only
+    change all carry scope intent = UNSET. It is deliberately a distinct type
+    from a clear: "no scope named here" and "clear the scope" are different
+    intents, and collapsing them is what would let a fresh question silently
+    broaden a restriction.
+    """
+
+
+# The singleton every unscoped input carries. Named in the wire-visible sense:
+# the ABSENCE of a scope key in one input, not a cleared scope.
+UNSET_SCOPED_INPUT: Final[UnsetScopeInput] = UnsetScopeInput()
+
+# What an input can name as scope intent: an explicit selection, or unset.
+ScopeScopedInput = ScopeInput | UnsetScopeInput
+
+
+@dataclass(frozen=True, slots=True)
+class SourceScopeRecheck:
+    """The outcome of rechecking a saved snapshot against current authority.
+
+    ``in_force`` is True only when every identity is confirmed NOW — that is
+    the only path from a saved intent to usable authority. ``kind`` is the
+    task failure kind when confirmation failed (``task_dependency_failure``
+    is distinguishable from a definite denial); ``snapshot`` is non-None only
+    when the recheck confirmed the restriction. A failed recheck NEVER
+    returns an unrestricted snapshot: a restriction that current authority no
+    longer supports resolves to nothing usable, never to the whole corpus.
+    """
+
+    snapshot: SourceScopeSnapshot | None
+    kind: str | None
+
+    @property
+    def in_force(self) -> bool:
+        return self.snapshot is not None
+
+
+@runtime_checkable
+class SourceScopeAuthority(Protocol):
+    """The checks a caller must perform before a saved intent is authority.
+
+    The host supplies the implementation; this module owns no store and no
+    permission table. Each method answers about ONE identity:
+
+    * ``identity_exists`` — does any current authority stand behind it?
+    * ``version_current`` — is the saved version still the current one?
+    * ``caller_permitted`` — may THIS caller use this source at all?
+
+    Every method may raise; a raise means the authority could not answer,
+    which is a dependency failure, never a permission answer.
+    """
+
+    def identity_exists(self, source: SourceIdentity) -> bool: ...
+
+    def version_current(self, source: SourceIdentity) -> bool: ...
+
+    def caller_permitted(self, source: SourceIdentity) -> bool: ...
+
+
+@runtime_checkable
+class SourceScopeReader(Protocol):
+    """How a host hands the snapshot its OWN checkpoint already accepted.
+
+    A single method, deliberately: the reader is not a second store and not a
+    second policy. It answers one question — "what snapshot, if any, is
+    committed on this thread?" — and the caller still validates the answer
+    through :func:`validate_source_scope` and re-asks current authority
+    through :func:`recheck_scope` before any read honours it.
+
+    The contract for implementations:
+
+    * ``None`` means NO snapshot has ever been accepted on that thread, which
+      is the pre-scope posture, not a cleared restriction (a clear is a real
+      ``mode="unrestricted"`` snapshot, never an absent one);
+    * the value is returned VERBATIM. A reader must not repair, default, or
+      reinterpret it — an unreadable value is a named cause the caller must
+      surface, and repairing it here would reintroduce exactly the silent
+      widening this protocol exists to prevent;
+    * it raises rather than answering when the channel cannot be read. A
+      fault is not an absence, and the caller treats the two differently.
+    """
+
+    def __call__(self, thread_id: str) -> dict[str, Any] | None: ...
+
+
+def unrestricted_scope(*, accepted_input_version: int) -> SourceScopeSnapshot:
+    """The explicit unrestricted snapshot — the shape a clear writes.
+
+    Pure construction: it carries no permission, and ``accepted_input_version``
+    only records which accepted input established the intent.
+    """
+    return SourceScopeSnapshot(
+        schema_version=SOURCE_SCOPE_SCHEMA_VERSION,
+        mode="unrestricted",
+        sources=(),
+        accepted_input_version=accepted_input_version,
+    )
+
+
+def restricted_scope(
+    sources: Sequence[SourceIdentity], *, accepted_input_version: int
+) -> SourceScopeSnapshot:
+    """The restricted snapshot for ``sources``, or a typed error.
+
+    Construction goes through the same validation as the wire round-trip, so
+    a builder and a reader can never disagree about what a valid snapshot is.
+    Duplicates collapse first (naming a source twice is one intent), and an
+    empty selection is ``task_input_invalid`` — never a silent unrestricted.
+    """
+    ordered: list[SourceIdentity] = []
+    for source in sources:
+        if source not in ordered:
+            ordered.append(source)
+    return SourceScopeSnapshot.from_state_dict(
+        {
+            "schema_version": SOURCE_SCOPE_SCHEMA_VERSION,
+            "mode": "restricted",
+            "sources": [source.to_state_dict() for source in ordered],
+            "accepted_input_version": accepted_input_version,
+        }
+    )
+
+
+def validate_source_scope(raw: object) -> SourceScopeValidation:
+    """The snapshot ``raw`` carries, with failures as CODES, not exceptions.
+
+    The semantic validator for callers that branch on the reason (Runtime's
+    proposal admission). It performs no source I/O and raises nothing: the
+    same rules as :meth:`SourceScopeSnapshot.from_state_dict`, delivered as a
+    value.
+    """
+    try:
+        return SourceScopeValidation(
+            snapshot=SourceScopeSnapshot.from_state_dict(raw), code=None, kind=None,
+        )
+    except TaskRuntimeError as exc:
+        code = exc.detail.get("code")
+        return SourceScopeValidation(
+            snapshot=None,
+            code=code if isinstance(code, str) else SCOPE_SNAPSHOT_NOT_AN_OBJECT,
+            kind=exc.kind,
+        )
+
+
+def scope_from_candidates(
+    candidates: Sequence[SourceIdentity], *, accepted_input_version: int
+) -> SourceScopeSnapshot | None:
+    """The proposal a confirmed document choice implies, or ``None``.
+
+    A REQUEST for Runtime to accept — never the write itself, and never a
+    mutation of the stored snapshot (pending candidates are not durable user
+    preferences). ``None`` means no proposal: with no candidate there is
+    nothing to accept, and an empty restricted selection is invalid rather
+    than silently reinterpreted as unrestricted.
+    """
+    if not candidates:
+        return None
+    return restricted_scope(candidates, accepted_input_version=accepted_input_version)
+
+
+def replace_scope(
+    previous: SourceScopeSnapshot,
+    /,
+    *,
+    requested: ScopeScopedInput,
+    accepted_input_version: int,
+) -> SourceScopeSnapshot:
+    """The snapshot after one accepted input, under the transition table.
+
+    The transition rules, frozen by the shared contract:
+
+    * ``requested is UNSET_SCOPED_INPUT`` (a fresh unscoped question, a short
+      follow-up, a search-mode-only change) KEEPS the previous restriction —
+      never a silent broadening — while ``accepted_input_version`` becomes the
+      authoritative new value the caller supplies (the accepted input is real;
+      it just names no scope).
+    * an explicit :class:`ScopeInput` replaces the selection only because the
+      caller accepted it; this function does not accept, it projects.
+    * a clear is not represented here: :func:`clear_scope` writes it, as an
+      explicit ``mode="unrestricted"`` key, never an omitted one.
+
+    Pending candidates change nothing here: a proposal exists only through
+    :func:`scope_from_candidates`, and until Runtime accepts it the previous
+    snapshot is the snapshot.
+    """
+    if isinstance(requested, UnsetScopeInput):
+        return dataclass_replace(previous, accepted_input_version=accepted_input_version)
+    return SourceScopeSnapshot.from_state_dict(
+        {
+            "schema_version": SOURCE_SCOPE_SCHEMA_VERSION,
+            "mode": requested.mode,
+            "sources": [source.to_state_dict() for source in requested.sources],
+            "accepted_input_version": accepted_input_version,
+        }
+    )
+
+
+def clear_scope(
+    previous: SourceScopeSnapshot, /, *, accepted_input_version: int
+) -> SourceScopeSnapshot:
+    """The EXPLICIT unrestricted snapshot a cleared restriction writes.
+
+    A clear is an explicit key, never an omitted one: the result is a real
+    ``mode="unrestricted"`` snapshot with ``sources=()`` and its own accepted
+    input version, distinguishable from "this input named no scope" (which
+    keeps the previous restriction via :func:`replace_scope`).
+    """
+    del previous  # the clear is total; the previous value cannot survive in it
+    return unrestricted_scope(accepted_input_version=accepted_input_version)
+
+
+def legacy_document_ids(snapshot: SourceScopeSnapshot) -> tuple[str, ...]:
+    """The DERIVED LEGACY corpus projection of ``snapshot``.
+
+    For a restricted snapshot it lists the corpus identities' ``source_id``
+    values, in order; an attachment-only restriction cannot be expressed and
+    projects to ``()``; unrestricted projects to ``()``. This is a
+    compatibility projection for the existing ``StatusSnapshot.document_ids``
+    reader — NEVER a second authority, and unrestricted access is never
+    inferred from ``()`` when a snapshot is present: the snapshot itself is
+    the decision, and readers must consult ``source_scope`` before attachment
+    choices are enabled.
+    """
+    return tuple(
+        source.source_id
+        for source in snapshot.sources
+        if source.source_kind == "corpus"
+    )
+
+
+def recheck_scope(
+    current: SourceScopeSnapshot,
+    /,
+    *,
+    authority: SourceScopeAuthority,
+) -> SourceScopeRecheck:
+    """Turn a saved intent into usable authority, or name why it cannot.
+
+    This is the ONLY path from a stored snapshot to a permission-bearing
+    answer: ``accepted_input_version`` never confers permission, so every
+    identity is re-asked NOW — does current authority still stand behind it,
+    at the saved version, for this caller. An unresolved identity or version
+    is ``task_applicability_unresolved``; a permission answer of "no" is
+    ``task_permission_denied``; an authority that RAISES is the distinct
+    ``task_dependency_failure`` (an outage is not a denial and not an
+    answer). A failed recheck returns no snapshot — never an unrestricted
+    fallback, which would broaden exactly where the intent narrowed. An
+    unrestricted snapshot names no identities, so there is nothing to
+    recheck and it confirms as itself.
+    """
+    if current.mode != "restricted":
+        return SourceScopeRecheck(snapshot=current, kind=None)
+    for source in current.sources:
+        try:
+            if not authority.identity_exists(source):
+                return SourceScopeRecheck(
+                    snapshot=None, kind=TASK_APPLICABILITY_UNRESOLVED
+                )
+            if not authority.version_current(source):
+                return SourceScopeRecheck(
+                    snapshot=None, kind=TASK_APPLICABILITY_UNRESOLVED
+                )
+            if not authority.caller_permitted(source):
+                return SourceScopeRecheck(
+                    snapshot=None, kind=TASK_PERMISSION_DENIED
+                )
+        except Exception:
+            # EXIT: the authority could not answer this identity. Recorded as
+            # a dependency failure — distinct from a denial — and never
+            # consumed as "answered, allowed".
+            return SourceScopeRecheck(snapshot=None, kind=TASK_DEPENDENCY_FAILURE)
+    return SourceScopeRecheck(snapshot=current, kind=None)
+
+
+__all__ += [
+    "MAX_SCOPE_FIELD_BYTES",
+    "MAX_SCOPE_SOURCES",
+    "SCOPE_SNAPSHOT_FAILURE_KINDS",
+    "SCOPE_SNAPSHOT_INPUT_INVALID",
+    "SCOPE_SNAPSHOT_KIND_UNKNOWN",
+    "SCOPE_SNAPSHOT_MODE_INVALID",
+    "SCOPE_SNAPSHOT_NOT_AN_OBJECT",
+    "SCOPE_SNAPSHOT_SOURCES_INVALID",
+    "SCOPE_SNAPSHOT_SCHEMA_UNSUPPORTED",
+    "SCOPE_SNAPSHOT_VERSION_INVALID",
+    "SOURCE_SCOPE_SCHEMA_VERSION",
+    "UNSET_SCOPED_INPUT",
+    "SourceIdentity",
+    "SourceKind",
+    "SourceScopeAuthority",
+    "SourceScopeReader",
+    "SourceScopeRecheck",
+    "SourceScopeSnapshot",
+    "SourceScopeValidation",
+    "ScopeInput",
+    "ScopeScopedInput",
+    "ScopeSourceKind",
+    "clear_scope",
+    "legacy_document_ids",
+    "replace_scope",
+    "recheck_scope",
+    "restricted_scope",
+    "scope_from_candidates",
+    "unrestricted_scope",
+    "validate_source_scope",
 ]

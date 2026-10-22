@@ -1,6 +1,6 @@
 """The thread-bound attachment storage contract (ADRs 0083/0085/0088).
 
-These cases pin ``fin.host.attachment_store.AttachmentStore`` semantics:
+These cases pin ``fin.host.attachment.attachment_store.AttachmentStore`` semantics:
 liveness arbitration, derived-data-gated ``ready``, restart visibility, and
 thread-cascade deletion. The deletion obligation is one contract with two
 implementations, so the ``store_pair`` fixture runs those cases against both
@@ -26,7 +26,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     AttachmentStoreError,
     AttachmentThreadGoneError,
@@ -113,7 +113,7 @@ def pg(postgres_store_url: str) -> Iterator[tuple[Any, Any]]:
     """Thread store + attachment store on one URL, with row cleanup."""
     import psycopg
 
-    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.attachment.attachment_store import PostgresAttachmentStore
     from fin.host.thread_store import PostgresThreadStore
 
     threads = PostgresThreadStore(postgres_store_url)
@@ -1114,7 +1114,7 @@ def test_postgres_store_satisfies_the_protocol_surface(
     only the in-memory implementation carries would let a real deployment
     answer a delete while leaving bytes owed with no way to finish them.
     """
-    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.attachment.attachment_store import PostgresAttachmentStore
     from fin.host.thread_store import PostgresThreadStore
 
     # The thread schema precedes the attachment schema, exactly as the
@@ -1235,7 +1235,7 @@ def test_postgres_a_second_store_instance_sees_the_ready_version(
     pg: tuple[Any, Any], postgres_store_url: str
 ) -> None:
     """Restart reads the same rows: bytes, version, and index survive."""
-    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.attachment.attachment_store import PostgresAttachmentStore
 
     threads, store = pg
     thread = threads.create_thread(title="pg restart")
@@ -1365,7 +1365,7 @@ def test_postgres_tombstone_obligation_survives_a_new_store_instance(
     pg: tuple[Any, Any], postgres_store_url: str
 ) -> None:
     """A restart reaches the same pending cleanup and can finish it."""
-    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.attachment.attachment_store import PostgresAttachmentStore
 
     threads, store = pg
     thread = threads.create_thread(title="pg tombstone restart")
@@ -1420,7 +1420,7 @@ def test_observation_answer_text_round_trips_on_both_backends(
     """A persisted observation must carry the provider's answer, not only its
     provenance keys, on every backend — equality of the read-back envelope is
     the check that no layer dropped the payload."""
-    from fin.host.attachment_observations import (
+    from fin.host.attachment.attachment_observations import (
         COVERAGE_SCHEMA_VERSION,
         ObservationEnvelope,
     )

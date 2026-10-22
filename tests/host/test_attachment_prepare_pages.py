@@ -50,13 +50,13 @@ from fin.corpus.parsers import (
     PageRegionParser,
     Region,
 )
-from fin.host.attachment_budgets import (
+from fin.host.attachment.attachment_budgets import (
     ATTACHMENT_PAGE_LIMIT_EXCEEDED,
     AttachmentBudgetConfigError,
     AttachmentBudgets,
     required_run_calls,
 )
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_prepare import (
     ATTACHMENT_EMPTY_TEXT,
     ATTACHMENT_INDEX_UNAVAILABLE,
     ATTACHMENT_NOT_TEXT,
@@ -73,7 +73,7 @@ from fin.host.attachment_prepare import (
     SOURCE_UNAVAILABLE,
     corpus_failure_to_attachment_error,
 )
-from fin.host.attachment_store import AttachmentRecord, InMemoryAttachmentStore
+from fin.host.attachment.attachment_store import AttachmentRecord, InMemoryAttachmentStore
 from fin.host.thread_store import InMemoryThreadStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

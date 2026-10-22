@@ -10,19 +10,35 @@
 // Every check reports a verdict. A thrown error inside a check is recorded as
 // a failure for that check id — never a skip, never an aborted run.
 
-// Checks that run on every invocation, in report order.
+// Checks that pin the SHARED chrome every lane's browser lands on, in
+// report order. They read route surfaces, not a turn, so they hold for
+// every scenario.
+//
 // ``1-kb-corpus`` was renamed to ``1-home-chrome`` and
 // ``6-status-strip`` to ``6-boot-status``: ``specs/workbench-
 // retrieve-product-seam.md`` retired the /kb corpus grid and the
 // /monitor status panel (see each check's comment), so the old names
 // pinned surfaces that no longer exist.
-const BASE_CHECK_IDS = [
-  "1-home-chrome",
+const CHROME_CHECK_IDS = ["1-home-chrome", "6-boot-status"];
+
+// Checks that pin a COMPLETED, ANSWERED turn: the answer bubble growing
+// across streamed deltas, its card/trace separation, the folded trace,
+// the prose surviving a reload, and the two scroll-follow invariants.
+//
+// They are declared here, and then SUPPRESSED for a transcript that
+// pauses instead of answering (see ``declaredCheckIds``). That is not a
+// skip: those checks still run in full on the default ``grounded`` lane
+// and on ``bounce``, so the coverage is not lost — it is simply not
+// applicable to a lane whose first send never produces a terminal turn.
+// Leaving them declared-and-failing would report the lane red for a
+// transcript shape it was not written to assert, and weakening their
+// assertions to tolerate a pause would delete exactly the evidence they
+// exist to produce.
+const ANSWER_TURN_CHECK_IDS = [
   "2-stream-no-retract",
   "4-dom-separation",
   "5-trace-collapse",
   "3-reload-persist",
-  "6-boot-status",
 ];
 
 // Runs only when the workspace under test replays a transcript that
@@ -33,17 +49,31 @@ const BASE_CHECK_IDS = [
 const BOUNCE_CHECK_ID = "7-bounce-no-blank";
 const SCROLL_CHECK_ID = "7-stream-scroll-follow";
 const SCROLL_LIFECYCLE_CHECK_ID = "8-scroll-follow-lifecycle";
+const DOCUMENT_CHOICE_CHECK_ID = "7-document-choice-pick";
+
+const BASE_CHECK_IDS = [...CHROME_CHECK_IDS, ...ANSWER_TURN_CHECK_IDS];
 
 /** Ids the runner must see a verdict for, given the same options the
  * check function is called with. An id declared here and missing from
  * the report is a failure, never a skip. */
 export function declaredCheckIds(options = {}) {
   return [
-    ...BASE_CHECK_IDS,
-    ...(options.requireStreamGrowth
-      ? [SCROLL_CHECK_ID, SCROLL_LIFECYCLE_CHECK_ID]
-      : []),
+    ...CHROME_CHECK_IDS,
+    // A transcript that PAUSES for a document choice never reaches a
+    // terminal turn on its first send, so the answered-turn checks have
+    // nothing to read — and the scroll-follow pair, which watch a
+    // streaming answer, nothing to follow. The document-choice check
+    // covers the answer surface itself for this lane (it asserts the
+    // resumed answer renders, reaches the bubble and cites only the
+    // picked source).
+    ...(options.expectDocumentChoice ? [] : ANSWER_TURN_CHECK_IDS),
+    ...(options.expectDocumentChoice
+      ? []
+      : options.requireStreamGrowth
+        ? [SCROLL_CHECK_ID, SCROLL_LIFECYCLE_CHECK_ID]
+        : []),
     ...(options.expectBounce ? [BOUNCE_CHECK_ID] : []),
+    ...(options.expectDocumentChoice ? [DOCUMENT_CHOICE_CHECK_ID] : []),
   ];
 }
 
@@ -68,6 +98,25 @@ export default async function runStreamChecks(page, options = {}) {
     // watch the T3 boundary.
     expectBounce: false,
     bounceQuestion: "What was Apple's total revenue in Q3 2022?",
+    // Opt-in: the workspace under test replays a transcript that pauses
+    // the run on a grounded document choice
+    // (`FIN_SCRIPTED_SCENARIO=document_choice`). Only then can the
+    // browser drive send -> choice card -> pick -> resumed answer, the
+    // GE-4 sequence.
+    expectDocumentChoice: false,
+    // The document-choice lane asks its OWN question: the choice is only
+    // reachable on the ``grounded`` lane, and the rules tier reads this
+    // wording as grounded because it names a company, a metric and a
+    // period. A vaguer question would be answered by the clarify leaf
+    // and the run would never reach the admission point, so the card
+    // would never paint and every assertion below would be vacuous.
+    documentChoiceQuestion: "What was Apple's total revenue in Q3 2022?",
+    // The document-choice card is a HOST-side wait, not a paced stream:
+    // the run pauses on an interrupt and the projection answers a GET.
+    // The resumed leg, however, streams real deltas, so the resumed
+    // answer is watched on the stream poll.
+    documentChoicePollIntervalMs: 150,
+    documentChoicePollCount: 300,
     // The bounce boundary is a handful of paced deltas wide, so it is
     // sampled far tighter than the 1s stream poll.
     bouncePollIntervalMs: 120,
@@ -234,6 +283,59 @@ export default async function runStreamChecks(page, options = {}) {
       const thread = await response.json();
       return thread.in_flight === true;
     }, { baseUrl: cfg.baseUrl, id: threadId });
+  const installBrowserSseObserver = async () =>
+    page.evaluate(() => {
+      window.__finScriptedSseOpenReaders = 0;
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        const response = await originalFetch(...args);
+        if (
+          !String(response.headers.get("content-type") ?? "")
+            .toLowerCase()
+            .includes("text/event-stream") ||
+          !response.body
+        ) {
+          return response;
+        }
+
+        const body = response.body;
+        const getReader = body.getReader.bind(body);
+        Object.defineProperty(body, "getReader", {
+          configurable: true,
+          value: (...readerArgs) => {
+            const reader = getReader(...readerArgs);
+            let open = true;
+            window.__finScriptedSseOpenReaders += 1;
+            const settle = () => {
+              if (!open) return;
+              open = false;
+              window.__finScriptedSseOpenReaders -= 1;
+            };
+            const read = reader.read.bind(reader);
+            reader.read = (...readArgs) =>
+              read(...readArgs).then(
+                (result) => {
+                  if (result.done) settle();
+                  return result;
+                },
+                (error) => {
+                  settle();
+                  throw error;
+                },
+              );
+            const cancel = reader.cancel.bind(reader);
+            reader.cancel = (...cancelArgs) => {
+              settle();
+              return cancel(...cancelArgs);
+            };
+            return reader;
+          },
+        });
+        return response;
+      };
+    });
+  const readBrowserSseOpen = async () =>
+    page.evaluate(() => window.__finScriptedSseOpenReaders > 0);
 
   // specs/workbench-retrieve-product-seam.md SC6/SC7 retired the whole
   // corpus surface: ``/kb`` + its card grid + the ingest control left
@@ -309,6 +411,14 @@ export default async function runStreamChecks(page, options = {}) {
     };
   });
 
+  // The answered-turn checks (2 / 4 / 5 / 3) and the two scroll-follow
+  // checks read a turn that STREAMED TO DONE. A document-choice transcript
+  // pauses on its first send instead, so they have nothing to read; they
+  // are declared out in ``declaredCheckIds`` for that lane and skipped
+  // here. Every other scenario still runs all of them in full.
+  const answeredTurnChecks = !cfg.expectDocumentChoice;
+
+  if (answeredTurnChecks) {
   await check("2-stream-no-retract", async () => {
     await page.getByRole("button", { name: "+ 新建 thread" }).click();
     await page.waitForURL(/\/t\//, { timeout: cfg.navTimeoutMs });
@@ -366,10 +476,11 @@ export default async function runStreamChecks(page, options = {}) {
       },
     };
   });
+  }
 
   // The paced lane samples actual streamed growth, so these checks can
   // distinguish following from a transcript that arrives all at once.
-  if (cfg.requireStreamGrowth) {
+  if (cfg.requireStreamGrowth && answeredTurnChecks) {
     const recordScrollGrowth = (result, sample) => {
       const metrics = sample.metrics;
       result.latestLength = sample.length;
@@ -511,6 +622,35 @@ export default async function runStreamChecks(page, options = {}) {
       if (bottomGap > 3) state.followFailures += 1;
     };
 
+    const observeLifecycleStream = async (box, state, doneCountBefore, threadId) => {
+      let browserStreamOpen = false;
+      let backendCompletedBeforeReplay = false;
+      for (let i = 0; i < cfg.pollCount; i++) {
+        const sample = await nextAssistantGrowth(
+          box,
+          state.latestLength,
+          doneCountBefore,
+        );
+        if (!sample) break;
+        recordLifecycleGrowth(state, sample);
+        browserStreamOpen = await readBrowserSseOpen();
+        const backendInFlight = await readThreadInFlight(threadId);
+        if (browserStreamOpen && backendInFlight === false) {
+          backendCompletedBeforeReplay = true;
+        }
+        if (
+          state.growthSteps >= 2 &&
+          state.overflowSamples >= 2 &&
+          browserStreamOpen
+        ) break;
+        if (sample.completed) break;
+      }
+      return {
+        browserStreamOpenAtResize: state.growthSteps >= 2 && browserStreamOpen,
+        backendCompletedBeforeReplay,
+      };
+    };
+
     const startLifecycleStream = async (route) => {
       if (!route) throw new Error("page.url() is required for scroll lifecycle coverage");
       await page.setViewportSize({ width: 1280, height: 320 });
@@ -527,6 +667,7 @@ export default async function runStreamChecks(page, options = {}) {
       const emptyThread = await scrollMetrics(box);
       const articleCountBefore = await page.locator("article").count();
       const doneCountBefore = await page.getByText("完成").count();
+      await installBrowserSseObserver();
       await sendButton().click();
       const articleAppeared = await waitForMoreArticles(articleCountBefore);
       const state = {
@@ -537,23 +678,12 @@ export default async function runStreamChecks(page, options = {}) {
         maxScrollHeight: emptyThread.scrollHeight,
         maxClientHeight: emptyThread.clientHeight,
       };
-      let inFlight = null;
-      for (let i = 0; i < cfg.pollCount; i++) {
-        const sample = await nextAssistantGrowth(
-          box,
-          state.latestLength,
-          doneCountBefore,
-        );
-        if (!sample) break;
-        recordLifecycleGrowth(state, sample);
-        inFlight = await readThreadInFlight(threadId);
-        if (
-          state.growthSteps >= 2 &&
-          state.overflowSamples >= 2 &&
-          inFlight === true
-        ) break;
-        if (sample.completed) break;
-      }
+      const streamState = await observeLifecycleStream(
+        box,
+        state,
+        doneCountBefore,
+        threadId,
+      );
       return {
         previousThreadPaused: reading.bottomGap > 10,
         emptyThread,
@@ -562,7 +692,7 @@ export default async function runStreamChecks(page, options = {}) {
         box,
         articleAppeared,
         ...state,
-        pendingAtResize: state.growthSteps >= 2 && inFlight === true,
+        ...streamState,
       };
     };
 
@@ -570,7 +700,7 @@ export default async function runStreamChecks(page, options = {}) {
       const viewportBeforeResize = await scrollMetrics(stream.box);
       const oldScroller = await stream.box.elementHandle();
       await page.setViewportSize({ width: 1280, height: 400 });
-      const pendingAfterResize = await readThreadInFlight(stream.threadId);
+      const browserStreamOpenAfterResize = await readBrowserSseOpen();
       const viewportAtResize = await oldScroller.evaluate((el) => ({
         connected: el.isConnected,
         clientHeight: el.clientHeight,
@@ -587,11 +717,11 @@ export default async function runStreamChecks(page, options = {}) {
       }));
       let detachedLatest = detachedBaseline;
       let replacementCurrent = replacementInitial;
-      let oldStreamSettled = false;
+      let browserStreamSettled = false;
       let replacementChanged = false;
       for (let i = 0; i < cfg.pollCount; i++) {
-        const [inFlight, detached, replacement] = await Promise.all([
-          readThreadInFlight(stream.threadId),
+        const [browserStreamOpen, detached, replacement] = await Promise.all([
+          readBrowserSseOpen(),
           oldScroller.evaluate((el) => ({
             connected: el.isConnected,
             scrollTop: el.scrollTop,
@@ -603,8 +733,8 @@ export default async function runStreamChecks(page, options = {}) {
         if (!sameScrollMetrics(replacementInitial, replacement)) {
           replacementChanged = true;
         }
-        if (inFlight === false) {
-          oldStreamSettled = true;
+        if (!browserStreamOpen) {
+          browserStreamSettled = true;
           break;
         }
         await page.waitForTimeout(Math.min(cfg.pollIntervalMs, 100));
@@ -612,14 +742,14 @@ export default async function runStreamChecks(page, options = {}) {
       return {
         viewportBeforeResize,
         viewportAtResize,
-        pendingAfterResize,
+        browserStreamOpenAfterResize,
         replacementRoute,
         replacementInitial,
         replacementCurrent,
         replacementChanged,
         detachedBaseline,
         detachedLatest,
-        oldStreamSettled,
+        browserStreamSettled,
       };
     };
     const lifecycleVerdict = (stream, cleanup, errorCount) => {
@@ -636,20 +766,22 @@ export default async function runStreamChecks(page, options = {}) {
         freshThreadObservedOngoingGrowth: stream.growthSteps >= 2,
         freshThreadFollowedWhileAtBottom:
           stream.overflowSamples >= 2 && stream.followFailures === 0,
+        backendCompletedBeforeBrowserReplay:
+          stream.backendCompletedBeforeReplay,
         resizedMountedScrollerWhileStreamWasPending:
-          stream.pendingAtResize &&
-          cleanup.pendingAfterResize &&
+          stream.browserStreamOpenAtResize &&
+          cleanup.browserStreamOpenAfterResize &&
           cleanup.viewportAtResize.connected &&
           cleanup.viewportAtResize.clientHeight !==
             cleanup.viewportBeforeResize.clientHeight,
         navigatedWhileStreamWasPending:
-          stream.pendingAtResize &&
+          stream.browserStreamOpenAtResize &&
           cleanup.replacementRoute !== stream.streamingRoute,
         detachedScrollerStayedAtPostDetachPosition: detachedScrollStable,
         replacementViewportWasNotMutated:
           !cleanup.replacementChanged &&
           sameScrollMetrics(cleanup.replacementInitial, cleanup.replacementCurrent),
-        oldStreamSettledAfterNavigation: cleanup.oldStreamSettled,
+        browserStreamSettledAfterNavigation: cleanup.browserStreamSettled,
         noPageErrors: errorCount === 0,
       };
       return {
@@ -660,16 +792,17 @@ export default async function runStreamChecks(page, options = {}) {
           growthSteps: stream.growthSteps,
           overflowSamples: stream.overflowSamples,
           followFailures: stream.followFailures,
-          pendingAtResize: stream.pendingAtResize,
+          browserStreamOpenAtResize: stream.browserStreamOpenAtResize,
+          backendCompletedBeforeReplay: stream.backendCompletedBeforeReplay,
           viewportBeforeResize: cleanup.viewportBeforeResize,
-          pendingAfterResize: cleanup.pendingAfterResize,
+          browserStreamOpenAfterResize: cleanup.browserStreamOpenAfterResize,
           viewportAtResize: cleanup.viewportAtResize,
           detachedBaseline: cleanup.detachedBaseline,
           detachedLatest: cleanup.detachedLatest,
           replacementInitial: cleanup.replacementInitial,
           replacementCurrent: cleanup.replacementCurrent,
           replacementChanged: cleanup.replacementChanged,
-          oldStreamSettled: cleanup.oldStreamSettled,
+          browserStreamSettled: cleanup.browserStreamSettled,
           pageErrors: errorCount,
         },
       };
@@ -715,6 +848,7 @@ export default async function runStreamChecks(page, options = {}) {
     };
   }
 
+  if (answeredTurnChecks) {
   await check("4-dom-separation", async () => {
     const domSeparation = await page
       .locator("article")
@@ -782,7 +916,7 @@ export default async function runStreamChecks(page, options = {}) {
     };
   });
 
-  // turn-trace-folds (the tracked change / the tracked change): sibling thinking/tool bursts,
+  // turn-trace-folds: sibling thinking/tool bursts,
   // each collapsed by default once the run ends. Collapsed thinking
   // is header-only (深度思考; no tail preview, no full text);
   // collapsed tools shows the 工具 header (no rows). Expanding
@@ -857,12 +991,14 @@ export default async function runStreamChecks(page, options = {}) {
       },
     };
   });
+  }
 
   // T4: reopening a thread the operator watched stream to `done` runs
   // the GET reconcile through `mergeReconciledTurn`. The observable is
   // not just "prose survives the reload" — it is that the prose never
   // retracts and repaints while the reconcile lands. A single reading
   // after a settle delay cannot see that, so the window is sampled.
+  if (answeredTurnChecks) {
   await check("3-reload-persist", async () => {
     const beforeReload = await readAssistantText();
     await page.reload();
@@ -902,6 +1038,7 @@ export default async function runStreamChecks(page, options = {}) {
       },
     };
   });
+  }
 
   // specs/workbench-retrieve-product-seam.md retired BOTH status
   // surfaces this check used to drive: the sidebar footer strip
@@ -1066,12 +1203,84 @@ export default async function runStreamChecks(page, options = {}) {
     await check("8-scroll-follow-lifecycle", scrollLifecycleCheck);
   }
 
-  // T3: the hidden bounce marker arms the generator's pending reset;
-  // the retry's first non-empty delta carries `reset: true` in the
-  // same frame as its text. `foldLiveAnswer` then accumulates the
-  // retry BEHIND the stale draft, so the bubble converges instead of
-  // retracting. What must never happen between the bounce and the
-  // terminal frame is a shorter — least of all an empty — bubble.
+  const readFinalBounceRun = async () => {
+    const threadId = page.url().slice(`${cfg.baseUrl}/t/`.length);
+    return page.evaluate(async ({ baseUrl, id }) => {
+      const response = await fetch(
+        `${baseUrl}/api/threads/${encodeURIComponent(id)}`,
+      );
+      if (!response.ok) return null;
+      const thread = await response.json();
+      return thread.turns?.at(-1) ?? null;
+    }, { baseUrl: cfg.baseUrl, id: threadId });
+  };
+  const summarizeBounceStates = (seen) => {
+    const painted = seen.findIndex((text) => text.length > 0);
+    const watched = painted < 0 ? [] : seen.slice(painted);
+    const blanked = watched.some((text) => text.length === 0);
+    let shrank = false;
+    let shrankFrom = 0;
+    let shrankTo = 0;
+    for (let i = 1; i < watched.length; i++) {
+      if (watched[i].length < watched[i - 1].length) {
+        shrank = true;
+        shrankFrom = watched[i - 1].length;
+        shrankTo = watched[i].length;
+      }
+    }
+    const draftMarker = "eighty-three billion";
+    return {
+      blanked,
+      shrank,
+      shrankFrom,
+      shrankTo,
+      leakedUngroundedDraft: seen.some((text) => text.includes(draftMarker)),
+    };
+  };
+  const hasSourceReadEvidence = (run) =>
+    run?.status === "done" &&
+    run.tool_summaries?.some((tool) => tool.name === "read_source") &&
+    run.evidence_locators?.some(
+      (locator) => locator.document_id === "AAPL-2022Q3",
+    );
+  const bounceVerdict = (seen, sawDone, sendFailure, finalRun) => {
+    const final = seen[seen.length - 1] ?? "";
+    const summary = summarizeBounceStates(seen);
+    const admittedRetryMarker = "Per AAPL-2022Q3 page";
+    const admittedRetryObserved = final.includes(admittedRetryMarker);
+    const sourceReadObserved = hasSourceReadEvidence(finalRun);
+    const pass =
+      !summary.leakedUngroundedDraft &&
+      sawDone &&
+      !summary.blanked &&
+      !summary.shrank &&
+      seen.length >= 2 &&
+      final.length > 0 &&
+      admittedRetryObserved &&
+      sourceReadObserved;
+    return {
+      pass,
+      detail: {
+        distinctBubbleStates: seen.length,
+        leakedUngroundedDraft: summary.leakedUngroundedDraft,
+        admittedRetryObserved,
+        sourceReadObserved,
+        sawDone,
+        blankedAfterPaint: summary.blanked,
+        shrankAfterPaint: summary.shrank,
+        shrankFrom: summary.shrankFrom,
+        shrankTo: summary.shrankTo,
+        finalLen: final.length,
+        sendFailure,
+      },
+    };
+  };
+
+  // T3: the hidden bounce marker makes the citation gate reject the
+  // first attempt. That unadmitted draft stays private; the browser
+  // observes only the source-backed retry answer and its terminal state.
+  // The bubble must never paint the rejected prose, blank after paint,
+  // or shrink while the admitted answer arrives.
   if (cfg.expectBounce) {
     // Literal, not BOUNCE_CHECK_ID: this function travels to the
     // browser driver as source text, so a module-scope reference here
@@ -1121,50 +1330,497 @@ export default async function runStreamChecks(page, options = {}) {
         await page.waitForTimeout(cfg.bouncePollIntervalMs);
       }
 
-      const painted = seen.findIndex((text) => text.length > 0);
-      const watched = painted < 0 ? [] : seen.slice(painted);
-      const blanked = watched.some((text) => text.length === 0);
-      let shrank = false;
-      let shrankFrom = 0;
-      let shrankTo = 0;
-      for (let i = 1; i < watched.length; i++) {
-        if (watched[i].length < watched[i - 1].length) {
-          shrank = true;
-          shrankFrom = watched[i - 1].length;
-          shrankTo = watched[i].length;
-        }
-      }
-
-      const final = seen[seen.length - 1] ?? "";
-      // The scripted draft is the only prose in this run that quotes
-      // no page, so its presence proves the gate really bounced and
-      // its absence at the end proves the retry replaced it.
-      const draftMarker = "eighty-three billion";
-      const drafted = seen.some((text) => text.includes(draftMarker));
-
-      return {
-        pass:
-          drafted &&
-          sawDone &&
-          !blanked &&
-          !shrank &&
-          final.length > 0 &&
-          !final.includes(draftMarker),
-        detail: {
-          distinctBubbleStates: seen.length,
-          sawUngroundedDraft: drafted,
-          sawDone,
-          blankedAfterPaint: blanked,
-          shrankAfterPaint: shrank,
-          shrankFrom,
-          shrankTo,
-          finalLen: final.length,
-          finalKeptDraft: final.includes(draftMarker),
-          sendFailure,
-        },
-      };
+      const finalRun = await readFinalBounceRun();
+      return bounceVerdict(seen, sawDone, sendFailure, finalRun);
     });
   }
+
+  // T9 / GE-4 (specs/qa-chain-grounded-experience.md:96): the document
+  // choice, driven end to end from the browser.
+  //
+  //   send -> the run pauses -> the card renders its candidates ->
+  //   reload (the projection, not the wire, restores it) ->
+  //   pick -> the SAME run answers inside the picked source.
+  //
+  // Declared conditionally for the same reason as the bounce check: a
+  // lane whose transcript cannot pause would otherwise report a
+  // permanent FAIL for a check it was never asked to run.
+  //
+  // What is asserted, in GE-4's own words:
+  //
+  //   * "<=4 hit-backed candidates have title/section/summary and
+  //     trailing rephrase" — the rows carry a title and a non-empty
+  //     summary, there are 1..4 of them, and exactly one trailing
+  //     换个问法 action sits after them;
+  //   * "browser RELOAD ... preserves the original run/receipt" — the
+  //     card is read again AFTER a reload, from the thread projection,
+  //     and still names the same question and the same origin run id.
+  //     The question's `origin_run_id` is read from the DOM's own
+  //     question id, so the run the operator sees is the run the host
+  //     bound the question to;
+  //   * "PICK ... preserves the original run/receipt and current source
+  //     authority" — after the pick, the thread still names that same
+  //     run id and now carries a restricted scope naming exactly the
+  //     picked candidate's source;
+  //   * "and current source authority" — the resumed answer CITES the
+  //     picked candidate and no other, which is the narrowing observable
+  //     on the operator's screen rather than only in a state field.
+  const documentChoiceAt = async (label, body) => {
+    try {
+      return await body();
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      throw new Error(label + ": " + message.split("\n")[0]);
+    }
+  };
+
+  const documentChoiceCurrentThreadId = () =>
+    page.url().slice((cfg.baseUrl + "/t/").length).split(/[?#]/)[0];
+
+  const readDocumentChoiceProjection = () =>
+    page.evaluate(
+      async ({ baseUrl, threadId }) => {
+        const projectChoiceDetails = (question) => {
+          if (!question) return [];
+          return (question.choice_details || []).map((row) => ({
+            choice_id: row.choice_id,
+            label: row.label,
+            summary: row.summary,
+            section: row.source_ref ? row.source_ref.section : null,
+            source_id: row.source_ref ? row.source_ref.source_id : null,
+          }));
+        };
+        const projectQuestion = (question) => ({
+          question_id: question ? question.question_id : null,
+          purpose: question ? question.purpose : null,
+          origin_run_id: question ? question.origin_run_id : null,
+          prompt: question ? question.prompt : null,
+          choices: question ? question.choices : null,
+          details: projectChoiceDetails(question),
+        });
+        const projectLastInput = (taskRuntime) => {
+          const history =
+            taskRuntime && taskRuntime.input_history
+              ? taskRuntime.input_history
+              : [];
+          return history.length > 0 ? history[history.length - 1] : null;
+        };
+        const projectTurns = (turns) =>
+          (turns || []).map((turn) => ({
+            run_id: turn.run_id,
+            status: turn.status,
+            answer: turn.answer || "",
+            citations: (turn.citations || []).map((citation) => citation.document_id),
+          }));
+
+        const response = await fetch(
+          baseUrl + "/api/threads/" + encodeURIComponent(threadId),
+        );
+        if (!response.ok) return null;
+        const thread = await response.json();
+        const taskRuntime = thread.task_runtime || {};
+        const question = taskRuntime.pending_question || null;
+        return {
+          pending_interrupt_kind: thread.pending_interrupt_kind ?? null,
+          ...projectQuestion(question),
+          scope: thread.source_scope || null,
+          input_version: taskRuntime.input_version,
+          last_input: projectLastInput(taskRuntime),
+          turns: projectTurns(thread.turns),
+        };
+      },
+      { baseUrl: cfg.baseUrl, threadId: documentChoiceCurrentThreadId() },
+    );
+
+  const readDocumentChoiceRows = () =>
+    page.evaluate(() => {
+      const node = document.querySelector(
+        '[data-testid="document-choice-card"]',
+      );
+      if (!node) return [];
+
+      const readText = (prefix, choiceId) => {
+        const element = Array.from(node.querySelectorAll("[data-testid]")).find(
+          (candidate) =>
+            candidate.getAttribute("data-testid") === prefix + choiceId,
+        );
+        return element ? (element.textContent || "").trim() : null;
+      };
+      const isChoiceButton = (button) =>
+        (button.getAttribute("data-testid") || "").startsWith(
+          "document-choice-row-",
+        );
+      const projectChoiceButton = (button) => {
+        const testid = button.getAttribute("data-testid") || "";
+        const choiceId = testid.slice("document-choice-row-".length);
+        return {
+          choice_id: choiceId,
+          title: readText("document-choice-title-", choiceId) || "",
+          summary: readText("document-choice-summary-", choiceId) || "",
+          section: readText("document-choice-section-", choiceId),
+        };
+      };
+      return Array.from(node.querySelectorAll("button"))
+        .filter(isChoiceButton)
+        .map(projectChoiceButton);
+    });
+
+  const documentChoiceCard = () =>
+    page.locator('[data-testid="document-choice-card"]');
+  const documentChoicePrompt = () =>
+    page.locator('[data-testid="document-choice-prompt"]');
+  const documentChoiceRephrase = () =>
+    page.locator('[data-testid="document-choice-rephrase"]');
+
+  const defaultCopyIsSafe = (text) =>
+    !/\b(?:document_id|list_files|10-Q|XBRL)\b/i.test(text) &&
+    !/\b[A-Z]{2,6}-\d{4}Q[1-4]\b/.test(text);
+
+  const documentChoiceCardInvariants = ({ rows, paused }) => ({
+    everyCandidateHasReadableTitle: rows.every(
+      (row) =>
+        /Apple Inc\./.test(row.title) &&
+        /202[23] Q[1-4]/.test(row.title) &&
+        defaultCopyIsSafe(row.title),
+    ),
+    everyCandidateHasReadableSection: rows.every(
+      (row) =>
+        /^Item\s+\d+[A-Z]?\.\s+\S/i.test(row.section || "") &&
+        defaultCopyIsSafe(row.section || ""),
+    ),
+    candidateTitlesDistinguishPeriods:
+      new Set(rows.map((row) => row.title)).size === rows.length,
+    everyCandidateHasInformativeSummary: rows.every(
+      (row) =>
+        ((/2022 Q3/.test(row.title) &&
+          row.summary ===
+            "资料中列出了“Products $ 63,355 $ 63,948 $ 245,241 $ 232,309”。") ||
+          (/2023 Q3/.test(row.title) &&
+            row.summary ===
+              "资料中列出了“Products $ 60,584 $ 63,355 $ 230,901 $ 245,241”。")) &&
+        defaultCopyIsSafe(row.summary),
+    ),
+    projectedReadableChoicesMatchDom:
+      paused !== null &&
+      paused.details.length === rows.length &&
+      paused.details.every(
+        (row, index) =>
+          row.label === rows[index].title &&
+          row.summary === rows[index].summary &&
+          defaultCopyIsSafe(row.label + row.summary),
+      ),
+  });
+
+  const documentChoiceAnswerInvariants = ({ turn, answered }) => ({
+    answerHasReadableSourceLabel:
+      turn !== null &&
+      turn.answer.includes("AAPL · 2022 Q3") &&
+      answered.includes("AAPL · 2022 Q3"),
+    defaultAnswerHasNoInternalOrBoilerplateLabels:
+      turn !== null &&
+      defaultCopyIsSafe(turn.answer) &&
+      defaultCopyIsSafe(answered),
+    answerQuotesRelevantSourceRow:
+      turn !== null &&
+      turn.answer.includes("Total net sales 82,959 81,434 304,182 282,457"),
+  });
+
+  const documentChoiceVisibleInvariants = ({
+    rows,
+    cardPresentBeforePick,
+    rephrasePresentBeforePick,
+    rephraseText,
+    promptText,
+  }) => ({
+    cardRendered: cardPresentBeforePick,
+    candidateCountWithinCap: rows.length >= 1 && rows.length <= 4,
+    trailingRephrasePresent:
+      rephrasePresentBeforePick && rephraseText.length > 0,
+    promptRendered: promptText.length > 0,
+  });
+
+  const documentChoicePauseInvariants = ({ rows, paused }) => ({
+    pausedOnDocumentChoice:
+      paused !== null && paused.purpose === "document_choice",
+    pausedInterruptKind:
+      paused !== null &&
+      paused.pending_interrupt_kind === "document_choice",
+    projectedCandidateCountMatchesDom:
+      paused !== null &&
+      paused.details.length === rows.length &&
+      rows.length > 0,
+    projectedCandidateIdsMatchDom:
+      paused !== null &&
+      paused.details.length > 0 &&
+      JSON.stringify(paused.details.map((row) => row.choice_id)) ===
+        JSON.stringify(rows.map((row) => row.choice_id)),
+    everyProjectedCandidateHasSummary:
+      paused !== null &&
+      paused.details.every((row) => row.summary.length > 0),
+  });
+
+  const documentChoiceReloadInvariants = ({
+    rows,
+    promptText,
+    reloadedRows,
+    reloadedPrompt,
+    afterReload,
+    paused,
+  }) => ({
+    reloadKeptTheCard: reloadedRows.length === rows.length,
+    reloadKeptTheQuestion:
+      reloadedPrompt === promptText && reloadedPrompt.length > 0,
+    reloadKeptTheRun:
+      afterReload !== null &&
+      paused !== null &&
+      afterReload.origin_run_id === paused.origin_run_id &&
+      afterReload.question_id === paused.question_id &&
+      afterReload.origin_run_id !== null,
+  });
+
+  const documentChoicePickInvariants = ({ paused, resumed }) => ({
+    pickAcceptedOnce:
+      resumed !== null &&
+      resumed.last_input !== null &&
+      resumed.last_input.kind === "reply",
+    pickDidNotAdvanceTwice:
+      paused !== null &&
+      resumed !== null &&
+      typeof resumed.input_version === "number" &&
+      resumed.input_version <= paused.input_version + 1,
+  });
+
+  const documentChoiceScopeInvariants = ({ rows, paused, resumed }) => ({
+    scopeRestrictedToThePickedSource:
+      resumed !== null &&
+      paused !== null &&
+      paused.details.length > 0 &&
+      resumed.scope !== null &&
+      resumed.scope.mode === "restricted" &&
+      resumed.scope.sources.length === 1 &&
+      resumed.scope.sources[0].source_id === paused.details[0].source_id,
+  });
+
+  const documentChoiceAuthorityInvariants = ({ paused, turn }) => ({
+    answerConfinedToThePickedSource:
+      turn !== null &&
+      paused !== null &&
+      paused.details.length > 0 &&
+      turn.citations.length > 0 &&
+      turn.citations.every(
+        (documentId) => documentId === paused.details[0].source_id,
+      ),
+  });
+
+  const documentChoiceAnswerSurfaceInvariants = ({
+    turn,
+    answered,
+    cardClosedAfterThePick,
+  }) => ({
+    answerRendered: turn !== null && turn.answer.trim().length > 0,
+    answerReachedTheBubble: answered.length > 0,
+    cardClosedAfterThePick,
+  });
+
+  const documentChoiceFieldOrNull = (source, field) =>
+    source ? source[field] : null;
+
+  const documentChoiceFirstSourceId = (paused) => {
+    const first = paused && paused.details && paused.details[0];
+    return documentChoiceFieldOrNull(first, "source_id");
+  };
+
+  const documentChoiceAnswerSnippet = (turn) =>
+    turn ? turn.answer.slice(0, 160) : null;
+
+  const documentChoiceDetail = (state) => {
+    return {
+      invariants: state.invariants,
+      rows: state.rows,
+      reloadedRows: state.reloadedRows,
+      promptText: state.promptText,
+      rephraseText: state.rephraseText,
+      pausedQuestionId: documentChoiceFieldOrNull(
+        state.paused,
+        "question_id",
+      ),
+      pausedOriginRunId: documentChoiceFieldOrNull(
+        state.paused,
+        "origin_run_id",
+      ),
+      pickedChoiceId: state.picked.choice_id,
+      pickedSourceId: documentChoiceFirstSourceId(state.paused),
+      afterReloadQuestionId: documentChoiceFieldOrNull(
+        state.afterReload,
+        "question_id",
+      ),
+      afterReloadOriginRunId: documentChoiceFieldOrNull(
+        state.afterReload,
+        "origin_run_id",
+      ),
+      resumedRunId: documentChoiceFieldOrNull(state.turn, "run_id"),
+      resumedAnswer: documentChoiceAnswerSnippet(state.turn),
+      resumedCitations: documentChoiceFieldOrNull(state.turn, "citations"),
+      resumedInputVersion: documentChoiceFieldOrNull(
+        state.resumed,
+        "input_version",
+      ),
+      resumedScope: documentChoiceFieldOrNull(state.resumed, "scope"),
+      bubbleLength: state.answered.length,
+    };
+  };
+
+  const documentChoiceOutcome = (state) => {
+    const invariants = {
+      ...documentChoiceVisibleInvariants(state),
+      ...documentChoiceCardInvariants(state),
+      ...documentChoicePauseInvariants(state),
+      ...documentChoiceReloadInvariants(state),
+      ...documentChoicePickInvariants(state),
+      ...documentChoiceScopeInvariants(state),
+      ...documentChoiceAuthorityInvariants(state),
+      ...documentChoiceAnswerInvariants(state),
+      ...documentChoiceAnswerSurfaceInvariants(state),
+    };
+    return {
+      pass: Object.values(invariants).every(Boolean),
+      detail: documentChoiceDetail({ ...state, invariants }),
+    };
+  };
+
+  const openDocumentChoice = async () => {
+    await documentChoiceAt("goto home", () =>
+      page.goto(cfg.baseUrl + "/", { timeout: cfg.navTimeoutMs }),
+    );
+    await documentChoiceAt("click 新建 thread", () =>
+      page
+        .getByRole("button", { name: "+ 新建 thread" })
+        .click({ timeout: cfg.navTimeoutMs }),
+    );
+    await documentChoiceAt("await thread url", () =>
+      page.waitForURL(/\/t\//, { timeout: cfg.navTimeoutMs }),
+    );
+    await documentChoiceAt("arm composer", () =>
+      fillAndArm(cfg.documentChoiceQuestion),
+    );
+    await documentChoiceAt("click 发送", () =>
+      sendButton().click({ timeout: cfg.navTimeoutMs }),
+    );
+    await documentChoiceAt("await document choice card", () =>
+      page.waitForSelector('[data-testid="document-choice-card"]', {
+        timeout: cfg.navTimeoutMs,
+      }),
+    );
+
+    const rows = await readDocumentChoiceRows();
+    const promptText = ((await documentChoicePrompt().textContent()) ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const rephraseText = ((await documentChoiceRephrase().textContent()) ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const cardPresentBeforePick =
+      (await documentChoiceCard().count()) === 1;
+    const rephrasePresentBeforePick =
+      (await documentChoiceRephrase().count()) === 1;
+    const paused = await readDocumentChoiceProjection();
+    return {
+      rows,
+      promptText,
+      rephraseText,
+      cardPresentBeforePick,
+      rephrasePresentBeforePick,
+      paused,
+    };
+  };
+
+  const reloadDocumentChoice = async (state) => {
+    await documentChoiceAt("reload", () => page.reload());
+    await documentChoiceAt("await card after reload", () =>
+      page.waitForSelector('[data-testid="document-choice-card"]', {
+        timeout: cfg.navTimeoutMs,
+      }),
+    );
+    return {
+      reloadedRows: await readDocumentChoiceRows(),
+      reloadedPrompt: ((await documentChoicePrompt().textContent()) ?? "")
+        .replace(/\s+/g, " ")
+        .trim(),
+      afterReload: await readDocumentChoiceProjection(),
+      promptText: state.promptText,
+      rows: state.rows,
+    };
+  };
+
+  const pickDocumentChoice = async (rows) => {
+    const picked = rows[0];
+    await documentChoiceAt("click candidate row", () =>
+      page
+        .locator(
+          "[data-testid=\"document-choice-row-" + picked.choice_id + "\"]",
+        )
+        .click({ timeout: cfg.navTimeoutMs }),
+    );
+    await documentChoiceAt("click 提交选择", () =>
+      page
+        .locator('[data-testid="document-choice-submit"]')
+        .click({ timeout: cfg.navTimeoutMs }),
+    );
+    return picked;
+  };
+
+  const findDocumentChoiceTurn = (projection, originRunId) => {
+    if (!originRunId || !projection) return null;
+    return projection.turns.find((row) => row.run_id === originRunId) || null;
+  };
+
+  const pollDocumentChoiceCompletion = async (originRunId) => {
+    for (let i = 0; i < cfg.documentChoicePollCount; i++) {
+      const projection = await readDocumentChoiceProjection();
+      const candidate = findDocumentChoiceTurn(projection, originRunId);
+      const cardGone = (await documentChoiceCard().count()) === 0;
+      if (candidate && candidate.status === "done" && cardGone) {
+        return projection;
+      }
+      await page.waitForTimeout(cfg.documentChoicePollIntervalMs);
+    }
+    return null;
+  };
+
+  const readDocumentChoiceCompletion = async (originRunId) => {
+    const polled = await pollDocumentChoiceCompletion(originRunId);
+    const resumed = polled || (await readDocumentChoiceProjection());
+    const turn = findDocumentChoiceTurn(resumed, originRunId) || null;
+    return { resumed, turn };
+  };
+
+  const runDocumentChoiceWorkflow = async () => {
+    const opened = await openDocumentChoice();
+    const reloaded = await reloadDocumentChoice(opened);
+    const picked = await pickDocumentChoice(opened.rows);
+    const originRunId = opened.paused ? opened.paused.origin_run_id : null;
+    const { resumed, turn } =
+      await readDocumentChoiceCompletion(originRunId);
+    const answered = await readAssistantText();
+    const cardClosedAfterThePick =
+      (await documentChoiceCard().count()) === 0;
+    return documentChoiceOutcome({
+      ...opened,
+      ...reloaded,
+      picked,
+      resumed,
+      turn,
+      answered,
+      cardClosedAfterThePick,
+    });
+  };
+
+  const maybeRunDocumentChoiceCheck = async () => {
+    if (!cfg.expectDocumentChoice) return;
+    await check("7-document-choice-pick", runDocumentChoiceWorkflow);
+  };
+
+  await maybeRunDocumentChoiceCheck();
 
   return {
     baseUrl: cfg.baseUrl,

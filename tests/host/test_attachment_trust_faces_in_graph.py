@@ -3,8 +3,8 @@
 Spec ``specs/thread-attachment-source-read.md`` (host-validated ownership
 and parsed-content version before a citation stands) pinned where identity
 is actually granted: ``compile_graph`` built with the REAL
-:class:`fin.host.attachment_source_read.AttachmentSourceReader` over
-:class:`fin.host.attachment_store.InMemoryAttachmentStore`, plus an
+:class:`fin.host.attachment.attachment_source_read.AttachmentSourceReader` over
+:class:`fin.host.attachment.attachment_store.InMemoryAttachmentStore`, plus an
 attachment search port. No hand-rolled reader stands in for the two faces
 the graph asks — ``owned_record`` (which grants a citation its filename and
 presentation) and ``identity_is_current`` (the gate's currency re-check) —
@@ -29,10 +29,10 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_retrieval import AttachmentChunk, AttachmentLocator
-from fin.host.attachment_source_read import AttachmentSourceReader
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_retrieval import AttachmentChunk, AttachmentLocator
+from fin.host.attachment.attachment_source_read import AttachmentSourceReader
+from fin.host.attachment.attachment_store import (
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
 )

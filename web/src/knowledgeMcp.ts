@@ -58,10 +58,80 @@ function asMember<T extends string>(
   return typeof value === "string" && values.has(value) ? (value as T) : null;
 }
 
+function isValidRunCount(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
+function parseWorkspaceStatusStates(
+  obj: Record<string, unknown>,
+): Pick<WorkspaceStatus, "knowledge_mcp" | "retrieve_adapter_kind"> | null {
+  const mcp = asMember<WorkspaceStatus["knowledge_mcp"]>(
+    obj.knowledge_mcp,
+    STATES,
+  );
+  const adapterKind = asMember<WorkspaceStatus["retrieve_adapter_kind"]>(
+    obj.retrieve_adapter_kind,
+    ADAPTER_KINDS,
+  );
+  if (mcp === null || adapterKind === null) return null;
+  return { knowledge_mcp: mcp, retrieve_adapter_kind: adapterKind };
+}
+
+function parseWorkspaceStatusMetadata(
+  obj: Record<string, unknown>,
+): Pick<
+  WorkspaceStatus,
+  "model_identity" | "corpus_filing_count" | "bound_collection_name"
+> | null {
+  const model = obj.model_identity;
+  const count = obj.corpus_filing_count;
+  const bound = obj.bound_collection_name;
+  if (
+    typeof model !== "string" ||
+    typeof count !== "number" ||
+    !Number.isFinite(count) ||
+    typeof bound !== "string" ||
+    bound.length === 0
+  ) {
+    return null;
+  }
+  return {
+    model_identity: model,
+    corpus_filing_count: count,
+    bound_collection_name: bound,
+  };
+}
+
+function parseWorkspaceRunCounts(raw: unknown): WorkspaceStatus["run_counts"] | null {
+  if (
+    typeof raw !== "object" ||
+    raw === null ||
+    Array.isArray(raw)
+  ) {
+    return null;
+  }
+  const counts = raw as Record<string, unknown>;
+  const active = counts.active;
+  const paused = counts.paused;
+  const suspectedStuck = counts.suspected_stuck;
+  if (
+    !isValidRunCount(active) ||
+    !isValidRunCount(paused) ||
+    !isValidRunCount(suspectedStuck)
+  ) {
+    return null;
+  }
+  return { active, paused, suspected_stuck: suspectedStuck };
+}
+
 /**
  * Defensive parse of the ``GET /api/status`` body.
  *
- * Returns ``null`` for anything that is not the pinned five-field set.
+ * Returns ``null`` for anything that is not the pinned status field set.
  * The retired ``retrieve_reachability`` field and any unknown
  * ``knowledge_mcp`` value are REJECTED, never coerced: a line that
  * vouches for a port it cannot read is worse than one that says
@@ -79,28 +149,13 @@ export function parseWorkspaceStatus(raw: unknown): WorkspaceStatus | null {
   // Reject the retired two-state payload outright rather than
   // falling back to it.
   if ("retrieve_reachability" in obj) return null;
-  const mcp = asMember<WorkspaceStatus["knowledge_mcp"]>(
-    obj.knowledge_mcp,
-    STATES,
-  );
-  const adapterKind = asMember<WorkspaceStatus["retrieve_adapter_kind"]>(
-    obj.retrieve_adapter_kind,
-    ADAPTER_KINDS,
-  );
-  const model = obj.model_identity;
-  const count = obj.corpus_filing_count;
-  const bound = obj.bound_collection_name;
-  if (mcp === null || adapterKind === null) return null;
-  if (typeof model !== "string") return null;
-  if (typeof count !== "number" || !Number.isFinite(count)) return null;
-  if (typeof bound !== "string" || bound.length === 0) return null;
-  return {
-    knowledge_mcp: mcp,
-    retrieve_adapter_kind: adapterKind,
-    model_identity: model,
-    corpus_filing_count: count,
-    bound_collection_name: bound,
-  };
+  const states = parseWorkspaceStatusStates(obj);
+  if (states === null) return null;
+  const metadata = parseWorkspaceStatusMetadata(obj);
+  if (metadata === null) return null;
+  const runCounts = parseWorkspaceRunCounts(obj.run_counts);
+  if (runCounts === null) return null;
+  return { ...states, ...metadata, run_counts: runCounts };
 }
 
 /**

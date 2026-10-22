@@ -26,7 +26,7 @@ from fin.host.compile import (
     compile_for_runtime,
     compile_for_runtime_dev,
 )
-from fin.host.jev_choice import JevChoiceClient
+from fin.host.question.jev_choice import JevChoiceClient
 
 
 # ----- fake runtime deps -----
@@ -115,7 +115,7 @@ def test_compile_for_runtime_threads_no_json_classify_model(
     cascade uses; a separate MiniMax model seam would be a second,
     silent classifier nobody asked for.
     """
-    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-soft-track-model")
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.delenv("FIN_API_KEY", raising=False)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
@@ -153,7 +153,7 @@ def test_compile_for_runtime_dev_threads_no_json_classify_model(
 ) -> None:
     """``compile_for_runtime_dev`` holds the same contract: the dev boot
     exercises production's single-judge wiring, not a second model."""
-    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-soft-track-model")
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.delenv("FIN_API_KEY", raising=False)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
@@ -220,7 +220,7 @@ def test_compile_for_runtime_threads_jev_client_when_key_present(
     ``compile_graph`` a real ``JevChoiceClient`` for the gray zone."""
     _clear_jev_env(monkeypatch)
     monkeypatch.setenv("FIN_JEV_API_KEY", "test-only-not-a-real-key")
-    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-soft-track-model")
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
@@ -244,7 +244,7 @@ def test_compile_for_runtime_dev_jev_client_none_when_key_missing(
     """Missing key → ``jev_client=None``: the cascade fail-closes to
     clarify at the gray zone — no MiniMax fallback is wired (ADR 0080)."""
     _clear_jev_env(monkeypatch)
-    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-soft-track-model")
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
 
@@ -268,7 +268,7 @@ def test_compile_for_runtime_dev_threads_jev_client_when_key_present(
     client, so the dev boot exercises the same gray-zone tier."""
     _clear_jev_env(monkeypatch)
     monkeypatch.setenv("FIN_JEV_API_KEY", "test-only-not-a-real-key")
-    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-soft-track-model")
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
 
     _install_fake_langchain_openai(monkeypatch, {})
@@ -290,7 +290,7 @@ def test_compile_for_runtime_jev_client_none_when_key_missing(
     """Runtime mirror of the dev contract: key missing → ``None`` client,
     the gray zone fail-closes to clarify with no fallback wired."""
     _clear_jev_env(monkeypatch)
-    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-soft-track-model")
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 

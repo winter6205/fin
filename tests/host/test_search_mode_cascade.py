@@ -6,7 +6,7 @@ live LLM (mirrors ``test_soft_track_ship.py``).
 
 Five boundary classes (spec Boundaries "Test classes"), mapped to names:
 
-* empty      -> ``test_empty_utterance_residual_clarifies_without_inventing_c``
+* empty      -> ``test_empty_utterance_residual_falls_back_without_calling_the_judge``
 * negative   -> ``test_jev_label_outside_the_closed_set_is_a_typed_exit`` /
                 ``test_invalid_pin_is_typed_exit_and_falls_through``
                 (the two assignment-flip tests
@@ -14,6 +14,13 @@ Five boundary classes (spec Boundaries "Test classes"), mapped to names:
                 and ``test_pin_of_real_db_tier_is_now_assigned_not_a_typed_fail``
                 record that with the refusal table empty only
                 out-of-closed-set input stays a negative)
+
+The residual is a RECORDED POLICY DEFAULT, not a window: when neither rules
+nor inheritance nor an accepted judge answer decides, the cascade assigns
+``graph`` at the ``fallback`` tier with ``confidence=0.0`` and NO mode
+options (ADR 0104 / spec search-mode-host contract item 5). An EXPLICIT
+selection that was rejected keeps its named rejection instead (contract item
+2): the residual never reinterprets a refused pin as a fallback answer.
 * overflow   -> ``test_cascade_has_no_step_cap_of_its_own`` /
                 ``test_snapshot_inherit_does_not_wipe_history``
 * concurrent -> ``test_mode_channel_does_not_leak_across_threads`` (the
@@ -31,9 +38,9 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-import fin.host.search_mode_decision as smd
+import fin.host.grounded.search_mode_decision as smd
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.jev_choice import (
+from fin.host.question.jev_choice import (
     JEV_CHOICE_EXIT_INVALID_SEARCH_MODE,
     JEV_CHOICE_EXIT_LOW_CONFIDENCE,
     JEV_CHOICE_EXIT_SCHEMA,
@@ -48,7 +55,7 @@ from fin.host.named_failures import (
 )
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.named_failures import LASTING_RETRIEVE_TIERS
-from fin.host.search_mode_decision import (
+from fin.host.grounded.search_mode_decision import (
     MODE_LABELS,
     clarify_options,
     decide_search_mode,
@@ -122,20 +129,29 @@ def test_rules_assign_mode_from_context_label() -> None:
 
 def test_two_different_named_tiers_stay_ambiguous_not_first_match() -> None:
     """Boundary: a naming that cannot uniquely name one 档 is ambiguous —
-    rules must not pick one and silently call it high-confidence."""
+    rules must not pick one and silently call it high-confidence.
+
+    The ambiguity is then resolved by POLICY, not by a window: the residual
+    assigns the recorded default (``graph``) at the ``fallback`` tier and
+    keeps the ambiguity marker on the audit.
+    """
     decision = decide_search_mode(_msgs("lexical档还是graph档？"))
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.search_mode == "graph"
+    assert decision.decision_tier == "fallback"
+    assert decision.confidence == 0.0
+    assert decision.options == []
     assert decision.signals.get("ambiguous_naming") == ["lexical", "graph"]
 
 
 def test_a_letter_next_to_the_marker_names_no_tier() -> None:
     """Zero coexistence at the rules tier: a retired single letter next to
     档 is ordinary prose — rules neither assign nor mark ambiguity, the ask
-    falls through like any unnamed one."""
+    falls through to the recorded default like any unnamed one."""
     decision = decide_search_mode(_msgs("A档还是B档？"))
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.search_mode == "graph"
+    assert decision.decision_tier == "fallback"
+    assert decision.confidence == 0.0
+    assert decision.options == []
     assert "ambiguous_naming" not in decision.signals
     assert "tier_naming" not in decision.signals
 
@@ -212,7 +228,7 @@ def test_pin_of_the_global_tier_is_now_assigned_not_a_typed_fail() -> None:
     """Boundary flipped by opening global (fin task 4): pin 综述 no longer
     exits 具名失败 档未开 — the cascade assigns the LASTING token at the
     rules tier, exactly as it assigns graph/lexical. This is the opposite
-    of the old 「不 invent 档」 failure; the tracked change T7 flipped the ``sql`` pin the
+    of the old 「不 invent 档」 failure; T7 flipped the ``sql`` pin the
     same way (next test), so NO closed-set pin can produce a typed fail."""
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="global"
@@ -224,7 +240,7 @@ def test_pin_of_the_global_tier_is_now_assigned_not_a_typed_fail() -> None:
 
 
 def test_pin_of_real_db_tier_is_now_assigned_not_a_typed_fail() -> None:
-    """Flipped by the tracked change T7 (commit 6e8ed97): the old pin asserted
+    """Flipped by T7 (commit 6e8ed97): the old pin asserted
     ``typed_fail`` carrying ``real_db_not_wired`` — the 「真库未接」 exit
     distinct from 「档未开」. Opening sql emptied the refusal table, so
     the pin now assigns the LASTING token at the rules tier exactly like
@@ -244,13 +260,53 @@ def test_pin_of_real_db_tier_is_now_assigned_not_a_typed_fail() -> None:
 def test_invalid_pin_is_typed_exit_and_falls_through() -> None:
     """A pin outside the closed set is a named ``invalid_search_mode``
     EXIT: recorded, then the cascade continues — never a crash, never
-    an invented 档."""
+    an invented 档.
+
+    At the residual the rejection stays NAMED (spec contract item 2: the
+    fallback does not silently reinterpret a refused explicit selection):
+    the decision is a typed fail carrying the same code, the 档 stays
+    ``None`` (so the port is handed ``None`` and keeps its own named
+    rejection), and NO fallback answer is produced for it.
+    """
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="E"
     )
     assert decision.search_mode is None
     assert decision.signals.get("pin_exit") == "invalid_search_mode"
-    assert decision.decision_tier == "clarify"
+    assert decision.signals.get("pin") == "E"
+    assert decision.decision_tier == "typed_fail"
+    assert decision.failure_code == "invalid_search_mode"
+    assert decision.confidence == 0.0
+    assert decision.options == []
+
+
+def test_invalid_pin_does_not_block_the_other_tiers() -> None:
+    """The named rejection is a RESIDUAL outcome, not a veto: an utterance
+    that names a 档, an eligible inheritance, or an accepted judge answer
+    still decides the turn, with its own tier (architect ruling 1(b))."""
+    named = decide_search_mode(
+        _msgs("lexical档 what was AAPL net sales in 2023 Q3?"), pinned_mode="E"
+    )
+    assert named.search_mode == "lexical"
+    assert named.decision_tier == "rules"
+    assert named.signals.get("pin_exit") == "invalid_search_mode"
+
+    judged = decide_search_mode(
+        _msgs("what was AAPL net sales in 2023 Q3?"),
+        pinned_mode="E",
+        jev_client=FakeJevChoice([("global", 0.9)]),
+    )
+    assert judged.search_mode == "global"
+    assert judged.decision_tier == "jev"
+    assert judged.signals.get("pin_exit") == "invalid_search_mode"
+
+    inherited = decide_search_mode(
+        _msgs("and 2022 Q3?"),
+        pinned_mode="E",
+        snapshots=[_snap_with_mode("AAPL", "2023 Q3", "graph")],
+    )
+    assert inherited.search_mode == "graph"
+    assert inherited.decision_tier == "inherit"
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +334,8 @@ def test_jev_valid_mode_assigns_the_jev_tier() -> None:
 @pytest.mark.parametrize("label", ["E", "", "Z", "research", "A", "b"])
 def test_jev_label_outside_the_closed_set_is_a_typed_exit(label: str) -> None:
     """Boundary 'negative': a judge label the 档 SSOT cannot map at all
-    names no 档 -- typed EXIT, residual clarify, never a silent global.
+    names no 档 -- typed EXIT, then the recorded default, never a silent
+    global and never a mode window.
     Retired single letters sit OUTSIDE the closed set now: zero
     coexistence means an ``A`` answer from the judge is refused exactly
     like ``E``, not quietly read as a spelling of some 档."""
@@ -287,10 +344,13 @@ def test_jev_label_outside_the_closed_set_is_a_typed_exit(label: str) -> None:
         _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
     assert len(fake.calls) == 1
-    assert decision.search_mode is None
     assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_INVALID_SEARCH_MODE
-    assert decision.decision_tier == "clarify"
-    assert decision.options  # the window data exists for Ticket 2 to render
+    assert decision.decision_tier == "fallback"
+    assert decision.search_mode == "graph"
+    assert decision.confidence == 0.0
+    # No mode window is offered for a routing residual: the options stay
+    # empty, so no client can render a picker out of this decision.
+    assert decision.options == []
 
 
 @pytest.mark.parametrize("label", ["graph", "GRAPH", " lexical "])
@@ -312,7 +372,7 @@ def test_jev_lasting_spelling_resolves_to_its_tier(label: str) -> None:
 
 def test_jev_schema_error_is_a_typed_exit() -> None:
     """An unusable judge payload names nothing: the EXIT is recorded and
-    the residual stays clarify."""
+    the recorded default takes over."""
     fake = FakeJevChoice(
         [JevChoiceError("not a choice object", exit_code=JEV_CHOICE_EXIT_SCHEMA)]
     )
@@ -320,14 +380,16 @@ def test_jev_schema_error_is_a_typed_exit() -> None:
         _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
     assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_SCHEMA
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.decision_tier == "fallback"
+    assert decision.search_mode == "graph"
+    assert decision.confidence == 0.0
+    assert decision.options == []
 
 
 def test_jev_transport_error_is_a_typed_exit_not_crash() -> None:
     """Boundary 'exception': an unreachable judge records the transport
-    EXIT and falls through the cascade -- the run cannot crash and no 档
-    is the silent default."""
+    EXIT and falls through the cascade -- the run cannot crash and the
+    档 is a recorded default, not a silent one."""
     fake = FakeJevChoice(
         [JevChoiceError("down", exit_code=JEV_CHOICE_EXIT_TRANSPORT)]
     )
@@ -336,8 +398,10 @@ def test_jev_transport_error_is_a_typed_exit_not_crash() -> None:
     )
     assert len(fake.calls) == 1  # exactly one attempt; no retry storm
     assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_TRANSPORT
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.decision_tier == "fallback"
+    assert decision.search_mode == "graph"
+    assert decision.confidence == 0.0
+    assert decision.options == []
 
 
 def test_jev_unexpected_throw_is_contained_as_an_exit() -> None:
@@ -350,8 +414,10 @@ def test_jev_unexpected_throw_is_contained_as_an_exit() -> None:
     # The type name is the whole diagnostic: an un-typed failure must be
     # attributable on the audit without leaking a message or a traceback.
     assert decision.signals["mode_jev_error_type"] == "RuntimeError"
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.decision_tier == "fallback"
+    assert decision.search_mode == "graph"
+    assert decision.confidence == 0.0
+    assert decision.options == []
     # What it broke on was a request carrying the per-option discriminators,
     # keyed by exactly the options the 档 cascade offered.
     (call,) = judge.calls
@@ -386,8 +452,10 @@ def test_miswired_criteria_is_contained_as_an_exit(
     assert sent == []  # the explicit never-sent count (the fixture's raise is the belt)
     assert decision.signals["mode_jev_exit"] == JEV_CHOICE_EXIT_UNEXPECTED_ERROR
     assert decision.signals["mode_jev_error_type"] == "ValueError"
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.decision_tier == "fallback"
+    assert decision.search_mode == "graph"
+    assert decision.confidence == 0.0
+    assert decision.options == []
 
 
 @pytest.mark.parametrize("label", ["global", "graph"])
@@ -395,15 +463,22 @@ def test_jev_low_confidence_falls_through_to_residual(label: str) -> None:
     """Boundary 'low_confidence' EXIT: an unsure name must not decide,
     whichever 档 it names -- the ban is on a SILENT assignment, and now
     that ``global`` is open a low-confidence 综述 is refused exactly like a
-    low-confidence ``graph``. The EXIT falls through either way."""
+    low-confidence ``graph``. The EXIT falls through either way to the
+    recorded default."""
     fake = FakeJevChoice([(label, 0.1)])
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
     assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_LOW_CONFIDENCE
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
-    assert decision.options  # the choice window still gets its data
+    # The judge DID answer, so its own label and confidence stay on the
+    # audit; the fallback's 0.0 is POLICY uncertainty and never claims to
+    # be the judge's probability for the 档 it refused.
+    assert decision.signals["mode_jev_label"] == label
+    assert decision.signals["mode_jev_confidence"] == 0.1
+    assert decision.decision_tier == "fallback"
+    assert decision.search_mode == "graph"
+    assert decision.confidence == 0.0
+    assert decision.options == []  # no mode window for a routing residual
 
 
 def test_jev_naming_the_global_tier_is_assigned_at_the_jev_tier() -> None:
@@ -477,11 +552,13 @@ def test_inherit_reuses_last_mode_on_short_follow_up() -> None:
 def test_inherit_ignores_a_retired_letter_in_history() -> None:
     """Zero coexistence reaches the durable channel too: a stray retired
     letter is not a 档 spelling, so it carries no job forward — the short
-    follow-up gets the residual clarify rather than an inherited mode."""
+    follow-up gets the recorded default rather than an inherited mode."""
     snapshots = [_snap_with_mode("AAPL", "2023 Q3", "B")]
     decision = decide_search_mode(_msgs("and 2022 Q3?"), snapshots=snapshots)
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.search_mode == "graph"
+    assert decision.decision_tier == "fallback"
+    assert decision.confidence == 0.0
+    assert decision.options == []
 
 
 def test_inherit_blocked_after_company_change_wipe() -> None:
@@ -494,33 +571,38 @@ def test_inherit_blocked_after_company_change_wipe() -> None:
     decision = decide_search_mode(
         _msgs("MSFT 2023 Q1 revenue?"), snapshots=snapshots
     )
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.search_mode == "graph"
+    assert decision.decision_tier == "fallback"
+    assert decision.options == []
 
 
 def test_inherit_requires_research_context_in_latest_snapshot() -> None:
     """A cleared / contextless snapshot cannot carry a 档 forward."""
     snapshots = [{"company": "", "period": "", "document_ids": []}]
     decision = decide_search_mode(_msgs("and 2022 Q3?"), snapshots=snapshots)
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
+    assert decision.search_mode == "graph"
+    assert decision.decision_tier == "fallback"
+    assert decision.options == []
 
 
 # ---------------------------------------------------------------------------
-# clarify residual + boundary 'empty'
+# fallback residual + boundary 'empty'
 # ---------------------------------------------------------------------------
 
 
-def test_empty_utterance_residual_clarifies_without_inventing_c() -> None:
+def test_empty_utterance_residual_falls_back_without_calling_the_judge() -> None:
     """Boundary 'empty': a blank post-grounded utterance with no inherit
-    clarifies (window data emitted) — no 档 is invented, C is not the
-    silent default, and the judge is never consulted for nothing."""
+    takes the recorded default — the judge is never consulted for nothing,
+    no mode window is offered, and the 0.0 confidence is POLICY
+    uncertainty rather than a judge's belief."""
     fake: FakeJevChoice = FakeJevChoice([])  # any call would raise
     decision = decide_search_mode(_msgs(""), jev_client=fake)
     assert fake.calls == []
-    assert decision.search_mode is None
-    assert decision.decision_tier == "clarify"
-    assert decision.options == clarify_options()
+    assert decision.search_mode == "graph"
+    assert decision.decision_tier == "fallback"
+    assert decision.confidence == 0.0
+    assert decision.options == []
+    assert "mode_jev_exit" not in decision.signals
 
 
 def test_clarify_options_are_structured_with_opened_flags(
@@ -528,7 +610,7 @@ def test_clarify_options_are_structured_with_opened_flags(
 ) -> None:
     """The Ticket-2 choice window consumes this: ids + operator labels;
     the ``opened`` flag reads the ``TIER_UNAVAILABLE_CODE`` SSOT — empty
-    since the tracked change T7 (commit 6e8ed97) opened sql, so ALL FOUR 档 now render
+    since T7 (commit 6e8ed97) opened sql, so ALL FOUR 档 now render
     opened (old pin: ``[True, True, True, False]`` with 真数据库 marked
     unopened). Equal-or-stronger replaces the frozen fourth slot with a
     two-sided proof: the current table value renders all-open, AND the
@@ -589,8 +671,8 @@ def test_cascade_has_no_step_cap_of_its_own() -> None:
     in a row run fine with no 档-specific fuse (and no mode drifts)."""
     for _ in range(40):
         decision = decide_search_mode(_msgs("what was revenue again?"))
-        assert decision.decision_tier in ("clarify", "typed_fail")
-        assert decision.search_mode is None
+        assert decision.decision_tier in ("fallback", "typed_fail")
+        assert decision.search_mode in ("graph", None)
 
 
 def test_snapshot_inherit_does_not_wipe_history() -> None:
@@ -791,8 +873,11 @@ def test_mode_channel_does_not_leak_across_threads() -> None:
         {**reset_input_state("and 2022 Q3?"), "evidence": []},
         config=_cfg("smc-leak-b"),
     )
-    assert out_b["search_mode_decision"]["decision_tier"] == "clarify"
-    assert out_b["search_mode_decision"]["search_mode"] is None
+    # The other thread's 档 is invisible here: this turn takes the
+    # recorded default, not the first thread's assignment.
+    assert out_b["search_mode_decision"]["decision_tier"] == "fallback"
+    assert out_b["search_mode_decision"]["search_mode"] == "graph"
+    assert out_b["search_mode_decision"]["options"] == []
 
 
 def test_naming_the_global_tier_in_the_utterance_assigns_it() -> None:
@@ -834,6 +919,53 @@ def test_run_payload_mirrors_search_mode_decision() -> None:
         {"status": "done", "answer": "ok", "search_mode_decision": smd}
     )
     assert payload["search_mode_decision"] == smd
+
+
+def test_run_payload_round_trips_the_fallback_tier_and_its_signals() -> None:
+    """Ruling: the receipt seam carries the FALLBACK decision whole — the
+    tier, the original judge signals and the empty options survive the
+    projection unchanged, so a receipt reader can still see WHY the run
+    fell back and no client can render a mode picker out of it."""
+    fallback = {
+        "search_mode": "graph",
+        "confidence": 0.0,
+        "decision_tier": "fallback",
+        "signals": {
+            "utterance_len": 33,
+            "mode_jev_exit": "low_confidence",
+            "mode_jev_label": "global",
+            "mode_jev_confidence": 0.1,
+        },
+        "options": [],
+        "failure_code": None,
+    }
+    payload = _run_to_response_payload(
+        {"status": "done", "answer": "ok", "search_mode_decision": fallback}
+    )
+    projected = payload["search_mode_decision"]
+    assert projected["decision_tier"] == "fallback"
+    assert projected["search_mode"] == "graph"
+    assert projected["confidence"] == 0.0
+    assert projected["options"] == []
+    assert projected["signals"] == fallback["signals"]
+
+
+def test_a_fallback_turn_appends_the_graph_snapshot_entry() -> None:
+    """The fallback turn IS an assigned 档, so it rides the append-only
+    snapshot history like any other assignment — which is how a later
+    follow-up in the same retrieve job inherits it (the existing inherit
+    contract, not a special case)."""
+    update = smd.search_mode_update_for_turn(_msgs("what was revenue again?"))
+    assert update["audit"]["decision_tier"] == "fallback"
+    assert update["audit"]["search_mode"] == "graph"
+    assert update["snapshot_patch"] == [
+        {
+            "company": "",
+            "period": "",
+            "document_ids": [],
+            "search_mode": "graph",
+        }
+    ]
 
 
 def test_run_payload_defaults_to_empty_dict_without_decision() -> None:

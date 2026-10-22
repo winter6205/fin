@@ -41,28 +41,28 @@ from fin.corpus.parsers import (
     PageRaster,
     PageRegionParser,
 )
-from fin.host.attachment_budgets import (
+from fin.host.attachment.attachment_budgets import (
     ATTACHMENT_VISION_BUDGET_EXCEEDED,
     AttachmentBudgetConfigError,
     AttachmentBudgets,
     VisionCallLedger,
     required_run_calls,
 )
-from fin.host.attachment_layout import (
+from fin.host.attachment.attachment_layout import (
     DEFAULT_STAGING_DIR,
     HeronHarnessAbsentError,
     HeronLayoutConfig,
     HeronLayoutConfigError,
 )
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_prepare import (
     ATTACHMENT_PAGE_LANE_UNWIRED,
     AttachmentPreparationService,
 )
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     InMemoryAttachmentStore,
 )
-from fin.host.attachment_vision import (
+from fin.host.attachment.attachment_vision import (
     ChatModelVisionAdapter,
     VisionCallResult,
     VisionUsage,
@@ -90,7 +90,7 @@ _ROOT_ENV = (
 )
 
 # The six Heron knobs, all optional: scrubbed, the builder takes the
-# shipped defaults named in ``.env.example``.
+# shipped defaults named in ``settings.example.yaml``.
 _HERON_ENV = (
     "FIN_ATTACHMENT_HERON_SCRIPT",
     "FIN_ATTACHMENT_HERON_STAGING_DIR",
@@ -256,7 +256,7 @@ def test_a_deployment_declaring_no_bounds_builds_the_unwired_text_door(
     has nothing to price pages against. The key names come from the module
     that owns them, so this branch cannot drift from what the gate reads.
     """
-    from fin.host.attachment_budgets import BOUND_ENV_KEYS
+    from fin.host.attachment.attachment_budgets import BOUND_ENV_KEYS
     from fin.host.thread_store import default_thread_store
 
     for key, _ in BOUND_ENV_KEYS:

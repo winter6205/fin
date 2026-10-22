@@ -26,13 +26,16 @@ import http.server
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pytest
 
-from fin.host.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
+from fin.host.attachment.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
 from fin.host.knowledge_mcp import (
     knowledge_mcp_gate_closed,
     publish_knowledge_mcp_state,
@@ -676,8 +679,8 @@ def test_no_lane_repeats_an_attachment_bound_literal() -> None:
 
     The host accepts any positive integer, so a lane carrying a stale cap
     boots happily and then measures the wrong thing. Four copies agreeing
-    by hand is how the cap drifted from the `.env.example` value this
-    round started; the template is the only place a number may appear.
+    by hand is how the cap drifted from the `settings.example.yaml` value
+    this round started; the template is the only place a number may appear.
     """
     offenders = {
         name: _bound_literals((REPO_ROOT / name).read_text(encoding="utf-8"))
@@ -685,7 +688,7 @@ def test_no_lane_repeats_an_attachment_bound_literal() -> None:
     }
 
     assert {name: found for name, found in offenders.items() if found} == {}, (
-        "attachment bound values belong in .env.example, read through "
+        "attachment bound values belong in settings.example.yaml, read through "
         "scripts/lib/attachment-bounds.{sh,mjs}"
     )
     for name in BOUNDS_LANES[:2]:
@@ -710,21 +713,28 @@ def test_no_lane_repeats_an_attachment_bound_literal() -> None:
 def test_attachment_bound_resolver_reads_the_template_and_lets_env_win(
     tmp_path: Path,
 ) -> None:
-    """The bash resolver: unset keys come from `.env.example`, a value
-    already in the environment is never overridden, and the node reader
-    agrees with it key for key.
+    """The bash resolver: unset keys come from `settings.example.yaml`, a
+    value already in the environment is never overridden, and the node
+    reader agrees with it key for key.
     """
-    # `export` and quoting vary per row so the resolver is exercised on
-    # every shape its docstring claims to accept.
+    # 10 + 4 + 1 = 15, so the template satisfies the attachment budget.
     template_values = {
-        key: str(333 * (index + 1)) for index, key in enumerate(BOUND_KEYS)
+        "FIN_ATTACHMENT_MAX_BYTES": "333",
+        "FIN_ATTACHMENT_MAX_PDF_PAGES": "10",
+        "FIN_ATTACHMENT_VISION_CALLS_PER_RUN": "15",
+        "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN": "4",
     }
-    template_rows = "".join(
-        f"{key}={value}\n" if index % 2 == 0 else f"export {key}='{value}'\n"
-        for index, (key, value) in enumerate(template_values.items())
+    fields = {
+        "FIN_ATTACHMENT_MAX_BYTES": "maxBytes",
+        "FIN_ATTACHMENT_MAX_PDF_PAGES": "maxPdfPages",
+        "FIN_ATTACHMENT_VISION_CALLS_PER_RUN": "visionCallsPerRun",
+        "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN": "visionCropCallsPerRun",
+    }
+    body = "\n".join(
+        f"  {fields[key]}: {template_values[key]}" for key in BOUND_KEYS
     )
-    template = tmp_path / ".env.example"
-    template.write_text(f"# comment line, ignored\n{template_rows}", encoding="utf-8")
+    template = tmp_path / "settings.example.yaml"
+    template.write_text(f"attachment:\n{body}\n", encoding="utf-8")
 
     exported = BOUND_KEYS[0]
     resolved = subprocess.run(
@@ -780,8 +790,8 @@ def test_attachment_bound_resolver_fails_loudly_on_a_missing_key(
     """
     hollow = tmp_path / "checkout"
     hollow.mkdir()
-    (hollow / ".env.example").write_text(
-        f"{BOUND_KEYS[0]}=1\n", encoding="utf-8"
+    (hollow / "settings.example.yaml").write_text(
+        "attachment:\n  maxBytes: 1\n", encoding="utf-8"
     )
 
     result = subprocess.run(
@@ -877,6 +887,14 @@ def test_shim_drives_a_checkout_from_any_directory(tmp_path: Path) -> None:
     bin_dir.mkdir()
     assert _install(bin_dir).returncode == 0
 
+    # `fin check` preflights the iknow-memory checkout next to the one it
+    # was handed (scripts/dev-up.sh --check), and the resolver only finds
+    # that by proximity. A checkout beside an iknow-memory tree passed on
+    # a dev box and failed everywhere else (CI has no such sibling), so the
+    # test supplies the one it needs instead of inheriting the host's.
+    iknow_root = tmp_path / "iknow-memory"
+    _PathStub.write_iknow_checkout(iknow_root)
+
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     # `fin check` preflights docker / node / uv, which are not in the
@@ -886,7 +904,7 @@ def test_shim_drives_a_checkout_from_any_directory(tmp_path: Path) -> None:
         cwd=str(elsewhere),
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(tmp_path)},
+        env={**os.environ, "HOME": str(tmp_path), "FIN_IKNOW_ROOT": str(iknow_root)},
         timeout=180,
         check=False,
     )
@@ -1096,3 +1114,518 @@ def test_shim_reinstall_does_not_stack_a_second_copy(tmp_path: Path) -> None:
             "mean the installer appended instead of rewriting"
         )
         assert body.count("--checkout-for-shim") == 1
+
+
+_IKNOW_EXPORTS_REMOVED = (
+    "GRAPHRAG_MEMORY_STORAGE",
+    "GRAPHRAG_MEMORY_DB_URL",
+    "GRAPHRAG_MEMORY_NEO4J_URI",
+    "GRAPHRAG_MEMORY_NEO4J_USER",
+    "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
+    "GRAPHRAG_MEMORY_ES_URL",
+)
+
+
+def test_dev_up_does_not_load_the_iknow_checkout_env() -> None:
+    """iknow config stays in ~/.iknow-memory/setting.json.
+
+    The launcher must not export the storage defaults, copy FIN_API_KEY
+    into ANTHROPIC_AUTH_TOKEN, or compose the checkout file by default. An
+    unset checkpoint URL stays unset so settings.yaml can supply it.
+
+    The checkout compose is reachable only under FIN_IKNOW_STACK=dev, which
+    spec item 2 added for the isolated demo stack (PG 5434 / ES 9201 /
+    Neo4j 7688); the production default is untouched.
+    """
+    text = (REPO_ROOT / "scripts" / "dev-up.sh").read_text(encoding="utf-8")
+    for key in _IKNOW_EXPORTS_REMOVED:
+        assert f"export {key}=" not in text, key
+    assert "ANTHROPIC_AUTH_TOKEN" not in text
+    assert 'load_env_file "$IKNOW_ROOT/.env' not in text
+    # FIN_IKNOW_STACK=dev (spec item 2) makes the iknow checkout's own compose
+    # reachable for the isolated demo stack, so a blanket prohibition is no
+    # longer the contract -- and the old literal only stopped matching because
+    # the script writes ${IKNOW_ROOT}, braced. A formatting accident is not a
+    # pass. The real contract: the DEFAULT branch never names the checkout file,
+    # and the checkout file is reachable only behind the dev gate.
+    _default_start = text.index("start_compose() {")
+    _dev_start = text.index("start_dev_compose() {")
+    _default_branch = text[_default_start : text.index("\n}\n", _default_start)]
+    _dev_branch = text[_dev_start : text.index("\n}\n", _dev_start)]
+    assert "docker-compose.yml" not in _default_branch.replace("start_dev_compose", "")
+    assert '[[ "$FIN_IKNOW_STACK" == "dev" ]]' in _default_branch
+    assert '"${IKNOW_ROOT}/docker-compose.yml"' in _dev_branch
+    assert 'FIN_IKNOW_STACK="${FIN_IKNOW_STACK:-production}"' in text
+    assert "apply_operator_settings_env" in text
+    assert (
+        'FIN_CHECKPOINT_URL="${FIN_CHECKPOINT_URL:-postgresql://fin:fin@localhost:5433/fin?sslmode=disable}"'
+        not in text
+    )
+    assert "export FIN_CHECKPOINT_URL=" not in text
+    assert "~/.iknow-memory/setting.json" in text
+    assert "${HOME}/.iknow-memory/compose/docker-compose.production.yml" in text
+    assert "-p iknow-memory" in text
+    assert 'iknow-memory-config.js" show' in text
+    guard = text.index('if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then')
+    assert text.index("\npreflight_iknow_config\n") > guard
+
+
+def test_sourcing_dev_up_does_not_show_config_or_touch_docker(tmp_path: Path) -> None:
+    """Sourcing the script loads exports only. Show and docker stay on exec."""
+    log = tmp_path / "calls"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("node", "docker"):
+        tool = bin_dir / name
+        tool.write_text(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$0\" \"$*\" >> \"$CALL_LOG\"\nexit 99\n",
+            encoding="utf-8",
+        )
+        tool.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["CALL_LOG"] = str(log)
+    env["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; printf sourced\\n',
+            "bash",
+            str(REPO_ROOT / "scripts" / "dev-up.sh"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "sourced" in result.stdout
+    calls = log.read_text(encoding="utf-8") if log.is_file() else ""
+    assert calls == ""
+
+
+_DOCKER_STUB = """\
+#!/bin/sh
+printf '%s %s\\n' "$0" "$*" >> "$CALL_LOG"
+if [ "$1" = "ps" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      publish=*) exit 0 ;;
+    esac
+  done
+  if [ "${DOCKER_PS_NAMES:-}" = "all" ]; then
+    printf '%s\\n' iknow-memory-postgres iknow-memory-neo4j iknow-memory-es
+  fi
+  exit 0
+fi
+if [ "$1" = "compose" ]; then
+  case "$*" in
+    *.fin/compose/*) exit 0 ;;
+    *docker-compose.production.yml*) exit 99 ;;
+    *config*) printf '%s\\n' '{}'; exit 0 ;;
+  esac
+  exit 0
+fi
+exit 0
+"""
+
+_NODE_STUB = """\
+#!/bin/sh
+printf '%s %s\\n' "$0" "$*" >> "$CALL_LOG"
+if [ "${NODE_EXIT:-0}" = "0" ]; then
+  printf '%s\\n' STDOUT_DISCARD_TOKEN
+  exit 0
+fi
+printf '%s\\n' SHOW_STDERR_TOKEN >&2
+exit 1
+"""
+
+
+def test_dev_up_compose_skip_missing_template_and_config_show(tmp_path: Path) -> None:
+    """Primary Postgres comes only from the installed production template.
+
+    A missing ``~/.fin/compose/docker-compose.production.yml`` exits
+    non-zero and names that path. The repo compose file is not a fallback.
+    iknow still refuses when its own template is missing.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("docker", _DOCKER_STUB), ("node", _NODE_STUB)):
+        tool = bin_dir / name
+        tool.write_text(body, encoding="utf-8")
+        tool.chmod(0o755)
+    source_log = tmp_path / "source-calls"
+    missing_fin_log = tmp_path / "missing-fin-calls"
+    missing_fin_err = tmp_path / "missing-fin-err"
+    skip_log = tmp_path / "skip-calls"
+    missing_log = tmp_path / "missing-calls"
+    missing_err = tmp_path / "missing-err"
+    show_log = tmp_path / "show-calls"
+    show_err = tmp_path / "show-err"
+    show_ok_err = tmp_path / "show-ok-err"
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["HOME"] = str(tmp_path)
+    env["CALL_LOG"] = str(source_log)
+    env["DOCKER_PS_NAMES"] = "none"
+    env["NODE_EXIT"] = "0"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+set -euo pipefail
+source "$1"
+export CALL_LOG="$2" DOCKER_PS_NAMES=all
+set +e
+( start_compose ) 2>"$3"
+missing_fin_rc=$?
+set -e
+printf 'MISSING_FIN_RC:%s\\n' "$missing_fin_rc"
+mkdir -p "$HOME/.fin/compose"
+printf 'name: fin\\n' > "$HOME/.fin/compose/docker-compose.production.yml"
+export CALL_LOG="$4" DOCKER_PS_NAMES=all
+start_compose
+printf 'SKIP_OK\\n'
+export CALL_LOG="$5" DOCKER_PS_NAMES=none
+set +e
+( start_compose ) 2>"$6"
+missing_rc=$?
+set -e
+printf 'MISSING_RC:%s\\n' "$missing_rc"
+export CALL_LOG="$7" NODE_EXIT=1
+set +e
+( preflight_iknow_config ) 2>"$8"
+show_rc=$?
+set -e
+printf 'SHOW_FAIL_RC:%s\\n' "$show_rc"
+export NODE_EXIT=0
+preflight_iknow_config 2>"$9"
+printf 'SHOW_OK\\n'
+""",
+            "bash",
+            str(REPO_ROOT / "scripts" / "dev-up.sh"),
+            str(missing_fin_log),
+            str(missing_fin_err),
+            str(skip_log),
+            str(missing_log),
+            str(missing_err),
+            str(show_log),
+            str(show_err),
+            str(show_ok_err),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SKIP_OK" in result.stdout
+    assert "SHOW_OK" in result.stdout
+    missing_fin_rc = int(result.stdout.split("MISSING_FIN_RC:", 1)[1].splitlines()[0])
+    assert missing_fin_rc != 0
+    missing_fin_text = missing_fin_err.read_text(encoding="utf-8")
+    fin_template = f"{tmp_path}/.fin/compose/docker-compose.production.yml"
+    assert fin_template in missing_fin_text
+    missing_fin_calls = (
+        missing_fin_log.read_text(encoding="utf-8") if missing_fin_log.is_file() else ""
+    )
+    assert " up" not in missing_fin_calls
+    skip_calls = skip_log.read_text(encoding="utf-8")
+    assert f"-p fin -f {fin_template}" in skip_calls
+    assert " up" in skip_calls
+    assert f"{REPO_ROOT / 'docker-compose.yml'} up" not in skip_calls
+    missing_rc = int(result.stdout.split("MISSING_RC:", 1)[1].splitlines()[0])
+    assert missing_rc != 0
+    missing_text = missing_err.read_text(encoding="utf-8")
+    assert (
+        f"{tmp_path}/.iknow-memory/compose/docker-compose.production.yml"
+        in missing_text
+    )
+    show_rc = int(result.stdout.split("SHOW_FAIL_RC:", 1)[1].splitlines()[0])
+    assert show_rc != 0
+    show_text = show_err.read_text(encoding="utf-8")
+    assert "SHOW_STDERR_TOKEN" in show_text
+    assert "STDOUT_DISCARD_TOKEN" not in show_text
+    ok_text = show_ok_err.read_text(encoding="utf-8") if show_ok_err.is_file() else ""
+    assert "STDOUT_DISCARD_TOKEN" not in ok_text
+    assert "STDOUT_DISCARD_TOKEN" not in result.stdout
+    assert "SHOW_STDERR_TOKEN" not in ok_text
+
+
+_FAKE_SECRET = "fake-secret-do-not-print"
+
+
+def _hermetic_launcher_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """A launcher env with no operator home and no real secrets."""
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path / "operator"),
+        "PYTHONPATH": str(REPO_ROOT / "src"),
+    }
+    env.update(extra)
+    return env
+
+
+def test_sourced_dev_up_does_not_invent_a_checkpoint_url(tmp_path: Path) -> None:
+    """Settings without a checkpoint leave FIN_CHECKPOINT_URL unset."""
+    home = tmp_path / "fin-home"
+    home.mkdir()
+    (home / "settings.yaml").write_text(
+        "llm:\n  model: from-file\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; printf "URL:%s\\n" "${FIN_CHECKPOINT_URL-UNSET}"',
+            "bash",
+            str(REPO_ROOT / "scripts" / "dev-up.sh"),
+        ],
+        capture_output=True,
+        text=True,
+        env=_hermetic_launcher_env(tmp_path, FIN_HOME=str(home)),
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "URL:UNSET" in result.stdout
+    assert "localhost:5433" not in result.stdout
+
+
+def test_sourced_dev_up_exports_checkpoint_from_settings(tmp_path: Path) -> None:
+    """A settings checkpoint fills the shell when the process left it unset."""
+    home = tmp_path / "fin-home"
+    home.mkdir()
+    (home / "settings.yaml").write_text(
+        "checkpoint:\n  url: postgresql://from-settings/fin\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; printf "URL:%s\\n" "${FIN_CHECKPOINT_URL-UNSET}"',
+            "bash",
+            str(REPO_ROOT / "scripts" / "dev-up.sh"),
+        ],
+        capture_output=True,
+        text=True,
+        env=_hermetic_launcher_env(tmp_path, FIN_HOME=str(home)),
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "URL:postgresql://from-settings/fin" in result.stdout
+    assert "localhost:5433" not in result.stdout
+
+
+def _linked_dev_up_script(tmp_path: Path) -> Path:
+    """Copy ``dev-up.sh`` into a temporary checkout whose ``.git`` is a file.
+
+    The script derives ``REPO_ROOT`` from its own path and refuses compose
+    when that directory's ``.git`` is a file. ``git init`` runs only inside
+    ``tmp_path``; this fixture does not call ``git worktree add``.
+    """
+    checkout = tmp_path / "linked-checkout"
+    checkout.mkdir()
+    git_home = tmp_path / "git-home"
+    git_home.mkdir()
+    init = subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(checkout)],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": str(git_home),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
+        timeout=60,
+        check=False,
+    )
+    assert init.returncode == 0, init.stderr
+    git_dir = tmp_path / "gitdir"
+    shutil.move(checkout / ".git", git_dir)
+    (checkout / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    assert (checkout / ".git").is_file()
+
+    lib_dir = checkout / "scripts" / "lib"
+    lib_dir.mkdir(parents=True)
+    shutil.copy(REPO_ROOT / "scripts" / "dev-up.sh", checkout / "scripts" / "dev-up.sh")
+    for name in ("readiness.sh", "fin-root.sh", "attachment-bounds.sh"):
+        shutil.copy(REPO_ROOT / "scripts" / "lib" / name, lib_dir / name)
+    (checkout / "settings.example.yaml").symlink_to(
+        REPO_ROOT / "settings.example.yaml"
+    )
+    venv_bin = checkout / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text(
+        "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n',
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    return checkout / "scripts" / "dev-up.sh"
+
+
+def test_dev_up_from_a_linked_worktree_exits_before_compose(tmp_path: Path) -> None:
+    """An executed up in a linked worktree must not reach compose."""
+    log = tmp_path / "calls"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text(_DOCKER_STUB, encoding="utf-8")
+    docker.chmod(0o755)
+    operator = tmp_path / "operator"
+    script = _linked_dev_up_script(tmp_path)
+    env = _hermetic_launcher_env(
+        tmp_path,
+        CALL_LOG=str(log),
+        FIN_SETTINGS_FILE=str(tmp_path / "missing-settings.yaml"),
+        FIN_IKNOW_ROOT=str(tmp_path / "not-an-iknow-checkout"),
+    )
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "linked worktree" in result.stderr
+    calls = log.read_text(encoding="utf-8") if log.is_file() else ""
+    assert " up " not in calls
+    assert not (operator / ".fin").exists()
+
+
+def test_publish_runtime_files_land_under_fin_home_run(tmp_path: Path) -> None:
+    """Pid, log, and ready are created only under the resolved run dir."""
+    home = tmp_path / "fin-home"
+    operator = tmp_path / "operator"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+set -euo pipefail
+source "$1"
+publish_runtime_files
+write_verdict 0 ready
+""",
+            "bash",
+            str(REPO_ROOT / "scripts" / "dev-up.sh"),
+        ],
+        capture_output=True,
+        text=True,
+        env=_hermetic_launcher_env(tmp_path, FIN_HOME=str(home)),
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    run = home / "run"
+    log = run / "serve.log"
+    assert (run / "serve.pid").is_file()
+    assert log.is_file()
+    assert (run / "ready").read_text(encoding="utf-8").startswith("0 ")
+    assert log.stat().st_mode & 0o777 == 0o600
+    assert not (operator / ".fin").exists()
+
+
+def test_fin_config_show_names_layers_and_hides_the_secret(tmp_path: Path) -> None:
+    """config show prints layers and never the secret string."""
+    home = tmp_path / "fin-home"
+    home.mkdir()
+    (home / "settings.yaml").write_text(
+        "llm:\n"
+        "  model: from-file\n"
+        f"  apiKey: {_FAKE_SECRET}\n"
+        "checkpoint:\n"
+        "  url: postgresql://from-settings/fin\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(FIN), "config", "show"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=_hermetic_launcher_env(
+            tmp_path,
+            FIN_HOME=str(home),
+            FIN_MODEL="from-env",
+        ),
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    text = result.stdout
+    assert "FIN_CHECKPOINT_URL=postgresql://from-settings/fin settings.yaml" in text
+    assert "FIN_MODEL=from-env env overrides settings.yaml" in text
+    assert "FIN_API_KEY configured settings.yaml" in text
+    assert _FAKE_SECRET not in text
+    assert _FAKE_SECRET not in result.stderr
+
+
+def test_fin_config_show_rejects_an_extra_argument(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [str(FIN), "config", "show", "extra"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=_hermetic_launcher_env(tmp_path),
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "extra" in result.stderr
+
+
+def test_fin_logs_names_the_run_log(tmp_path: Path) -> None:
+    """A missing log names <FIN_HOME>/run, not the checkout .fin dir."""
+    home = tmp_path / "fin-home"
+    result = subprocess.run(
+        [str(FIN), "logs"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env=_hermetic_launcher_env(tmp_path, FIN_HOME=str(home)),
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert f"{home}/run/serve.log" in result.stderr
+
+
+def test_dev_down_names_the_fin_home_pid(tmp_path: Path) -> None:
+    """down looks for the pid under FIN_HOME/run and does not need a live port."""
+    log = tmp_path / "calls"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text(_DOCKER_STUB, encoding="utf-8")
+    docker.chmod(0o755)
+    home = tmp_path / "fin-home"
+    env = _hermetic_launcher_env(
+        tmp_path,
+        FIN_HOME=str(home),
+        CALL_LOG=str(log),
+        WORKBENCH_SERVE_PORT="59991",
+        FIN_IKNOW_ROOT=str(tmp_path / "not-an-iknow-checkout"),
+    )
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "dev-down.sh")],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+    combined = result.stdout + result.stderr
+    assert f"{home}/run/serve.pid" in combined

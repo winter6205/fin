@@ -83,7 +83,7 @@ export const ACCEPTED_NOTICE = "Runtime 已经接受了这次输入。";
 export const TRANSPORT_UNKNOWN_NOTICE =
   "没能收到 Runtime 的答复，结果未知：这次输入可能还没有生效，当前任务可能保持不变。";
 
-// The contract's named task failures (fin.host.task_runtime_types.
+// The contract's named task failures (fin.host.task.task_runtime_types.
 // TASK_FAILURE_KINDS) and the copy each deserves. Red line (contract
 // §Named failures): an operational failure is a SYSTEM outcome and is
 // never converted into a clarification — so none of these strings asks

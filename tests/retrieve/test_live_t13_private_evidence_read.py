@@ -39,7 +39,7 @@ from typing import Any, Iterator
 import psycopg
 import pytest
 
-from fin.host.evidence_session_registry import (
+from fin.host.evidence.evidence_session_registry import (
     EvidenceBindingRefusal,
     EvidenceSessionRegistry,
 )
@@ -985,6 +985,7 @@ def test_allowlisted_child_stops_inheriting_the_parent_environment() -> None:
     assert set(INHERITED_ENV_ALLOWLIST) == {
         "PATH",
         "HOME",
+        "IKNOW_MEMORY_HOME",
         "LANG",
         "LC_ALL",
         "TMPDIR",
@@ -992,6 +993,37 @@ def test_allowlisted_child_stops_inheriting_the_parent_environment() -> None:
         "SYSTEMROOT",
         "COMSPEC",
     }
+
+
+def test_the_memory_home_is_inherited_so_the_child_reads_the_selected_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``IKNOW_MEMORY_HOME`` reaches an allowlisted child from the parent.
+
+    ADR-0100 §2: the Evidence child has to boot against the same isolated
+    stack the host selected, so the memory home travels with the *allowlist*
+    rather than only when an operator remembers to name it in
+    ``FIN_EVIDENCE_TRANSPORT_FORWARD``.
+
+    It is a *where*, not a *who*: iknow reads it as the directory that holds
+    ``setting.json``, which is where the dev stack's ports are named. So it
+    joins the base set that already holds ``HOME`` for the same reason, and
+    the invariant this allowlist exists for still holds — the eight
+    ``IKNOW_EVIDENCE_*`` variables remain absent from it, so an identity the
+    host did not inject still cannot arrive by inheritance.
+    """
+
+    monkeypatch.setenv("IKNOW_MEMORY_HOME", "/tmp/fin-t13-iknow-dev")
+    session = MCPStdioSession(
+        [shutil.which("node") or "node", "--version"],
+        env={"IKNOW_EVIDENCE_BINDING": "1"},
+    )
+
+    resolved = session._resolve_env()
+    assert resolved is not None
+    assert resolved["IKNOW_MEMORY_HOME"] == "/tmp/fin-t13-iknow-dev"
+    # Nothing an authority could travel in: the allowlist carries no identity.
+    assert not set(INHERITED_ENV_ALLOWLIST) & set(TRUSTED_BINDING_ENV_VARS.values())
 
 
 def test_a_model_supplied_identity_field_is_refused_and_never_read(t13_env) -> None:

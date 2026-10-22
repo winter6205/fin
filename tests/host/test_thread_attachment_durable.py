@@ -36,15 +36,15 @@ from langgraph.checkpoint.memory import InMemorySaver
 from fin.corpus.extracted import load_extracted_tree
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.corpus.object_store_errors import UnknownObjectKeyError
-from fin.host.attachment_budgets import AttachmentBudgets
-from fin.host.attachment_index import search
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_budgets import AttachmentBudgets
+from fin.host.attachment.attachment_index import search
+from fin.host.attachment.attachment_prepare import (
     AttachmentCleanupError,
     AttachmentNotFoundError,
     AttachmentNotReadyError,
     AttachmentPreparationService,
 )
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     AttachmentStoreError,
     AttachmentThreadGoneError,
@@ -559,6 +559,25 @@ def _status(client: TestClient, thread_id: str, attachment_id: str) -> Any:
     return client.get(f"/api/threads/{thread_id}/attachments/{attachment_id}")
 
 
+def _retire(client: TestClient, thread_id: str) -> None:
+    """Retire a run parked on the attachment gate, through the real door.
+
+    A pause is a state and not an end, so the executor deliberately keeps
+    the run's live entry open in the mounted app's ``RunControl`` — that is
+    what lets ``/api/status`` publish a non-zero ``paused`` at all. The one
+    production event that retires it is ``DELETE /api/threads/{id}``, which
+    calls ``run_control.forget`` for exactly this reason.
+
+    A case that parks a run and walks away therefore leaves the shared
+    registry carrying the pause into every later file in the process. The
+    status code is asserted so a refused delete cannot hide a leak behind a
+    green test.
+    """
+    response = client.delete(f"/api/threads/{thread_id}")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+
+
 # ----- uploaded -> ready, searchable across turns -----
 
 
@@ -672,6 +691,7 @@ def test_send_naming_an_uploaded_attachment_is_accepted_and_pauses(
     assert wired["service"].status(record.attachment_id).status == "parsing"
     assert len(wired["service"].jobs.incomplete()) == 1
     assert wired["threads"].list_runs(wired["thread_id"]) == []
+    _retire(client, wired["thread_id"])
 
 
 def test_send_naming_a_failed_attachment_is_still_typed_not_ready(
@@ -1522,7 +1542,7 @@ def test_a_refused_cleanup_names_the_owed_bytes_in_the_log(
     object_key = wired["service"].status(aid).object_key
     gate.delete_fails = True
 
-    with caplog.at_level(logging.WARNING, logger="fin.host.attachment_prepare"):
+    with caplog.at_level(logging.WARNING, logger="fin.host.attachment.attachment_prepare"):
         assert _delete_one(client, wired["thread_id"], aid).status_code == 500
 
     named = [record.getMessage() for record in caplog.records]
@@ -1534,7 +1554,7 @@ def test_a_refused_cleanup_names_the_owed_bytes_in_the_log(
     refused = [
         record
         for record in caplog.records
-        if record.name == "fin.host.attachment_prepare"
+        if record.name == "fin.host.attachment.attachment_prepare"
         and object_key in record.getMessage()
     ]
     # WHY a count: one refused key is one fact about one leftover. The same
@@ -1737,6 +1757,10 @@ def test_non_utf8_body_is_rejected(
     assert turns[0].status_reason == "attachment_not_text"
     assert turns[0].answer == ""
     assert turns[0].citations == []
+    # The resume above drove a THROWAWAY ``RunControl``, so the mounted
+    # app's registry still holds the pause this send left. Only the thread
+    # going away retires it.
+    _retire(client, wired["thread_id"])
 
 
 def test_unknown_thread_upload_is_404(

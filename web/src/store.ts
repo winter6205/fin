@@ -6,7 +6,7 @@ import { create } from "zustand";
 import * as api from "./api";
 // T8: the thumbs-feedback boundary (POST .../runs/{run_id}/feedback).
 import { submitFeedback, type FeedbackValue } from "./feedback";
-// T5 (#35): the last opened thread id, persisted so a returning
+// T5: the last opened thread id, persisted so a returning
 // visit lands back on that thread.
 import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
 import {
@@ -14,6 +14,7 @@ import {
   threadHasPendingChoice,
 } from "./choiceWindow";
 import type {
+  CatalogOverview,
   ChoiceWindow,
   Filing,
   IngestJobState,
@@ -77,7 +78,7 @@ import {
   parseDraftRecords,
   restoreDraftText,
   type ClarificationDraftRecords,
-} from "./clarificationReply";
+} from "./capabilities/clarification/clarificationReply";
 import {
   applyRefusal,
   dismissClarification,
@@ -87,13 +88,15 @@ import {
   setOtherText,
   submitPayload,
   type ClarificationDraft,
-} from "./clarificationReply";
+} from "./capabilities/clarification/clarificationReply";
 import {
   decodeThreadTaskRuntime,
+  type DocumentChoiceFrame,
   type TaskRuntimeDecodeRefusal,
-} from "./taskRuntime";
-import type { SubmissionNotice } from "./taskState";
+} from "./capabilities/task/taskRuntime";
+import type { SubmissionNotice } from "./capabilities/task/taskState";
 import { isTaskFailureKind, type TaskRuntimeView } from "./types";
+import { threadEntryIsLive } from "./threadEntry";
 
 /** The refusal the thread's current operation carries, with the door that
  * recorded it. A failure kind is only meaningful against its own door's
@@ -124,18 +127,45 @@ interface RestoreRequestRecord extends RestoreRequestRef {
   seenSinceSend: boolean;
 }
 
+/**
+ * What an ``openThread`` call did.
+ *
+ * T2 (plans/2026-10-20-qa-design-correction.md): the entry read is
+ * NOT unconditional. Three outcomes, and the route can rely on them:
+ *
+ * - ``opened`` — the thread was read and the turn table reconciled.
+ * - ``skipped`` — this client is sending on that thread, so the live
+ *   send owns it: no read was made, no loading branch was entered and
+ *   no live stream state was replaced. The route reads the same rule
+ *   (``threadEntryIsLive``) and paints the live answer instead of its
+ *   entry loader.
+ * - ``superseded`` — a LATER entry took over while this read was in
+ *   flight, so this read did not touch the active thread.
+ */
+export type ThreadOpenOutcome =
+  | { kind: "opened"; threadId: string }
+  | { kind: "skipped"; threadId: string; reason: "sending" }
+  | { kind: "superseded"; threadId: string };
+
 interface WorkspaceState {
   threads: ThreadListItem[];
   corpus: Filing[];
   activeThread: ThreadDetail | null;
   loadingThreads: boolean;
-  // T5 (#35): true once the FIRST refreshThreads completed. The
+  // T5: true once the FIRST refreshThreads completed. The
   // restore-on-return logic must distinguish "not loaded yet"
   // (initial ``loadingThreads === false`` before App's effect
   // starts the fetch) from "loaded and genuinely empty" — otherwise
   // the one-shot restore treats a valid marker as stale.
   threadsLoaded: boolean;
   corpusLoaded: boolean;
+  // T6: the generic catalog overview behind the home corpus surface.
+  // ``null`` until the first read answers (the door renders its loading
+  // copy rather than claiming an empty catalog); ``catalogOverviewLoaded``
+  // keeps "not read yet" apart from "read and genuinely empty", the same
+  // distinction ``corpusLoaded`` makes.
+  catalogOverview: CatalogOverview | null;
+  catalogOverviewLoaded: boolean;
   // T10 (ADR 0033): the boot-scoped status slice behind the
   // left-corner 知识 MCP line. ``null`` after ``statusLoaded`` means
   // the status route itself did not answer — the line renders its
@@ -146,13 +176,31 @@ interface WorkspaceState {
   // second dispatch is ignored (one wire call per boot/refresh).
   loadingStatus: boolean;
   sendingQuestion: boolean;
+  // T2 (plans/2026-10-20-qa-design-correction.md): the thread THIS
+  // CLIENT is currently sending on. ``sendingQuestion`` says "a send is
+  // running" but not WHERE, and the thread-entry contract needs the
+  // thread: only the thread that is streaming may reuse the live
+  // answer, and a read for it would replace that answer with a stale
+  // snapshot. Set SYNCHRONOUSLY when the send starts — before its
+  // first await — so a route mount right after ``sendQuestion(...)``
+  // already sees it; cleared when that send settles (success, failure
+  // or cancellation). ``null`` when no send is in flight.
+  sendingThreadId: string | null;
+  // T2: the token of the entry read that is the CURRENT one. The route
+  // effect and the thread page both open the same thread; a switch
+  // opens another one. A read that a LATER entry superseded must not
+  // repaint the active thread the operator already left. The marker
+  // holds a per-read TOKEN, not the thread id: two concurrent reads of
+  // the SAME thread are only orderable with a token, and the marker is
+  // released when its read settles.
+  enteringReadToken: number | null;
   // T4: ``resumeThread(threadId)`` sets this while the resume SSE
   // stream is active so the Composer can disable itself and so a
   // second resume click is rejected. ``null`` when no resume is in
   // flight. Tracks the THREAD, not just a boolean, so a resume on
   // thread A does not block a fresh send on thread B.
   resumingThreadId: string | null;
-  // T4 workflow (the tracked change): watched issuers and the in-app notices their
+  // T4 workflow: watched issuers and the in-app notices their
   // filings raised. Both are workspace-local — no outbound delivery.
   watchlist: WatchEntry[];
   notices: Notice[];
@@ -251,12 +299,17 @@ interface WorkspaceState {
 
   refreshThreads: () => Promise<void>;
   loadCorpus: () => Promise<void>;
+  // T6: the generic catalog OVERVIEW — documents with title / type plus
+  // the presentation grouping. Separate from ``loadCorpus`` because
+  // ``GET /api/corpus`` is the frozen FINANCIAL projection and this is the
+  // surface an ordinary metadata-free document is visible on.
+  loadCatalogOverview: () => Promise<void>;
   // Re-GETs ``GET /api/status`` (boot effect). Boot-scoped fields do
   // not change mid-session, so a successful read updates the store; a
   // thrown fetch still flips ``statusLoaded`` so the left-corner line
   // renders its neutral state rather than a silent OK.
   loadStatus: () => Promise<void>;
-  openThread: (threadId: string) => Promise<void>;
+  openThread: (threadId: string) => Promise<ThreadOpenOutcome>;
   createThread: (firstMessage: string | null) => Promise<string>;
   removeThread: (threadId: string) => Promise<void>;
   sendQuestion: (
@@ -285,7 +338,7 @@ interface WorkspaceState {
     runId: string,
     optionId: string,
   ) => Promise<api.SendResult | null>;
-  // T4 workflow (the tracked change). ``addWatch`` rejects with the host's typed
+  // T4 workflow. ``addWatch`` rejects with the host's typed
   // error so the panel can show it inline; the rest resolve quietly
   // and leave the slice consistent.
   loadWatchlist: () => Promise<void>;
@@ -835,7 +888,7 @@ function recordRestoreFailure(
   recordOperationVerdict(set, { ...facts, state: "failed" });
 }
 
-// turn-trace-folds (the tracked change): fold one wire frame into the turn's burst
+// turn-trace-folds: fold one wire frame into the turn's burst
 // timeline. Shared by send and resume so the two paths cannot drift
 // on burst semantics (arrival-order folds, auto-collapse at burst
 // end). Plain helpers — no state access.
@@ -850,7 +903,7 @@ function closeOpenBurstsOnTurn(t: Turn): Turn {
   return { ...t, trace_items: closeOpenBursts(t.trace_items ?? []) };
 }
 
-// Streaming render saturation (#252 follow-up): at provider chunk
+// Streaming render saturation (follow-up): at provider chunk
 // granularity every SSE frame triggers one store patch → one full
 // transcript re-render. A long thread (round 3+) re-renders EVERY
 // historical turn row per frame; with a fast provider the frames
@@ -913,6 +966,18 @@ type TurnPatcherQueue = ReturnType<typeof makeTurnPatcherQueue>;
 interface StreamFold {
   statusSeen: boolean;
   windowPending: ChoiceWindow | null;
+  /**
+   * the ``document_choice`` frame this
+   * stream suspended on, or null. The host emits NO terminal frames on a
+   * suspended document choice, so a set fold is what keeps the row live
+   * instead of letting the finalize patch read it as done — the same
+   * posture ``windowPending`` gives a choice window, for the same reason.
+   *
+   * The fold carries the REFERENCE (question id + originating run id),
+   * never candidates: the frame carries no ``choice_details``, so the
+   * candidate authority is the projection the store re-reads on receipt.
+   */
+  documentChoicePending: DocumentChoiceFrame | null;
   answerFold: LiveAnswerState;
 }
 
@@ -932,6 +997,7 @@ function foldResumeFrame(
     case "status":
       fold.statusSeen = true;
       fold.windowPending = null;
+      fold.documentChoicePending = null;
       patches.flushThen((t) => ({
         ...closeOpenBurstsOnTurn(t),
         status: event.status,
@@ -939,6 +1005,8 @@ function foldResumeFrame(
         assistant_message: event.assistant_message,
         track: event.track ?? t.track,
         track_decision: event.track_decision ?? t.track_decision,
+        search_mode_decision:
+          event.search_mode_decision ?? t.search_mode_decision,
         // Mid-flight stream taxonomy (see sendQuestion's status
         // branch for the same handling rationale).
         status_classified:
@@ -947,6 +1015,7 @@ function foldResumeFrame(
             : t.status_classified,
         in_flight: false,
         thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
+        semantic_outcome: event.semantic_outcome ?? t.semantic_outcome,
       }));
       break;
     case "citations":
@@ -984,6 +1053,15 @@ function foldResumeFrame(
       // to suspended.
       fold.windowPending = event.window;
       patches.flushThen((t) => ({ ...t, choice_window: event.window }));
+      break;
+    case "document_choice":
+      // The run suspended for a document choice — either the first
+      // interrupt or the host re-opening the question after a refused
+      // pick. Nothing is patched onto the turn:
+      // the frame is a REFERENCE carrying no candidates, and the turn row
+      // is not where a question lives. Only the fold moves, so the row
+      // stays suspended (see the ``in_flight`` sites).
+      fold.documentChoicePending = event.frame;
       break;
   }
 }
@@ -1054,6 +1132,281 @@ function foldStreamTraceFrame(
   }
 }
 
+interface SendQuestionStreamState {
+  fold: StreamFold;
+  patches: TurnPatcherQueue;
+  run: {
+    optimisticRunId: Turn["run_id"];
+    attachmentWaitRunId: string | null;
+  };
+}
+
+function foldSendQuestionStatus(
+  event: Extract<api.SendEvent, { type: "status" }>,
+  stream: SendQuestionStreamState,
+): void {
+  stream.fold.statusSeen = true;
+  stream.fold.windowPending = null;
+  stream.fold.documentChoicePending = null;
+  stream.patches.flushThen((turn) => ({
+    ...closeOpenBurstsOnTurn(turn),
+    run_id: event.run_id,
+    status: event.status,
+    status_reason: event.reason ?? "",
+    assistant_message: event.assistant_message,
+    track: event.track ?? turn.track,
+    track_decision: event.track_decision ?? turn.track_decision,
+    search_mode_decision:
+      event.search_mode_decision ?? turn.search_mode_decision,
+    status_classified:
+      event.status_classified !== undefined
+        ? event.status_classified
+        : turn.status_classified,
+    in_flight: false,
+    thinking_duration_ms: event.thinking_ms ?? turn.thinking_duration_ms,
+    semantic_outcome: event.semantic_outcome ?? turn.semantic_outcome,
+  }));
+  stream.run.optimisticRunId = event.run_id;
+}
+
+function foldSendQuestionFrame(
+  event: api.SendEvent,
+  stream: SendQuestionStreamState,
+): void {
+  if (foldStreamTraceFrame(stream.patches, stream.fold, event)) return;
+  if (event.type === "status") {
+    foldSendQuestionStatus(event, stream);
+    return;
+  }
+  switch (event.type) {
+    case "citations":
+      stream.patches.flushThen((turn) => ({
+        ...turn,
+        citations: event.citations,
+      }));
+      break;
+    case "evidence_refusals":
+      stream.patches.flushThen((turn) => ({
+        ...turn,
+        evidence_refusals: mergeEvidenceRefusals(
+          turn.evidence_refusals,
+          event.refusals,
+        ),
+      }));
+      break;
+    case "visual_claims":
+      stream.patches.flushThen((turn) => ({
+        ...turn,
+        visual_claims: event.visual_claims,
+      }));
+      break;
+    case "comparison":
+      stream.patches.flushThen((turn) => ({
+        ...turn,
+        comparisons: [...(turn.comparisons ?? []), event.comparison],
+      }));
+      break;
+    case "choice_window":
+      stream.fold.windowPending = event.window;
+      stream.patches.flushThen((turn) => ({
+        ...turn,
+        choice_window: event.window,
+      }));
+      break;
+    case "attachment_wait":
+      stream.run.attachmentWaitRunId = event.run_id;
+      stream.patches.flushThen((turn) => ({ ...turn, run_id: event.run_id }));
+      stream.run.optimisticRunId = event.run_id;
+      break;
+    case "document_choice":
+      stream.fold.documentChoicePending = event.frame;
+      stream.patches.flushThen((turn) => ({
+        ...turn,
+        run_id: event.frame.origin_run_id,
+      }));
+      stream.run.optimisticRunId = event.frame.origin_run_id;
+      break;
+  }
+}
+
+interface SendQuestionOperation {
+  threadId: string;
+  attempt: number;
+  stream: SendQuestionStreamState;
+}
+
+interface SendQuestionCompletion extends SendQuestionOperation {
+  result: api.SendResult;
+}
+
+function beginMessageSend(
+  set: StoreSetter,
+  get: StoreGetter,
+  threadId: string,
+  question: string,
+): number | null {
+  if (!question.trim()) return null;
+  const decision = activeInputFor(get(), threadId);
+  if (decision.holdReason !== null) throw heldRefusalFor(decision.holdReason);
+  const opened = beginWorkspaceOperation(get().workspaceOperations, {
+    threadId,
+    door: "message",
+    kind: "message",
+  });
+  if (opened.operation === null) return null;
+  set({ workspaceOperations: opened.ledger });
+  return opened.operation.attempt;
+}
+
+function createSendQuestionStream(
+  get: StoreGetter,
+  set: StoreSetter,
+  threadId: string,
+  question: string,
+): SendQuestionStreamState {
+  const run = {
+    optimisticRunId: crypto.randomUUID() as Turn["run_id"],
+    attachmentWaitRunId: null as string | null,
+  };
+  const baseTurn = makeLiveTurn({ runId: run.optimisticRunId, question });
+  const patchTurnByRunId = (
+    runId: Turn["run_id"],
+    patcher: (turn: Turn) => Turn,
+  ) => {
+    const current = get().activeThread;
+    if (!current || current.id !== threadId) return;
+    const nextTurns = current.turns.map((turn) =>
+      turn.run_id === runId ? patcher(turn) : turn,
+    );
+    set({ activeThread: { ...current, turns: nextTurns } });
+  };
+  const patchTurn = (patcher: (turn: Turn) => Turn) =>
+    patchTurnByRunId(run.optimisticRunId, patcher);
+  const patches = makeTurnPatcherQueue(patchTurn);
+  const initial = get().activeThread;
+  if (initial && initial.id === threadId) {
+    set({ activeThread: { ...initial, turns: [...initial.turns, baseTurn] } });
+  }
+  return {
+    fold: {
+      statusSeen: false,
+      windowPending: null,
+      documentChoicePending: null,
+      answerFold: EMPTY_LIVE_ANSWER,
+    },
+    patches,
+    run,
+  };
+}
+
+function makeSendRequest(
+  question: string,
+  thinkingOn: boolean,
+  attachmentIds?: string[],
+): api.SendRequest {
+  const request: api.SendRequest = { question, thinking: thinkingOn };
+  if (attachmentIds && attachmentIds.length > 0) {
+    request.attachment_ids = attachmentIds;
+  }
+  return request;
+}
+
+function finalizeSendQuestionTurn(
+  get: StoreGetter,
+  completion: SendQuestionCompletion,
+): void {
+  const { threadId, result, stream } = completion;
+  if (get().activeThread?.id !== threadId) return;
+  const { fold, patches, run } = stream;
+  patches.flushThen((turn) => ({
+    ...closeOpenBurstsOnTurn(turn),
+    in_flight:
+      fold.windowPending !== null ||
+      fold.documentChoicePending !== null ||
+      run.attachmentWaitRunId !== null,
+    citations: result.citations.length > 0 ? result.citations : turn.citations,
+    evidence_refusals: mergeEvidenceRefusals(
+      turn.evidence_refusals,
+      result.evidence_refusals,
+    ),
+    track: result.track ?? turn.track,
+    track_decision: result.track_decision ?? turn.track_decision,
+    search_mode_decision:
+      result.search_mode_decision ?? turn.search_mode_decision,
+    status_classified: result.status_classified ?? turn.status_classified,
+  }));
+}
+
+async function settleSendQuestion(
+  set: StoreSetter,
+  get: StoreGetter,
+  completion: SendQuestionCompletion,
+): Promise<void> {
+  const { threadId, attempt, stream, result } = completion;
+  finalizeSendQuestionTurn(get, completion);
+  if (stream.run.attachmentWaitRunId !== null) {
+    startAttachmentPolling(threadId, ATTACHMENT_POLL_INTERVAL_MS, true);
+  }
+  await get().refreshThreads();
+  const refusal = midStreamTaskRefusal(result);
+  recordOperationVerdict(set, {
+    threadId,
+    attempt,
+    state: refusal === null ? "accepted" : "rejected",
+    reason: refusal,
+  });
+  await get().reloadTaskProjection(threadId);
+}
+
+function messageStreamStarted(stream: SendQuestionStreamState): boolean {
+  const { fold, run } = stream;
+  return (
+    fold.statusSeen ||
+    fold.windowPending !== null ||
+    fold.documentChoicePending !== null ||
+    run.attachmentWaitRunId !== null
+  );
+}
+
+/** Roll back the optimistic row of a send-shaped stream after a failure. */
+function rollbackSendStreamTurn(
+  threadId: string,
+  stream: SendQuestionStreamState,
+): void {
+  const { fold, patches, run } = stream;
+  if (messageStreamStarted(stream)) {
+    patches.flushThen((turn) => ({
+      ...closeOpenBurstsOnTurn(turn),
+      in_flight:
+        fold.windowPending !== null ||
+        fold.documentChoicePending !== null ||
+        run.attachmentWaitRunId !== null,
+    }));
+  } else {
+    dropTurnByRunId(threadId, run.optimisticRunId);
+  }
+}
+
+function failSendQuestion(
+  set: StoreSetter,
+  operation: SendQuestionOperation,
+  error: unknown,
+): void {
+  const { threadId, attempt, stream } = operation;
+  rollbackSendStreamTurn(threadId, stream);
+  if (error instanceof api.TaskInputRefusedError) {
+    recordOperationVerdict(set, {
+      threadId,
+      attempt,
+      state: "rejected",
+      reason: error.kind,
+      questionId: error.questionId,
+    });
+    return;
+  }
+  recordOperationVerdict(set, { threadId, attempt, state: "failed" });
+}
+
 // The finalize patch both resume-shaped streams run once their SSE
 // body closes: keep the row suspended when a window is pending, and
 // never re-GET over the streamed row.
@@ -1069,7 +1422,10 @@ function finalizeResumedTurn(
   // risk as the status branch).
   patches.flushThen((t) => ({
     ...closeOpenBurstsOnTurn(t),
-    in_flight: fold.windowPending !== null,
+    // A suspended choice window OR document choice means the stream ended
+    // without a terminal frame: the run waits on the operator, so the row
+    // is suspended, not done (GE-4).
+    in_flight: fold.windowPending !== null || fold.documentChoicePending !== null,
     citations: result.citations.length > 0 ? result.citations : t.citations,
     // Same refusal union as the send finalize: the resume stream's
     // accumulated refusals fold onto the row without touching the
@@ -1080,6 +1436,8 @@ function finalizeResumedTurn(
     ),
     track: result.track ?? t.track,
     track_decision: result.track_decision ?? t.track_decision,
+    search_mode_decision:
+      result.search_mode_decision ?? t.search_mode_decision,
     status_classified: result.status_classified ?? t.status_classified,
   }));
 }
@@ -1212,6 +1570,253 @@ async function settleReplyFailure(
   await get().reloadTaskProjection(input.threadId);
 }
 
+type TaskReplyPayload = NonNullable<ReturnType<typeof submitPayload>>;
+type StoreGetter = () => WorkspaceState;
+
+interface TaskReplyPreparation {
+  question: PendingQuestionView;
+  payload: TaskReplyPayload;
+}
+
+/** A terminal clarification reply opens a NEW turn on the normal send
+ * door, so it streams through the same optimistic-row machinery as
+ * ``sendQuestion``: one owner holds the fold, the patcher and the run. */
+interface TaskReplySendStream {
+  kind: "send";
+  send: SendQuestionStreamState;
+}
+
+/** A document-choice reply continues the paused run: the row already
+ * exists, so this stream only folds the remainder onto it. */
+interface TaskReplyResumeStream {
+  kind: "resume";
+  resumeRunId: string;
+  materialized: boolean;
+  fold: StreamFold;
+  patches: TurnPatcherQueue;
+}
+
+/** Which of the two reply mechanisms this submission uses.
+ *
+ * A discriminated union rather than parallel nullable fields: the fold
+ * and patcher have exactly one owner per kind, so no reader can pick the
+ * wrong pair out of two aliases over the same objects. */
+type TaskReplyStream = TaskReplySendStream | TaskReplyResumeStream;
+
+interface TaskReplySubmission extends TaskReplyPreparation {
+  threadId: string;
+  attempt: number;
+  stream: TaskReplyStream;
+}
+
+function prepareTaskReply(
+  get: StoreGetter,
+  threadId: string,
+): TaskReplyPreparation | null {
+  const question = pendingQuestionFor(get(), threadId);
+  if (question === null) return null;
+  const draft = get().clarificationDrafts[question.question_id];
+  if (!draft || !isSubmittable(draft)) return null;
+  const payload = submitPayload(draft);
+  if (payload === null) return null;
+  return { question, payload };
+}
+
+function beginTaskReplyOperation(
+  set: StoreSetter,
+  get: StoreGetter,
+  threadId: string,
+  payload: TaskReplyPayload,
+): number | null {
+  const opened = beginWorkspaceOperation(get().workspaceOperations, {
+    threadId,
+    door: "reply",
+    kind: "reply",
+    questionId: payload.questionId,
+  });
+  if (opened.operation === null) return null;
+  set({ workspaceOperations: opened.ledger });
+  return opened.operation.attempt;
+}
+
+/** The message the host will open as the reply turn's question.
+ *
+ * A terminal clarification reply is a new turn, and the host owns the
+ * composed text (`_clarify_reply_turn_question`): the committed task
+ * goal (or the pending question's prompt when there is none) beside the
+ * operator's answer, trimmed. The optimistic row renders before any host
+ * frame arrives, so it mirrors that ONE composition exactly — same
+ * fallback, same format — and the persisted GET row then replaces it
+ * with the identical string. Pinned by tests on both surfaces. */
+function replyTurnQuestion(
+  get: StoreGetter,
+  threadId: string,
+  question: PendingQuestionView,
+  payload: TaskReplyPayload,
+): string {
+  const goal =
+    get().taskRuntime[threadId]?.current_task?.goal ?? question.prompt;
+  const answer = (payload.freeText ?? payload.choiceId ?? "").trim();
+  return `原问题：${goal}\n补充回答：${answer}`;
+}
+
+function prepareTaskReplyStream(
+  get: StoreGetter,
+  set: StoreSetter,
+  threadId: string,
+  question: PendingQuestionView,
+  payload: TaskReplyPayload,
+): TaskReplyStream {
+  const resumeRunId = resumeOriginRunId(question);
+  if (resumeRunId === null) {
+    // A terminal clarification has no paused run. Its reply is a NEW
+    // turn on the send door, so it materializes and folds exactly like
+    // an ordinary question instead of dropping every stream frame.
+    return {
+      kind: "send",
+      send: createSendQuestionStream(
+        get,
+        set,
+        threadId,
+        replyTurnQuestion(get, threadId, question, payload),
+      ),
+    };
+  }
+  const materialized = ensureReplyTurn(
+    threadId,
+    resumeRunId,
+    recoveredReplyQuestion(get(), threadId, resumeRunId),
+  );
+  const fold: StreamFold = {
+    statusSeen: false,
+    windowPending: null,
+    documentChoicePending: null,
+    answerFold: EMPTY_LIVE_ANSWER,
+  };
+  const patches = makeTurnPatcherQueue((patcher) =>
+    patchTurnByRunIdOn(threadId, resumeRunId, patcher),
+  );
+  return { kind: "resume", resumeRunId, materialized, fold, patches };
+}
+
+function foldTaskReplyFrame(
+  get: StoreGetter,
+  threadId: string,
+  stream: TaskReplyStream,
+  event: api.SendEvent,
+): void {
+  if (stream.kind === "send") {
+    foldSendQuestionFrame(event, stream.send);
+    return;
+  }
+  const current = get().activeThread;
+  if (!current || current.id !== threadId) return;
+  foldResumeFrame(stream.patches, stream.fold, event);
+}
+
+async function sendTaskReply(
+  submission: TaskReplySubmission,
+  get: StoreGetter,
+): Promise<api.SendResult> {
+  const { threadId, payload, stream } = submission;
+  const onEvent = (event: api.SendEvent) =>
+    foldTaskReplyFrame(get, threadId, stream, event);
+  const result = await api.sendMessage(
+    threadId,
+    {
+      question: payload.freeText ?? "",
+      question_id: payload.questionId,
+      choice_id: payload.choiceId,
+      ...(payload.freeText !== null ? { free_text: payload.freeText } : {}),
+    },
+    onEvent,
+  );
+  if (stream.kind === "send") {
+    // The NEW turn's row is the streamed one; the finalize patch is the
+    // same one an ordinary send uses.
+    finalizeSendQuestionTurn(get, {
+      threadId,
+      attempt: submission.attempt,
+      stream: stream.send,
+      result,
+    });
+  } else {
+    // Drain queued deltas, then keep the row suspended if the stream ended
+    // on a re-opened question. The streamed row remains authoritative.
+    finalizeResumedTurn(stream.patches, threadId, stream.fold, result);
+  }
+  return result;
+}
+
+async function settleTaskReply(
+  set: StoreSetter,
+  get: StoreGetter,
+  submission: TaskReplySubmission,
+  result: api.SendResult,
+): Promise<void> {
+  const streamRefusal = midStreamTaskRefusal(result);
+  if (streamRefusal !== null) {
+    // A NEW turn's refusal row is a real streamed turn: keep it on
+    // screen (the earlier silent drop hid a failed continuation). Only
+    // a row materialized for a resume is rolled back.
+    if (submission.stream.kind === "resume") {
+      dropMaterializedTurn(
+        submission.threadId,
+        submission.stream.resumeRunId,
+        submission.stream.materialized,
+      );
+    }
+    recordReplyRefusal(set, get, {
+      threadId: submission.threadId,
+      attempt: submission.attempt,
+      draftQuestionId: submission.payload.questionId,
+      refusal: { kind: streamRefusal, questionId: submission.payload.questionId },
+    });
+    if (submission.stream.kind === "send") await get().refreshThreads();
+    await get().reloadTaskProjection(submission.threadId);
+    return;
+  }
+  recordOperationVerdict(set, {
+    threadId: submission.threadId,
+    attempt: submission.attempt,
+    state: "accepted",
+    questionId: submission.payload.questionId,
+  });
+  if (submission.stream.kind === "send") await get().refreshThreads();
+  await get().reloadTaskProjection(submission.threadId);
+}
+
+async function failTaskReply(
+  set: StoreSetter,
+  get: StoreGetter,
+  submission: TaskReplySubmission,
+  error: unknown,
+): Promise<void> {
+  if (submission.stream.kind === "send") {
+    rollbackSendStreamTurn(submission.threadId, submission.stream.send);
+  } else {
+    dropMaterializedTurn(
+      submission.threadId,
+      submission.stream.resumeRunId,
+      submission.stream.materialized,
+    );
+  }
+  await settleReplyFailure(set, get, {
+    threadId: submission.threadId,
+    attempt: submission.attempt,
+    questionId: submission.payload.questionId,
+    error,
+  });
+}
+
+/** A monotonic token for the entry reads.
+ *
+ * The entry marker below holds one of these, NOT the thread id: two
+ * concurrent reads of the SAME thread carry the same id, so an id cannot
+ * say which of them is newer. A token can, and it is per read, so the
+ * marker is also released when its read settles. */
+let entryReadSeq = 0;
+
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   threads: [],
   corpus: [],
@@ -1219,10 +1824,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   loadingThreads: false,
   threadsLoaded: false,
   corpusLoaded: false,
+  catalogOverview: null,
+  catalogOverviewLoaded: false,
   status: null,
   statusLoaded: false,
   loadingStatus: false,
   sendingQuestion: false,
+  sendingThreadId: null,
+  enteringReadToken: null,
   resumingThreadId: null,
   watchlist: [],
   notices: [],
@@ -1265,6 +1874,22 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 
+  // A failing overview read is an EMPTY overview, never a stale list: the
+  // surface shows nothing rather than documents that may no longer exist.
+  // ``catalogOverviewLoaded`` flips either way so the panel stops saying
+  // 加载中 and starts saying the truth about what it has.
+  async loadCatalogOverview() {
+    try {
+      const catalogOverview = await api.getCatalogOverview();
+      set({ catalogOverview, catalogOverviewLoaded: true });
+    } catch {
+      set({
+        catalogOverview: { documents: [], dimensions: [], flat_titles: [] },
+        catalogOverviewLoaded: true,
+      });
+    }
+  },
+
   async loadStatus() {
     // A failing or malformed status read is a left-corner line state,
     // not an error the operator has to act on: the workspace keeps
@@ -1289,7 +1914,42 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 
-  async openThread(threadId: string) {
+  async openThread(threadId: string): Promise<ThreadOpenOutcome> {
+    // T2 (plans/2026-10-20-qa-design-correction.md): the entry guard.
+    // While THIS client is sending on the thread AND the pane still
+    // holds it, the live send owns it. A read here would be redundant
+    // AND harmful: its snapshot predates the RunRecord the running
+    // answer is about to write, so the reconcile could drop the live
+    // turn and take the streamed prose with it. The route would also
+    // show its entry loader over an answer that is already arriving.
+    // The three entry paths (the demo action, the route effect, the
+    // thread page re-sync) all reach this one guard, so they cannot
+    // disagree about it.
+    //
+    // The rule itself is the SHARED one (``threadEntryIsLive``): the
+    // route's entry decision and the thread page's re-sync ask the same
+    // predicate, so what the guard skips is exactly what the route
+    // paints as live.
+    //
+    // The second condition keeps a REQUIRED read alive: when the
+    // operator left the thread (the pane holds another one), the live
+    // state is gone and this thread must still be read.
+    if (
+      threadEntryIsLive({
+        threadId,
+        sendingThreadId: get().sendingThreadId,
+        activeThreadId: get().activeThread?.id ?? null,
+      })
+    ) {
+      return { kind: "skipped", threadId, reason: "sending" };
+    }
+    // The newest entry wins: a read a LATER entry superseded must not
+    // repaint the active thread the operator already left. The marker
+    // holds this read's own TOKEN: a thread id cannot order two
+    // concurrent reads of the SAME thread, and the marker is released
+    // when the read settles.
+    const readToken = (entryReadSeq += 1);
+    set({ enteringReadToken: readToken });
     // Unknown id -> 404 -> surface as empty active thread so the
     // route can render its not-found copy. We do NOT re-invoke the
     // graph on reload; GET only.
@@ -1298,27 +1958,50 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // clear its records before the new detail lands.
     stopAttachmentPolling();
     set({ attachments: [] });
+    // The live turn table as it stands BEFORE the read. If it moves
+    // while the read is in flight, the read's snapshot is older than
+    // what the operator is watching, and the reconcile must not drop
+    // or blank the live rows it does not know about.
+    const liveAtRead = get().activeThread;
     const detail = await api.getThread(threadId);
-    // T5 (#35): a successfully opened thread becomes the one a
-    // returning visit restores.
-    rememberLastThread(threadId);
-    // T4 (plans/workspace-stream-fidelity.md): reconcile, do not
-    // replace. Replacing the turn table retracted prose the operator
-    // had already watched arrive token-by-token and repainted the
-    // persisted text over it.
-    set((s) => ({ activeThread: reconcileTurnTable(s.activeThread, detail) }));
-    // question-workspace W4: the GET is the recovery path. The task
-    // projection, the pending clarification and the archive list come
-    // back from authoritative state, so a reload restores them WITHOUT
-    // submitting empty input and WITHOUT re-invoking the graph —
-    // display recovery is separate from resuming execution
-    // (question-workspace.md: "Reopening a pending question does not
-    // require an empty or bodyless resume request").
-    const decoded = decodeThreadTaskRuntime(detail);
-    set((s) => ({
-      taskRuntime: { ...s.taskRuntime, [threadId]: decoded.view },
-    }));
-    recordProjectionRefusal(set, threadId, decoded.refusal);
+    const superseded = get().enteringReadToken !== readToken;
+    const stale = get().activeThread !== liveAtRead;
+    if (!superseded) {
+      // T5: a successfully opened thread becomes the one a
+      // returning visit restores.
+      rememberLastThread(threadId);
+      // T4 (plans/workspace-stream-fidelity.md): reconcile, do not
+      // replace. Replacing the turn table retracted prose the operator
+      // had already watched arrive token-by-token and repainted the
+      // persisted text over it.
+      set((s) => ({
+        activeThread: reconcileTurnTable(s.activeThread, detail, { stale }),
+      }));
+      // question-workspace W4: the GET is the recovery path. The task
+      // projection, the pending clarification and the archive list come
+      // back from authoritative state, so a reload restores them WITHOUT
+      // submitting empty input and WITHOUT re-invoking the graph —
+      // display recovery is separate from resuming execution
+      // (question-workspace.md: "Reopening a pending question does not
+      // require an empty or bodyless resume request").
+      const decoded = decodeThreadTaskRuntime(detail);
+      set((s) => ({
+        taskRuntime: { ...s.taskRuntime, [threadId]: decoded.view },
+      }));
+      recordProjectionRefusal(set, threadId, decoded.refusal);
+    }
+    // A SUPERSEDED read wrote nothing: its snapshot is older than the
+    // read that took over, so it must not replace that read's turn
+    // table, its marker or its projection.
+    //
+    // The read has settled: the marker is released — but only if this
+    // read still owns it, so a later read's token survives.
+    if (get().enteringReadToken === readToken) {
+      set({ enteringReadToken: null });
+    }
+    return superseded
+      ? { kind: "superseded", threadId }
+      : { kind: "opened", threadId };
   },
 
   async createThread(firstMessage: string | null) {
@@ -1334,7 +2017,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   async removeThread(threadId: string) {
     await api.deleteThread(threadId);
-    // T5 (#35): a deleted thread must never be restored on the next
+    // T5: a deleted thread must never be restored on the next
     // visit — drop the marker when it pointed here.
     forgetLastThreadIf(threadId);
     // Attach door: the host drops the thread's attachment data
@@ -1351,348 +2034,34 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async sendQuestion(threadId, question, thinkingOn = true, attachmentIds) {
-    if (!question.trim()) return null; // Empty submit is a no-op.
-    // The one send decision for the open thread, computed once from
-    // ``activeInputFactsFor`` and refused from. Two rules changed here,
-    // both deliberate:
-    //
-    // * A held send RAISES the typed refusal instead of returning
-    //   ``null``. A silent swallow left the operator with a button press
-    //   that produced nothing at all — no notice, no draft restore, no
-    //   error path — while the composer was already telling them the
-    //   thread holds. Refusing out loud keeps the notice and the
-    //   draft-restoration path honest.
-    // * An in-flight send is NOT a hold. Compatible follow-up input stays
-    //   available while work is running (SC-5); whether it is queued,
-    //   accepted, or interrupted is Runtime's call, not a client guess.
-    //
-    // The pending-choice half is one fact from both sources — the live turn
-    // table AND a projection-reloaded ``pending_turn`` — so a thread opened
-    // mid-window refuses exactly like a window watched live, instead of
-    // firing a POST the host answers 409.
-    const decision = activeInputFor(get(), threadId);
-    if (decision.holdReason !== null) throw heldRefusalFor(decision.holdReason);
-    // The message door opens its own attempt, so its verdict lands on this
-    // thread's record and a superseded send cannot repaint it.
-    const opened = beginWorkspaceOperation(get().workspaceOperations, {
-      threadId,
-      door: "message",
-      kind: "message",
-    });
-    if (opened.operation === null) return null;
-    set({ workspaceOperations: opened.ledger });
-    const attempt = opened.operation.attempt;
-    set({ sendingQuestion: true });
-
-    // T3: optimistic turn the SSE frames thread into. Allocated
-    // up front so the api client can ``onEvent`` updates against
-    // the SAME turn (matched by ``run_id``). On the first
-    // ``status`` frame we reconcile the run_id with the
-    // server-minted one and patch the turn.
-    // ``run_id`` is typed as the UUID template literal in types.ts;
-    // crypto.randomUUID() already satisfies it. The template-literal
-    // type is what makes the reconcile-on-status patch typecheck.
-    let optimisticRunId: Turn["run_id"] = crypto.randomUUID();
-    // The live row SHAPE lives in ``makeLiveTurn`` so the optimistic
-    // send row and the pick-materialized row cannot drift (see the
-    // pickChoice pending-turn path below).
-    const baseTurn: Turn = makeLiveTurn({
-      runId: optimisticRunId,
-      question,
-    });
-
-    // Helpers bound to the latest state so ``onEvent`` callbacks
-    // always patch the most-recent snapshot of the optimistic
-    // turn (the array reference is stable across renders).
-    const patchTurnByRunId = (
-      runId: Turn["run_id"],
-      patcher: (t: Turn) => Turn,
-    ) => {
-      const current = get().activeThread;
-      if (!current || current.id !== threadId) return;
-      const nextTurns = current.turns.map((t) =>
-        t.run_id === runId ? patcher(t) : t,
-      );
-      set({ activeThread: { ...current, turns: nextTurns } });
-    };
-    const patchTurn = (patcher: (t: Turn) => Turn) =>
-      patchTurnByRunId(optimisticRunId, patcher);
-    // Coalesced patcher for high-frequency SSE deltas (thinking /
-    // answer): one store patch per animation frame instead of one
-    // per wire frame. Non-delta frames go through ``flushThen`` so a
-    // queued delta can never be overtaken — or applied after — the
-    // terminal patch.
-    const turnPatches = makeTurnPatcherQueue(patchTurn);
-
-    const initial = get().activeThread;
-    if (initial && initial.id === threadId) {
-      set({
-        activeThread: { ...initial, turns: [...initial.turns, baseTurn] },
-      });
-    }
-
-    // T1 (#33): answer frames are DELTAS while the model streams; after
-    // ``status`` the wire may emit one authoritative frame — on ``done``
-    // runs we keep a non-empty draft; on refuse/step_cap an empty frame
-    // clears the draft so SC67 copy renders from ``assistant_message``.
-    // The fold state lives here rather than on the turn row because a
-    // bounce retry accumulates behind the visible draft.
-    // The stream fold this send shares with the resume path (see
-    // ``StreamFold``): ``statusSeen`` /
-    // ``answerFold`` drive the answer delta fold, and
-    // ``windowPending`` is the window a ``choice_window`` frame
-    // painted on this turn, or null. The host sends NO terminal
-    // frames on a suspended stream — while it is set the run is
-    // waiting on a pick, so the row must not be finalized (not done,
-    // still in_flight).
-    const fold: StreamFold = {
-      statusSeen: false,
-      windowPending: null,
-      answerFold: EMPTY_LIVE_ANSWER,
-    };
-    // T2f graph job gate (review C4): the server-minted run id from
-    // an ``attachment_wait`` frame — the EXACT signal that this
-    // stream suspended on the attachment_preparation interrupt.
-    // ``null`` = no frame, no wait. Replaces the old "no terminal
-    // frame + the send named a local uploaded/parsing row" heuristic,
-    // which misread a crashed/truncated stream the same way.
-    let attachmentWaitRunId: string | null = null;
-    // ADR 0086: the ids the attach door minted
-    // ride this send — and stay referenceable on every later one.
-    // The attach path never touches /api/corpus/ingest.
-    const request: api.SendRequest = { question, thinking: thinkingOn };
-    if (attachmentIds && attachmentIds.length > 0) {
-      request.attachment_ids = attachmentIds;
-    }
+    const attempt = beginMessageSend(set, get, threadId, question);
+    if (attempt === null) return null;
+    // T2: the thread-scoped in-flight fact, set SYNCHRONOUSLY — before
+    // the first await of this send — so a route mount right after
+    // ``sendQuestion(...)`` already sees it and the entry guard can
+    // reuse the live answer instead of reading the thread again.
+    set({ sendingQuestion: true, sendingThreadId: threadId });
+    const stream = createSendQuestionStream(get, set, threadId, question);
+    const operation = { threadId, attempt, stream };
+    const request = makeSendRequest(question, thinkingOn, attachmentIds);
     try {
-      const result = await api.sendMessage(threadId, request, (event) => {
-        if (foldStreamTraceFrame(turnPatches, fold, event)) return;
-        switch (event.type) {
-          case "status": {
-            fold.statusSeen = true;
-            // A terminal status ends any earlier suspension: the run
-            // (possibly after a resume in another stream) is over.
-            fold.windowPending = null;
-            // turn-trace-folds: the run ended — close any still-live
-            // burst so the folds auto-collapse (spec line 34).
-            // Drain queued deltas first so a pending thinking/answer
-            // patch can never land after this terminal patch and
-            // re-open a live burst on an ended run. Patch by the
-            // CLIENT placeholder id (``optimisticRunId`` is not
-            // reassigned until after this patch) so the optimistic
-            // row is never orphaned until GET.
-            turnPatches.flushThen((t) => ({
-              ...closeOpenBurstsOnTurn(t),
-              run_id: event.run_id,
-              status: event.status,
-              status_reason: event.reason ?? "",
-              assistant_message: event.assistant_message,
-              // Soft-Track: optional until host SSE includes track.
-              track: event.track ?? t.track,
-              track_decision: event.track_decision ?? t.track_decision,
-              // Mid-flight stream taxonomy: only set on refuse
-              // rows whose refusal came from the stream engine;
-              // an empty value from the wire keeps the prior
-              // row's value (a fresh turn starts as ``""``).
-              status_classified:
-                event.status_classified !== undefined
-                  ? event.status_classified
-                  : t.status_classified,
-              // T4 (#37): the run ended — thinking collapses to the
-              // duration label, tool rows collapse.
-              in_flight: false,
-              thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
-            }));
-            optimisticRunId = event.run_id;
-            break;
-          }
-          case "citations":
-            turnPatches.flushThen((t) => ({
-              ...t,
-              citations: event.citations,
-            }));
-            break;
-          case "evidence_refusals":
-            // Same fold, same ordering invariant as the resume path
-            // (see ``foldResumeFrame``): refusals stay visible, citations
-            // are never reordered by the fold.
-            turnPatches.flushThen((t) => ({
-              ...t,
-              evidence_refusals: mergeEvidenceRefusals(
-                t.evidence_refusals,
-                event.refusals,
-              ),
-            }));
-            break;
-          case "visual_claims":
-            // Its own field, never ``citations`` — the chip layer
-            // places a span with ``answer.indexOf(quote)`` and a visual
-            // claim has no quote. A non-delta frame, so it goes through
-            // ``flushThen`` like the terminal one: a queued answer delta
-            // must not overtake it.
-            turnPatches.flushThen((t) => ({
-              ...t,
-              visual_claims: event.visual_claims,
-            }));
-            break;
-          case "comparison":
-            turnPatches.flushThen((t) => ({
-              ...t,
-              comparisons: [...(t.comparisons ?? []), event.comparison],
-            }));
-            break;
-          case "choice_window":
-            // The run suspended on this frame; the stream closes
-            // without terminal frames. The row keeps its live flag
-            // (see the finalize patch) and the window renders as the
-            // operator's next action.
-            fold.windowPending = event.window;
-            turnPatches.flushThen((t) => ({
-              ...t,
-              choice_window: event.window,
-            }));
-            break;
-          case "attachment_wait":
-            // T2f: the run suspended on the attachment_preparation
-            // interrupt and the durable job AUTO-resumes it — no
-            // operator action. Record the server-minted run id on the
-            // optimistic row (patch-then-reassign, the same ordering
-            // the status branch uses) so the row is never orphaned
-            // and a reload after the auto-resume reconciles against
-            // the persisted record instead of flashing a duplicate.
-            // The row stays live — see the finalize patch below.
-            attachmentWaitRunId = event.run_id;
-            turnPatches.flushThen((t) => ({
-              ...t,
-              run_id: event.run_id,
-            }));
-            optimisticRunId = event.run_id;
-            break;
-        }
-      });
-      // T2f (review C4): the wait holds ONLY when the host emitted the
-      // exact ``attachment_wait`` frame on this stream — the run is
-      // alive, suspended on the ``attachment_preparation`` interrupt,
-      // and will auto-resume, so the optimistic row stays live and the
-      // readiness poll follows the chip through the wait. The pre-C4
-      // heuristic (no terminal frame + the send named a local
-      // uploaded/parsing row) is deleted: it also matched a
-      // crashed/truncated stream on a thread holding a stray upload,
-      // leaving the row live and a poll spinning on a dead run. (A
-      // suspended choice window keeps ``windowPending`` instead; a
-      // crash or transport error takes the catch path below.)
-      const preparationWait = attachmentWaitRunId !== null;
-      // The SSE stream already delivered terminal status, answer, and
-      // citations. Re-GET'ing here used to replace the live turn row
-      // and caused a visible retract/repop even when merge logic ran
-      // immediately after — keep the streamed row; refresh the sidebar
-      // list only. Reload still uses GET via ThreadPage's effect.
-      const cur = get().activeThread;
-      if (cur?.id === threadId) {
-        // Drain the queue first: a queued delta patch must not land
-        // after the finalize patch (same ghost-burst risk as the
-        // status branch).
-        turnPatches.flushThen((t) => ({
-          ...closeOpenBurstsOnTurn(t),
-          // A pending window means the stream ended WITHOUT a
-          // terminal frame — the run is suspended, not done. Same
-          // for a preparation wait, which resumes without any
-          // operator action.
-          in_flight: fold.windowPending !== null || preparationWait,
-          citations:
-            result.citations.length > 0 ? result.citations : t.citations,
-          // Union of everything the per-frame fold already saw and the
-          // terminal result accumulated from the wire — duplicates drop
-          // (the same run can be named by both the server refusal lane
-          // and a web decode), order and the citations array are
-          // untouched.
-          evidence_refusals: mergeEvidenceRefusals(
-            t.evidence_refusals,
-            result.evidence_refusals,
-          ),
-          track: result.track ?? t.track,
-          track_decision: result.track_decision ?? t.track_decision,
-          status_classified: result.status_classified ?? t.status_classified,
-        }));
-      }
-      if (preparationWait) {
-        // Cover the whole wait window from the client side too: the
-        // run referenced these records, so uploaded rows are pending
-        // work now, not idle uploads.
-        startAttachmentPolling(threadId, ATTACHMENT_POLL_INTERVAL_MS, true);
-      }
-      await get().refreshThreads();
-      // The send can change the task envelope (e.g. an ordinary message
-      // that starts or completes work): the same settle point as the
-      // thread list refresh also re-reads the projection, so the panel
-      // and the archive list cannot keep a stale current task. The
-      // read failure stays non-fatal (reloadTaskProjection records it).
-      // What the host said about the REQUEST is recorded at that same
-      // settle point, before the re-read: a stream that carried a task
-      // refusal was never accepted, and whether the task advanced stays
-      // the projection's word rather than this record's.
-      const streamRefusal = midStreamTaskRefusal(result);
-      recordOperationVerdict(set, {
-        threadId,
-        attempt,
-        state: streamRefusal === null ? "accepted" : "rejected",
-        reason: streamRefusal,
-      });
-      await get().reloadTaskProjection(threadId);
+      const result = await api.sendMessage(threadId, request, (event) =>
+        foldSendQuestionFrame(event, stream),
+      );
+      await settleSendQuestion(set, get, { ...operation, result });
       return result;
     } catch (error) {
-      // The send failed (409 concurrent_run / 503 ingest_missing /
-      // transport). Before this the rejection escaped into a
-      // floating promise and the optimistic row stayed ``in_flight``
-      // forever — a ghost turn with no question answered. Drop the
-      // row when no frame ever landed on it; keep (but un-live) a
-      // row the stream had already started painting, then rethrow so
-      // the composer can show the failure.
-      if (
-        fold.statusSeen ||
-        fold.windowPending !== null ||
-        attachmentWaitRunId !== null
-      ) {
-        // Drain any queued deltas before un-living the row so a late
-        // flush cannot patch a row the stream already abandoned; the
-        // closeOpenBursts also guarantees a queued delta folded after
-        // the terminal status cannot leave a live burst on the row.
-        // A suspended row (window or preparation wait painted, then
-        // transport error) stays in_flight — the pick path can still
-        // resume a window, and a preparation wait auto-resumes on
-        // its own.
-        turnPatches.flushThen((t) => ({
-          ...closeOpenBurstsOnTurn(t),
-          in_flight:
-            fold.windowPending !== null || attachmentWaitRunId !== null,
-        }));
-      } else {
-        dropTurnByRunId(threadId, optimisticRunId);
-      }
-      // The attempt the message door opened still needs the host's answer,
-      // or the ledger would keep reporting a send that never settled: a
-      // named refusal is the host's rejection of THIS message, and anything
-      // else (409 concurrent run, 503, transport) is a send whose outcome
-      // the browser never learned. Both are written against this attempt,
-      // so a superseded send cannot repaint the current operation.
-      if (error instanceof api.TaskInputRefusedError) {
-        recordOperationVerdict(set, {
-          threadId,
-          attempt,
-          state: "rejected",
-          reason: error.kind,
-          questionId: error.questionId,
-        });
-      } else {
-        recordOperationVerdict(set, {
-          threadId,
-          attempt,
-          state: "failed",
-        });
-      }
+      failSendQuestion(set, operation, error);
       throw error;
     } finally {
-      set({ sendingQuestion: false });
+      // The send settled — success, failure or cancellation. The
+      // thread-scoped fact is released, but only if this send still
+      // owns it: a later send on another thread keeps its own id.
+      set((s) => ({
+        sendingQuestion: false,
+        sendingThreadId:
+          s.sendingThreadId === threadId ? null : s.sendingThreadId,
+      }));
     }
   },
 
@@ -1720,13 +2089,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
 
     try {
-      // Same delta semantics as sendQuestion (T1 #33): append while
+      // Same delta semantics as sendQuestion (T1): append while
       // streaming; post-status empty frame clears refuse/step_cap draft.
       // The fold starts from the prose already painted on the resumed
       // row so the first delta extends it instead of replacing it.
       const fold: StreamFold = {
         statusSeen: false,
         windowPending: null,
+        documentChoicePending: null,
         answerFold: {
           ...EMPTY_LIVE_ANSWER,
           visible: latestTurnAnswer(threadId),
@@ -1793,6 +2163,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const fold: StreamFold = {
         statusSeen: false,
         windowPending: null,
+        documentChoicePending: null,
         answerFold: { ...EMPTY_LIVE_ANSWER, visible: turn.answer },
       };
       const patches = makeTurnPatcherQueue(patchTarget);
@@ -1939,71 +2310,27 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async submitTaskReply(threadId) {
-    const question = pendingQuestionFor(get(), threadId);
-    if (question === null) return;
-    const draft = get().clarificationDrafts[question.question_id];
-    if (!draft || !isSubmittable(draft)) return;
-    // The payload is built from the draft, which carries the ORIGINAL
-    // question association. Building it once and posting that exact
-    // object is what makes a retry identical rather than merely
-    // similar (spec: a transport retry resends the identical reply with
-    // its original question association).
-    const payload = submitPayload(draft);
-    if (payload === null) return;
-    // The reply door opens its OWN attempt on THIS thread. Everything the
-    // host then says is written against that attempt number, so a verdict
-    // for a reply the operator has already superseded is dropped by the
-    // ledger instead of repainting the operation now on screen.
-    const opened = beginWorkspaceOperation(get().workspaceOperations, {
+    const prepared = prepareTaskReply(get, threadId);
+    if (prepared === null) return;
+    const attempt = beginTaskReplyOperation(set, get, threadId, prepared.payload);
+    if (attempt === null) return;
+    const submission: TaskReplySubmission = {
+      ...prepared,
       threadId,
-      door: "reply",
-      kind: "reply",
-      questionId: payload.questionId,
-    });
-    if (opened.operation === null) return;
-    set({ workspaceOperations: opened.ledger });
-    const attempt = opened.operation.attempt;
+      attempt,
+      stream: prepareTaskReplyStream(
+        get,
+        set,
+        threadId,
+        prepared.question,
+        prepared.payload,
+      ),
+    };
     try {
-      const result = await api.sendMessage(threadId, {
-        question: payload.freeText ?? "",
-        question_id: payload.questionId,
-        choice_id: payload.choiceId,
-        ...(payload.freeText !== null ? { free_text: payload.freeText } : {}),
-      });
-      // The same mid-stream refusal the restore door can answer: the
-      // reply was durably accepted and then refused at reconciliation.
-      // Treating that as acceptance would show the operator an answered
-      // clarification that was never adopted.
-      const streamRefusal = midStreamTaskRefusal(result);
-      if (streamRefusal !== null) {
-        recordReplyRefusal(set, get, {
-          threadId,
-          attempt,
-          draftQuestionId: payload.questionId,
-          refusal: { kind: streamRefusal, questionId: payload.questionId },
-        });
-        await get().reloadTaskProjection(threadId);
-        return;
-      }
-      // Accepted: the host owns the resulting state, so re-read it
-      // rather than assuming the clarification closed. The accepted
-      // verdict is the host's word about the REQUEST only — whether the
-      // question is answered comes from the projection read below, never
-      // from this record.
-      recordOperationVerdict(set, {
-        threadId,
-        attempt,
-        state: "accepted",
-        questionId: payload.questionId,
-      });
-      await get().reloadTaskProjection(threadId);
+      const result = await sendTaskReply(submission, get);
+      await settleTaskReply(set, get, submission, result);
     } catch (error) {
-      await settleReplyFailure(set, get, {
-        threadId,
-        attempt,
-        questionId: payload.questionId,
-        error,
-      });
+      await failTaskReply(set, get, submission, error);
     }
   },
 
@@ -2277,13 +2604,19 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 // duration; ``mergeReconciledTurn`` keeps the prose (and trace) the
 // operator already watched stream in so the bubble never retracts and
 // repaints. Rows this session never streamed come straight from the
-// server. The still-running row is the one exception the server cannot
-// send: a RunRecord is appended only once its stream completes, so a
-// mid-run reopen carries the live row over — dropping it would blank
-// the bubble AND orphan the patches the running stream still makes.
+// server.
+//
+// ``stale`` says the read is OLDER than what is on screen: the live
+// turn table moved while the read was in flight. The still-running row
+// is then the exception the server cannot send — a RunRecord is
+// appended only once its stream completes, so a mid-run reopen carries
+// the live row over — and a read that lands AFTER the terminal status
+// frame (which already cleared the in-flight flag) must carry it over
+// too, or the streamed prose disappears with the row.
 function reconcileTurnTable(
   streamed: ThreadDetail | null,
   persisted: ThreadDetail,
+  options: { stale: boolean },
 ): ThreadDetail {
   if (!streamed || streamed.id !== persisted.id) return persisted;
   const streamedByRunId = new Map<string, Turn>(
@@ -2308,10 +2641,20 @@ function reconcileTurnTable(
       ),
     };
   });
-  const stillRunning = streamed.turns.filter(
-    (t) => t.in_flight === true && !persistedRunIds.has(t.run_id),
+  // The live rows the persisted table does not know about. A row is
+  // absent from the persisted table when its RunRecord has not been
+  // written yet — the server appends it when the run's stream ends.
+  // While the read is FRESH the in-flight flag is the signal that the
+  // row is still the server's to write; when the read is STALE its
+  // snapshot predates the live table, so the row is kept whatever its
+  // flag says: a terminal status frame already cleared it, and
+  // dropping the row would take the streamed prose with it.
+  const liveOnlyRows = streamed.turns.filter(
+    (t) =>
+      !persistedRunIds.has(t.run_id) &&
+      (options.stale || t.in_flight === true),
   );
-  return { ...persisted, turns: [...reconciled, ...stillRunning] };
+  return { ...persisted, turns: [...reconciled, ...liveOnlyRows] };
 }
 
 // Remove an optimistic turn that never received a single SSE frame.
@@ -2372,6 +2715,81 @@ function patchTurnByRunIdOn(
       ),
     },
   });
+}
+
+// The origin run id a reply would RESUME, or ``null``. Only a
+// ``document_choice`` question names the run it interrupted; a
+// ``task_clarification`` (and any question without an origin run) is
+// answered by a FRESH run on the send door and carries no resume identity,
+// so it takes the door's original path.
+function resumeOriginRunId(question: PendingQuestionView): string | null {
+  if (question.purpose !== "document_choice") return null;
+  const origin = question.origin_run_id;
+  return typeof origin === "string" && origin.length > 0 ? origin : null;
+}
+
+// The reply door's target row for a RESUMED document choice. The host
+// answers the pick by continuing the run the question names
+// (``origin_run_id``) rather than minting a fresh one, and it persists the
+// resumed remainder under that same id — but a paused run has no
+// RunRecord yet, so after a reload ``turns[]`` holds no row for it. The
+// resumed stream would then have nothing to paint into (and
+// ``reloadTaskProjection`` deliberately never repaints turns). Materialize
+// a live row under the origin run id when none exists, using the same
+// shape the optimistic send row uses (``makeLiveTurn``) — the precedent
+// ``resolvePickTurn`` set for a pick. Returns whether THIS call built the
+// row, the signal the failure rollback keys on.
+function ensureReplyTurn(
+  threadId: string,
+  runId: string,
+  question: string,
+): boolean {
+  const current = useWorkspaceStore.getState().activeThread;
+  if (!current || current.id !== threadId) return false;
+  if (current.turns.some((t) => t.run_id === runId)) return false;
+  const turn = makeLiveTurn({ runId, question });
+  useWorkspaceStore.setState({
+    activeThread: { ...current, turns: [...current.turns, turn] },
+  });
+  return true;
+}
+
+// Drop a reply row THIS call materialized when the reply failed (a typed
+// pre-SSE refusal, a transport error, or a mid-stream task refusal). A
+// materialized row is not yet a server record, so leaving it would strand
+// a permanently in-flight ghost; a row that already existed (the live send
+// path) is left exactly as it was, matching the pick path's rule.
+function dropMaterializedTurn(
+  threadId: string,
+  runId: string,
+  materialized: boolean,
+): void {
+  if (!materialized) return;
+  const cur = useWorkspaceStore.getState().activeThread;
+  if (!cur || cur.id !== threadId) return;
+  useWorkspaceStore.setState({
+    activeThread: {
+      ...cur,
+      turns: cur.turns.filter((t) => t.run_id !== runId),
+    },
+  });
+}
+
+// The original question the resumed reply answers, recovered from the
+// accepted-input history by the run it continues. The original send
+// accepted a ``message`` row carrying the operator's own words under that
+// run id, so this is the one honest source for the row's prompt — the
+// pending question's ``prompt`` is the question the HOST asks the
+// operator, not the operator's question. Absent history (an older host)
+// reads as no question rather than inventing one.
+function recoveredReplyQuestion(
+  state: Pick<WorkspaceState, "taskRuntime">,
+  threadId: string,
+  runId: string,
+): string {
+  const rows = state.taskRuntime[threadId]?.input_history ?? [];
+  const row = rows.find((r) => r.run_id === runId && r.kind === "message");
+  return row?.payload ?? "";
 }
 
 // search-mode-host T2 pick resolution: the row a pick continues, or — when
@@ -2681,6 +3099,10 @@ function applyIngestJobStatus(status: JobStatus): void {
   useWorkspaceStore.setState({ ingestJob: status, ingestJobFailure: null });
   if (status.state === "ready") {
     void useWorkspaceStore.getState().loadCorpus();
+    // T6: the catalog row exists once the publication succeeded, so the
+    // generic overview refreshes on the same signal the financial
+    // projection does.
+    void useWorkspaceStore.getState().loadCatalogOverview();
   }
 }
 

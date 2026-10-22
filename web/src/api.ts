@@ -6,6 +6,10 @@
 // carry JSON. This matches spec ADR 0026.
 
 import type {
+  CatalogDimension,
+  CatalogDocument,
+  CatalogGroup,
+  CatalogOverview,
   ChoiceWindow,
   Citation,
   Comparison,
@@ -15,6 +19,7 @@ import type {
   JobStatus,
   Notice,
   SoftTrack,
+  SearchModeDecision,
   StreamErrorKind,
   ThreadAttachment,
   ThreadDetail,
@@ -25,6 +30,10 @@ import type {
   WorkspaceStatus,
 } from "./types";
 import { parseChoiceWindow } from "./choiceWindow";
+import {
+  parseDocumentChoiceFrame,
+  type DocumentChoiceFrame,
+} from "./capabilities/task/taskRuntime";
 import { decodeComparison } from "./comparison";
 import {
   decodeCitationsArray,
@@ -33,10 +42,15 @@ import {
   decodeThreadDetail,
 } from "./evidenceContract";
 import { threadAttachmentUrl } from "./sourceLocator";
-import { parseVisualClaimFrame } from "./visualClaims";
+import { parseVisualClaimFrame } from "./capabilities/evidence/visualClaims";
 import { parseWorkspaceStatus } from "./knowledgeMcp";
 import { parseSoftTrack, parseTrackDecision } from "./softTrack";
+import { parseSearchModeDecision } from "./capabilities/trace/searchModeReceipt";
 import { parseStreamErrorKind } from "./streamErrorKind";
+import {
+  parseTurnSpansResponse,
+  type TurnSpansResponse,
+} from "./capabilities/trace/traceSpans";
 import { foldSendResultAnswer } from "./turnStream";
 import { parseNotices, parseWatchlist } from "./watchlist";
 
@@ -112,10 +126,177 @@ export async function deleteThread(threadId: string): Promise<void> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }
 
+/**
+ * One turn's trace spans (the developer TaskPanel waterfall).
+ *
+ * An empty trace is a 200 with ``spans: []`` — tracing was never enabled
+ * is a normal state, not a refusal — so the decoder keeps the host's
+ * ``trace_state`` beside the rows and the caller renders the receipt
+ * fallback rather than an error.
+ */
+export async function getTurnSpans(
+  threadId: string,
+  turnId: string,
+): Promise<TurnSpansResponse> {
+  const res = await fetch(
+    `/api/threads/${encodeURIComponent(threadId)}/turns/` +
+      `${encodeURIComponent(turnId)}/spans`,
+  );
+  const parsed = parseTurnSpansResponse(await jsonOrThrow<unknown>(res));
+  if (parsed === null) throw new Error("malformed /spans payload");
+  return parsed;
+}
+
 export async function getCorpus(): Promise<Filing[]> {
   const res = await fetch("/api/corpus");
   const body = await jsonOrThrow<{ filings: Filing[] }>(res);
   return body.filings;
+}
+
+/** The GENERIC catalog surface (T6): documents with their title and type
+ * plus the presentation grouping.
+ *
+ * A separate mouth from ``getCorpus``: that one is the FINANCIAL
+ * compatibility projection whose six-key shape is frozen for its existing
+ * callers, while an ordinary uploaded document has no company / period /
+ * form at all. */
+export async function getCatalogOverview(): Promise<CatalogOverview> {
+  const res = await fetch("/api/corpus/overview");
+  const body = await jsonOrThrow<unknown>(res);
+  const parsed = parseCatalogOverview(body);
+  if (parsed === null) throw new Error("malformed /api/corpus/overview payload");
+  return parsed;
+}
+
+/** Where a grouping bucket puts a document with no value for that
+ * dimension. Pinned on both sides so the SPA and the host cannot name the
+ * same bucket differently. */
+export const UNCLASSIFIED_LABEL = "未分类";
+
+const GROUPING_KEYS = ["doc_type", "company", "period"] as const;
+
+/** ``row[name]`` when it is a non-empty string, else ``undefined`` — one
+ * rule so every identity field in this decoder is checked the same way. */
+function nonEmptyString(
+  row: Record<string, unknown>,
+  name: string,
+): string | undefined {
+  const value = row[name];
+  return typeof value === "string" && value ? value : undefined;
+}
+
+/** ``row[name]`` when it is an array of non-empty strings, else
+ * ``undefined``. */
+function nonEmptyStringList(
+  row: Record<string, unknown>,
+  name: string,
+): string[] | undefined {
+  const value = row[name];
+  if (!Array.isArray(value)) return undefined;
+  if (!value.every((entry) => typeof entry === "string" && entry)) return undefined;
+  return value as string[];
+}
+
+/** The two OPTIONAL display fields of a document row, or ``null`` when
+ * one of them is present but not a non-empty string. Both absent gives
+ * the empty object, so a metadata-free document stays exactly that
+ * instead of growing a ``company: null``. */
+function optionalCatalogMetadata(
+  row: Record<string, unknown>,
+): Pick<CatalogDocument, "company" | "period"> | null {
+  const metadata: Pick<CatalogDocument, "company" | "period"> = {};
+  for (const field of ["company", "period"] as const) {
+    const raw = row[field];
+    if (raw === undefined) continue;
+    const present = nonEmptyString(row, field);
+    if (!present) return null;
+    metadata[field] = present;
+  }
+  return metadata;
+}
+
+/** The five ALWAYS-present identity/display fields of a document row, or
+ * ``null`` when any of them is missing or not a non-empty string. */
+function requiredCatalogIdentity(
+  row: Record<string, unknown>,
+): Omit<CatalogDocument, "company" | "period"> | null {
+  const identity = {
+    document_id: nonEmptyString(row, "document_id"),
+    version: nonEmptyString(row, "version"),
+    title: nonEmptyString(row, "title"),
+    doc_type: nonEmptyString(row, "doc_type"),
+  };
+  if (Object.values(identity).some((value) => value === undefined)) return null;
+  if (typeof row.page_count !== "number") return null;
+  return { ...identity, page_count: row.page_count } as Omit<
+    CatalogDocument,
+    "company" | "period"
+  >;
+}
+
+/** One generic read-model row, or ``null`` when its shape does not hold. */
+function parseCatalogDocument(entry: unknown): CatalogDocument | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  const row = entry as Record<string, unknown>;
+  const identity = requiredCatalogIdentity(row);
+  if (!identity) return null;
+  // A present-but-blank optional value is a refusal, not a silently
+  // dropped field: a null would render as the word "null".
+  const metadata = optionalCatalogMetadata(row);
+  if (metadata === null) return null;
+  return { ...identity, ...metadata };
+}
+
+/** One grouping bucket, or ``null`` when its shape does not hold. */
+function parseCatalogGroup(entry: unknown): CatalogGroup | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  const group = entry as Record<string, unknown>;
+  const value = nonEmptyString(group, "value");
+  const document_ids = nonEmptyStringList(group, "document_ids");
+  if (!value || !document_ids) return null;
+  return { value, document_ids };
+}
+
+/** One grouping dimension, or ``null`` when its shape does not hold. */
+function parseCatalogDimension(entry: unknown): CatalogDimension | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  const row = entry as Record<string, unknown>;
+  const key = row.key;
+  if (typeof key !== "string") return null;
+  if (!(GROUPING_KEYS as readonly string[]).includes(key)) return null;
+  const label = nonEmptyString(row, "label");
+  const groups = parseRowList(row.groups, parseCatalogGroup);
+  if (!label || !groups) return null;
+  return { key: key as CatalogDimension["key"], label, groups };
+}
+
+/** Decode one list of rows through ``parse``, or ``null`` if any entry
+ * fails — a list is decoded whole or not at all, so the surface never
+ * renders half a corpus. */
+function parseRowList<T>(
+  raw: unknown,
+  parse: (entry: unknown) => T | null,
+): T[] | null {
+  if (!Array.isArray(raw)) return null;
+  const rows: T[] = [];
+  for (const entry of raw) {
+    const parsed = parse(entry);
+    if (parsed === null) return null;
+    rows.push(parsed);
+  }
+  return rows;
+}
+
+function parseCatalogOverview(value: unknown): CatalogOverview | null {
+  if (typeof value !== "object" || value === null) return null;
+  const body = value as Record<string, unknown>;
+  const documents = parseRowList(body.documents, parseCatalogDocument);
+  if (documents === null) return null;
+  const dimensions = parseRowList(body.dimensions, parseCatalogDimension);
+  if (dimensions === null) return null;
+  if (!Array.isArray(body.flat_titles)) return null;
+  if (!body.flat_titles.every((title) => typeof title === "string")) return null;
+  return { documents, dimensions, flat_titles: body.flat_titles as string[] };
 }
 
 /**
@@ -145,7 +326,7 @@ export class FilingMonitorDegradedError extends Error {
   }
 }
 
-// ----- T4 workflow (the tracked change): watchlist, notices, stop -----
+// ----- T4 workflow: watchlist, notices, stop -----
 
 export async function listWatchlist(): Promise<WatchEntry[]> {
   const res = await fetch("/api/watchlist");
@@ -235,6 +416,7 @@ export interface SendResult {
   // Soft-Track: optional until the host peer lands SSE ``track``.
   track?: SoftTrack;
   track_decision?: TrackDecision;
+  search_mode_decision?: SearchModeDecision;
   // Mid-flight stream error taxonomy on refuse rows. Empty when
   // the run did not end on the stream-engine failure path; the
   // SPA renders a small "原因" label off this field so a 401 /
@@ -250,7 +432,7 @@ export interface SendResult {
 // T3 streaming events surfaced to the caller as they arrive.
 // The store threads each one into the optimistic turn so the
 // tools region + scratchpad fill in while the run is live.
-// T1 (#33): ``thinking`` / ``answer`` frames are DELTAS (fragments
+// T1: ``thinking`` / ``answer`` frames are DELTAS (fragments
 // to concatenate); the authoritative full answer arrives on the
 // terminal ``answer`` frame AFTER ``status`` (fixed server order).
 export type SendEvent =
@@ -273,21 +455,24 @@ export type SendEvent =
       status: SendResult["status"];
       reason?: string | null;
       assistant_message: string;
-      // T4 (#37): the run's total thinking duration in ms, known
+      // T4: the run's total thinking duration in ms, known
       // by stream end; drives the live turn's collapse label.
       thinking_ms?: number;
       // Soft-Track: optional until host SSE includes ``track``.
       track?: SoftTrack;
       track_decision?: TrackDecision;
+      search_mode_decision?: SearchModeDecision;
       // Mid-flight stream error taxonomy; non-empty only on
       // refuse rows whose refusal came from the stream engine
       // (not the citation gate). Mirrors the SSE
       // ``status_classified`` field.
       status_classified?: StreamErrorKind | "";
+      // A5: present only when the run stored insufficient_evidence.
+      semantic_outcome?: string | null;
     }
   | { type: "answer"; text: string; reset?: boolean }
   | { type: "citations"; citations: Citation[] }
-  // E6 (the tracked change): the run's named per-row evidence refusals. New
+  // E6: the run's named per-row evidence refusals. New
   // event vocabulary minted at E5 — ``{"refusals": [{citation_index,
   // error}]}`` emitted BEFORE the terminal ``citations`` frame, which
   // closes the reader — entry shape mirroring the history read's
@@ -322,7 +507,24 @@ export type SendEvent =
       run_id: string;
       kind: string;
       attachment_ids: string[];
-    };
+    }
+  | {
+      type: "document_choice";
+      frame: DocumentChoiceFrame;
+    }
+  // The run suspended for a document choice (specs/qa-chain-grounded-experience.md
+  // §GE-4: "≤4 hit-backed candidates have title/section/summary and
+  // trailing rephrase"). NO terminal status/answer/citations frames follow
+  // on this stream — the run resumes on the document-choice reply.
+  //
+  // This frame is a REFERENCE, not a second candidate list: it names the
+  // committed ``question_id`` and the ``origin_run_id`` it interrupted, so
+  // the client can mark THAT run suspended. The candidates themselves come
+  // only from the authoritative projection
+  // (``task_runtime.pending_question.choice_details``) — re-read on
+  // receipt, so a reload and a live frame paint the identical question and
+  // the reply binds to the original run/receipt.
+  | { type: "document_choice"; frame: DocumentChoiceFrame };
 
 /** The one interrupt kind the host's attachment wait rides — shared by
  * the SSE ``attachment_wait`` frame and the GET detail's
@@ -594,6 +796,10 @@ export async function sendMessage(
   return consumeSseStream(res.body, onEvent);
 }
 
+function insufficientEvidenceToken(value: unknown): string | undefined {
+  return value === "insufficient_evidence" ? value : undefined;
+}
+
 /**
  * Shared SSE consumption loop for the send AND resume paths
  * (T4). Reads ``body`` frame-by-frame, dispatches each typed event
@@ -601,303 +807,336 @@ export async function sendMessage(
  * Extracted from ``sendMessage`` so the resume path cannot drift
  * on frame parsing / error tolerance.
  */
+type ParsedSseFrame = { eventName: string; payload: unknown };
+
+interface SseStreamContext {
+  result: SendResult;
+  emit: (event: SendEvent) => void;
+  sawStatus: boolean;
+}
+
+type SseFrameHandler = (payload: unknown, context: SseStreamContext) => void;
+
+interface StatusFramePayload {
+  run_id?: string;
+  status: SendResult["status"];
+  reason?: string;
+  assistant_message?: string;
+  thinking_ms?: number;
+  track?: unknown;
+  track_decision?: unknown;
+  search_mode_decision?: unknown;
+  status_classified?: string;
+  semantic_outcome?: unknown;
+  evidence_schema?: unknown;
+  schema_version?: unknown;
+}
+
+function handleThinkingFrame(payload: unknown, { emit }: SseStreamContext): void {
+  const thinking = payload as { text: string };
+  emit({ type: "thinking", text: thinking.text ?? "" });
+}
+
+function handleToolCallFrame(payload: unknown, { emit }: SseStreamContext): void {
+  const call = payload as {
+    name: string;
+    args: Record<string, unknown>;
+    tool_call_id: string;
+  };
+  emit({
+    type: "tool_call",
+    name: call.name,
+    args: call.args ?? {},
+    tool_call_id: call.tool_call_id,
+  });
+}
+
+function handleToolResultFrame(payload: unknown, { emit }: SseStreamContext): void {
+  const result = payload as {
+    tool_call_id: string;
+    name: string;
+    summary?: string;
+  };
+  emit({
+    type: "tool_result",
+    tool_call_id: result.tool_call_id,
+    name: result.name,
+    summary: result.summary ?? result.name,
+  });
+}
+
+function applyStatusMetadata(
+  status: StatusFramePayload,
+  context: SseStreamContext,
+): StreamErrorKind | "" {
+  const { result } = context;
+  const trackDecision = parseTrackDecision(status.track_decision);
+  const track = parseSoftTrack(status.track) ?? trackDecision?.track;
+  if (track !== undefined) result.track = track;
+  if (trackDecision !== undefined) result.track_decision = trackDecision;
+  result.search_mode_decision = parseSearchModeDecision(
+    status.search_mode_decision,
+  );
+  const classified: StreamErrorKind | "" =
+    parseStreamErrorKind(status.status_classified) ?? "";
+  if (classified) result.status_classified = classified;
+  emitEvidenceEnvelopeRefusal(status, context);
+  return classified;
+}
+
+function emitEvidenceEnvelopeRefusal(
+  status: StatusFramePayload,
+  context: SseStreamContext,
+): void {
+  const envelope = decodeEvidenceSchemaField(
+    status.evidence_schema,
+    status.schema_version,
+  );
+  if (envelope !== "unsupported" && envelope !== "malformed") return;
+  const refusal: EvidenceRefusal = {
+    citation_index: 0,
+    error:
+      envelope === "unsupported"
+        ? "unsupported_evidence_contract"
+        : "malformed_evidence_contract",
+  };
+  context.result.evidence_refusals.push(refusal);
+  context.emit({ type: "evidence_refusals", refusals: [refusal] });
+}
+
+function updateStatusRunId(status: StatusFramePayload, result: SendResult): void {
+  if (typeof status.run_id === "string" && status.run_id.length > 0) {
+    result.run_id = status.run_id;
+  }
+}
+
+function handleStatusFrame(
+  payload: unknown,
+  context: SseStreamContext,
+): void {
+  const status = payload as StatusFramePayload;
+  const { result, emit } = context;
+  context.sawStatus = true;
+  result.status = status.status;
+  result.reason = status.reason ?? null;
+  result.assistantMessage = status.assistant_message ?? "";
+  const classified = applyStatusMetadata(status, context);
+  updateStatusRunId(status, result);
+  emit({
+    type: "status",
+    run_id: result.run_id,
+    status: status.status,
+    reason: status.reason ?? null,
+    assistant_message: status.assistant_message ?? "",
+    thinking_ms: status.thinking_ms,
+    track: result.track,
+    track_decision: result.track_decision,
+    search_mode_decision: result.search_mode_decision,
+    status_classified: classified,
+    semantic_outcome: insufficientEvidenceToken(status.semantic_outcome),
+  });
+}
+
+function handleCitationsFrame(
+  payload: unknown,
+  context: SseStreamContext,
+): void {
+  const frame = decodeCitationsArray(payload);
+  context.result.citations = frame.citations;
+  context.result.evidence_refusals = context.result.evidence_refusals.concat(
+    frame.refusals,
+  );
+  context.emit({ type: "citations", citations: frame.citations });
+  if (frame.refusals.length > 0) {
+    context.emit({ type: "evidence_refusals", refusals: frame.refusals });
+  }
+}
+
+function handleEvidenceRefusalsFrame(
+  payload: unknown,
+  context: SseStreamContext,
+): void {
+  const refusals = decodeEvidenceRefusalsFrame(payload);
+  if (refusals.length === 0) return;
+  context.result.evidence_refusals =
+    context.result.evidence_refusals.concat(refusals);
+  context.emit({ type: "evidence_refusals", refusals });
+}
+
+function handleVisualClaimsFrame(
+  payload: unknown,
+  context: SseStreamContext,
+): void {
+  context.emit({
+    type: "visual_claims",
+    visual_claims: parseVisualClaimFrame(payload),
+  });
+}
+
+function handleComparisonFrame(
+  payload: unknown,
+  context: SseStreamContext,
+): void {
+  const outcome = decodeComparison(payload);
+  if (outcome.status === "ok") {
+    context.result.comparisons.push(outcome.comparison);
+    context.emit({ type: "comparison", comparison: outcome.comparison });
+    return;
+  }
+  const refusal: EvidenceRefusal = {
+    citation_index: 0,
+    error: outcome.error,
+  };
+  context.result.evidence_refusals.push(refusal);
+  context.emit({ type: "evidence_refusals", refusals: [refusal] });
+}
+
+function handleChoiceWindowFrame(
+  payload: unknown,
+  { emit }: SseStreamContext,
+): void {
+  const window = parseChoiceWindow(payload);
+  if (window !== null) emit({ type: "choice_window", window });
+}
+
+function handleAttachmentWaitFrame(
+  payload: unknown,
+  { emit }: SseStreamContext,
+): void {
+  const wait = payload as {
+    run_id?: unknown;
+    kind?: unknown;
+    attachment_ids?: unknown;
+  };
+  if (
+    typeof wait.run_id !== "string" ||
+    wait.run_id.length === 0 ||
+    wait.kind !== ATTACHMENT_PREPARATION_KIND
+  ) {
+    return;
+  }
+  emit({
+    type: "attachment_wait",
+    run_id: wait.run_id,
+    kind: ATTACHMENT_PREPARATION_KIND,
+    attachment_ids: Array.isArray(wait.attachment_ids)
+      ? wait.attachment_ids.map((id) => String(id))
+      : [],
+  });
+}
+
+function handleAnswerFrame(
+  payload: unknown,
+  context: SseStreamContext,
+): void {
+  const answer = payload as { text: string; reset?: boolean };
+  context.result.answerText = foldSendResultAnswer(
+    context.result.answerText,
+    answer.text ?? "",
+    { statusSeen: context.sawStatus, reset: answer.reset },
+  );
+  context.emit({
+    type: "answer",
+    text: answer.text ?? "",
+    reset: answer.reset === true,
+  });
+}
+
+function handleDocumentChoiceFrame(
+  payload: unknown,
+  { emit }: SseStreamContext,
+): void {
+  const frame = parseDocumentChoiceFrame(payload);
+  if (frame !== null) emit({ type: "document_choice", frame });
+}
+
+const SSE_FRAME_HANDLERS = new Map<string, SseFrameHandler>([
+  ["thinking", handleThinkingFrame],
+  ["tool_call", handleToolCallFrame],
+  ["tool_result", handleToolResultFrame],
+  ["status", handleStatusFrame],
+  ["citations", handleCitationsFrame],
+  ["evidence_refusals", handleEvidenceRefusalsFrame],
+  ["visual_claims", handleVisualClaimsFrame],
+  ["comparison", handleComparisonFrame],
+  ["choice_window", handleChoiceWindowFrame],
+  ["attachment_wait", handleAttachmentWaitFrame],
+  ["answer", handleAnswerFrame],
+  ["document_choice", handleDocumentChoiceFrame],
+]);
+
+function parseSseFrame(rawFrame: string): ParsedSseFrame | null {
+  let eventName = "";
+  const dataLines: string[] = [];
+  for (const line of rawFrame.split("\n")) {
+    if (line.startsWith("event:")) eventName = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  if (!eventName || dataLines.length === 0) return null;
+  try {
+    return { eventName, payload: JSON.parse(dataLines.join("\n")) as unknown };
+  } catch {
+    // Malformed frames are skipped; the rest of the stream remains readable.
+    return null;
+  }
+}
+
+function takeCompleteSseFrames(buffer: string): {
+  frames: string[];
+  remainder: string;
+} {
+  const frames: string[] = [];
+  let separator: number;
+  while ((separator = buffer.indexOf("\n\n")) >= 0) {
+    frames.push(buffer.slice(0, separator));
+    buffer = buffer.slice(separator + 2);
+  }
+  return { frames, remainder: buffer };
+}
+
+function dispatchSseFrame(
+  frame: ParsedSseFrame,
+  context: SseStreamContext,
+): void {
+  const handler = SSE_FRAME_HANDLERS.get(frame.eventName);
+  if (handler !== undefined) handler(frame.payload, context);
+}
+
 async function consumeSseStream(
   body: ReadableStream<Uint8Array>,
-  onEvent?: (e: SendEvent) => void,
+  onEvent?: (event: SendEvent) => void,
 ): Promise<SendResult> {
-  const result: SendResult = {
-    // Run id starts as a local placeholder; the ``status`` SSE
-    // frame carries the server-minted id and overwrites it.
-    run_id: crypto.randomUUID(),
-    status: "done",
-    reason: null,
-    citations: [],
-    evidence_refusals: [],
-    answerText: "",
-    assistantMessage: "",
-    comparisons: [],
+  const context: SseStreamContext = {
+    result: {
+      run_id: crypto.randomUUID(),
+      status: "done",
+      reason: null,
+      citations: [],
+      evidence_refusals: [],
+      answerText: "",
+      assistantMessage: "",
+      comparisons: [],
+    },
+    emit: onEvent ?? (() => {}),
+    sawStatus: false,
   };
-
-  // Hoisted so the per-frame dispatch below does not re-decide
-  // "is there a listener?" at every call site.
-  const emit = onEvent ?? (() => {});
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  // T1 (#33): answer frames are DELTAS while the run streams; the
-  // post-``status`` frame is the authoritative full text (replace);
-  // ``reset:true`` replaces with accompanying ``text`` (bounce retry
-  // first delta, or empty clear for terminal refuse flush).
-  let sawStatus = false;
 
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-
-    // SSE frames are separated by a blank line.
-    let sep: number;
-    while ((sep = buffer.indexOf("\n\n")) >= 0) {
-      const rawFrame = buffer.slice(0, sep);
-      buffer = buffer.slice(sep + 2);
-
-      let eventName = "";
-      let dataLines: string[] = [];
-      for (const line of rawFrame.split("\n")) {
-        if (line.startsWith("event:")) eventName = line.slice(6).trim();
-        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-      }
-      if (!eventName || dataLines.length === 0) continue;
-
-      let payload: unknown;
-      try {
-        payload = JSON.parse(dataLines.join("\n"));
-      } catch {
-        continue; // Malformed frame - skip rather than crash.
-      }
-
-      switch (eventName) {
-        case "thinking": {
-          // T1 (#33): token deltas — each frame's ``text`` is a
-          // FRAGMENT of the run's thinking prose; the store
-          // concatenates. The prose never participates in citation
-          // matching (SC60 binding).
-          const t = payload as { text: string };
-          emit({ type: "thinking", text: t.text ?? "" });
-          break;
-        }
-        case "tool_call": {
-          // T3 (spec line 32): ``name`` / ``args`` /
-          // ``tool_call_id`` so the SPA can render a running
-          // indicator while the tool runs.
-          const tc = payload as {
-            name: string;
-            args: Record<string, unknown>;
-            tool_call_id: string;
-          };
-          emit({
-            type: "tool_call",
-            name: tc.name,
-            args: tc.args ?? {},
-            tool_call_id: tc.tool_call_id,
-          });
-          break;
-        }
-        case "tool_result": {
-          // T3 wire shape: ``{name, summary, tool_call_id}`` — the
-          // server-formatted one-liner, never raw ToolMessage JSON.
-          const tr = payload as {
-            tool_call_id: string;
-            name: string;
-            summary?: string;
-          };
-          emit({
-            type: "tool_result",
-            tool_call_id: tr.tool_call_id,
-            name: tr.name,
-            summary: tr.summary ?? tr.name,
-          });
-          break;
-        }
-        case "status": {
-          // The status frame carries the server-minted ``run_id``
-          // so the optimistic turn the store renders can match
-          // the persisted RunRecord BEFORE any re-GET. T2 adds
-          // ``assistant_message`` (ordinary-person copy on
-          // refuse / step_cap). Soft-Track may add ``track`` /
-          // ``track_decision``; both are optional until the peer
-          // lands. The mid-flight stream taxonomy (``status_classified``)
-          // rides the same frame on refuse rows.
-          sawStatus = true;
-          const s = payload as {
-            run_id?: string;
-            status: SendResult["status"];
-            reason?: string;
-            assistant_message?: string;
-            thinking_ms?: number;
-            track?: unknown;
-            track_decision?: unknown;
-            status_classified?: string;
-            // E5 declares the citation channel once on the terminal
-            // status frame ("fin.evidence.citation" + its schema_version).
-            evidence_schema?: unknown;
-            schema_version?: unknown;
-          };
-          result.status = s.status;
-          result.reason = s.reason ?? null;
-          result.assistantMessage = s.assistant_message ?? "";
-          const trackDecision = parseTrackDecision(s.track_decision);
-          const track = parseSoftTrack(s.track) ?? trackDecision?.track;
-          if (track !== undefined) result.track = track;
-          if (trackDecision !== undefined)
-            result.track_decision = trackDecision;
-          const classified = parseStreamErrorKind(s.status_classified) ?? "";
-          if (classified) result.status_classified = classified;
-          // E5 declares the citation channel once on the terminal status
-          // frame. A token this client cannot name is the unsupported
-          // class — visible as a refusal (§2.3: never the nearest older
-          // parser), while an absent token is a pre-E5 peer and leaves
-          // the rows to the per-row guards below.
-          const envelope = decodeEvidenceSchemaField(
-            s.evidence_schema,
-            s.schema_version,
-          );
-          if (envelope === "unsupported" || envelope === "malformed") {
-            const envelopeRefusal: EvidenceRefusal = {
-              citation_index: 0,
-              error:
-                envelope === "unsupported"
-                  ? "unsupported_evidence_contract"
-                  : "malformed_evidence_contract",
-            };
-            result.evidence_refusals.push(envelopeRefusal);
-            emit({
-              type: "evidence_refusals",
-              refusals: [envelopeRefusal],
-            });
-          }
-          if (typeof s.run_id === "string" && s.run_id.length > 0) {
-            result.run_id = s.run_id;
-          }
-          emit({
-            type: "status",
-            run_id: result.run_id,
-            status: s.status,
-            reason: s.reason ?? null,
-            assistant_message: s.assistant_message ?? "",
-            thinking_ms: s.thinking_ms,
-            track: result.track,
-            track_decision: result.track_decision,
-            status_classified: classified,
-          });
-          break;
-        }
-        case "citations": {
-          // E6: the old ``payload as Citation[]`` blind cast is replaced
-          // by the runtime guard (spec §6 web-decode row). A row this
-          // boundary cannot decode keeps its frame index and surfaces as
-          // a visible named refusal — never a silent drop, a coercion,
-          // or a shortened frame presented as success. The server-side
-          // refusal lane (E5) already split refused rows onto the
-          // ``evidence_refusals`` event; the cast rule from the E5
-          // carrier notes (a plain-array payload) still holds.
-          const frame = decodeCitationsArray(payload);
-          result.citations = frame.citations;
-          result.evidence_refusals = result.evidence_refusals.concat(
-            frame.refusals,
-          );
-          emit({ type: "citations", citations: frame.citations });
-          if (frame.refusals.length > 0)
-            emit({ type: "evidence_refusals", refusals: frame.refusals });
-          break;
-        }
-        case "evidence_refusals": {
-          // E5 vocabulary, E6 decoder: ``{"refusals": [{citation_index,
-          // error}]}``, arriving BEFORE the terminal citations frame. An
-          // empty list is defined-empty (§6.1 empty row) — it is not a
-          // failure and not a missing channel. A malformed entry stays
-          // visible as its own named malformed refusal.
-          const refusals = decodeEvidenceRefusalsFrame(payload);
-          if (refusals.length > 0) {
-            result.evidence_refusals = result.evidence_refusals.concat(
-              refusals,
-            );
-            emit({ type: "evidence_refusals", refusals });
-          }
-          break;
-        }
-        case "visual_claims": {
-          // The run's visual-claim rows arrive on their own event,
-          // after the answer frames and BEFORE the terminal ``citations``
-          // event, as ``{"visual_claims": [row, …]}``. Parsed at this
-          // boundary (the wire is ``unknown``) exactly like ``comparison``:
-          // a malformed payload yields no rows instead of a half-rendered
-          // provenance line, and it never reaches ``result.citations`` —
-          // the quote channel stays closed to a generated observation.
-          const claims = parseVisualClaimFrame(payload);
-          emit({ type: "visual_claims", visual_claims: claims });
-          break;
-        }
-        case "comparison": {
-          // T3: decode the envelope at the wire boundary. A rejected
-          // comparison follows the same named-refusal lane as other
-          // runtime evidence failures, rather than vanishing as an
-          // empty table.
-          const outcome = decodeComparison(payload);
-          if (outcome.status === "ok") {
-            result.comparisons.push(outcome.comparison);
-            emit({ type: "comparison", comparison: outcome.comparison });
-          } else {
-            const refusal: EvidenceRefusal = {
-              citation_index: 0,
-              error: outcome.error,
-            };
-            result.evidence_refusals.push(refusal);
-            emit({ type: "evidence_refusals", refusals: [refusal] });
-          }
-          break;
-        }
-        case "choice_window": {
-          // T2 (host-locked): same skip-don't-crash boundary as
-          // ``comparison``. The frame is the stream's LAST one — no
-          // terminal frames follow while the run waits for a pick —
-          // so nothing here touches ``result``.
-          const window = parseChoiceWindow(payload);
-          if (window !== null) emit({ type: "choice_window", window });
-          break;
-        }
-        case "attachment_wait": {
-          // T2f (review C4): the exact suspend signal. A frame whose
-          // run id or kind is missing/malformed is skipped like any
-          // other unreadable payload — a half-parsed wait would
-          // suppress the crash handling the row still needs. Nothing
-          // touches ``result``: no terminal frame follows while the
-          // run waits on the durable job.
-          const w = payload as {
-            run_id?: unknown;
-            kind?: unknown;
-            attachment_ids?: unknown;
-          };
-          if (
-            typeof w.run_id === "string" &&
-            w.run_id.length > 0 &&
-            w.kind === ATTACHMENT_PREPARATION_KIND
-          ) {
-            emit({
-              type: "attachment_wait",
-              run_id: w.run_id,
-              kind: ATTACHMENT_PREPARATION_KIND,
-              attachment_ids: Array.isArray(w.attachment_ids)
-                ? w.attachment_ids.map((id) => String(id))
-                : [],
-            });
-          }
-          break;
-        }
-        case "answer": {
-          const a = payload as { text: string; reset?: boolean };
-          result.answerText = foldSendResultAnswer(
-            result.answerText,
-            a.text ?? "",
-            { statusSeen: sawStatus, reset: a.reset },
-          );
-          emit({
-            type: "answer",
-            text: a.text ?? "",
-            reset: a.reset === true,
-          });
-          break;
-        }
-        default:
-          // Unknown event type - skip rather than crash. Future
-          // T3+ event types slot in here without breaking
-          // older clients.
-          break;
-      }
+    const completed = takeCompleteSseFrames(buffer);
+    buffer = completed.remainder;
+    for (const rawFrame of completed.frames) {
+      const frame = parseSseFrame(rawFrame);
+      if (frame !== null) dispatchSseFrame(frame, context);
     }
   }
 
-  return result;
+  return context.result;
 }
 
 /**
@@ -1039,17 +1278,20 @@ async function namedErrorCode(res: Response): Promise<string> {
   return `http_${res.status}`;
 }
 
-/** Metadata for the ingest door. ``company`` and ``period`` are
- * required: with no explicit ``document_id`` they are the ONLY source
- * of the stable identity, so the endpoint never falls back to the
- * uploaded filename. Everything else is optional locator/classifier
- * metadata. */
+/** Optional metadata for the ingest door.
+ *
+ * Every field is descriptive: the upload identity is derived from the
+ * trusted corpus scope and the content bytes, never from the filename or
+ * this metadata, so the client has no mode flag and no way to supply a
+ * caller-chosen ``document_id``. ``title`` names the document (otherwise
+ * the sanitized filename does); ``doc_type`` and ``format`` override the
+ * server's classification. */
 export interface IngestMeta {
-  company: string;
-  period: string;
-  document_id?: string;
+  company?: string;
+  period?: string;
   doc_type?: string;
   format?: string;
+  title?: string;
 }
 
 /**
@@ -1066,11 +1308,14 @@ export async function ingestCorpus(
 ): Promise<IngestResult> {
   const form = new FormData();
   form.append("file", file, file.name);
-  form.append("company", meta.company);
-  form.append("period", meta.period);
+  // Only NON-EMPTY optional metadata is appended: a blank string would
+  // otherwise be sent as ``company=""`` and read server-side as a
+  // present-but-blank value rather than "not provided".
+  if (meta.company) form.append("company", meta.company);
+  if (meta.period) form.append("period", meta.period);
   if (meta.format) form.append("format", meta.format);
-  if (meta.document_id) form.append("document_id", meta.document_id);
   if (meta.doc_type) form.append("doc_type", meta.doc_type);
+  if (meta.title) form.append("title", meta.title);
   const res = await fetch("/api/corpus/ingest", {
     method: "POST",
     body: form,

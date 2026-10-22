@@ -21,7 +21,7 @@ import pytest
 
 from fin.corpus.errors import PageLayoutError
 from fin.corpus.parsers import PageParseResult, PageRegionParser, Region
-from fin.host.attachment_layout import (
+from fin.host.attachment.attachment_layout import (
     PASS_FAILED,
     PASS_MEASURED,
     PASS_PENDING,

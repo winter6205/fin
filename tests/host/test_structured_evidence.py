@@ -16,13 +16,13 @@ from typing import Any
 
 import pytest
 
-from fin.host.evidence_contract import (
+from fin.host.evidence.evidence_contract import (
     CONTRACT_REFUSAL_CODES,
     EVIDENCE_TOO_LARGE,
     MALFORMED_EVIDENCE_CONTRACT,
     UNSUPPORTED_EVIDENCE_CONTRACT,
 )
-from fin.host.structured_evidence import (
+from fin.host.evidence.structured_evidence import (
     MAX_STRUCTURED_ROWS,
     STORED_EVIDENCE_FIELDS,
     StructuredRefusal,
@@ -37,7 +37,7 @@ from fin.host.structured_evidence import (
     validate_structured_result,
     verify_structured_claims,
 )
-from fin.host.structured_snapshot import (
+from fin.host.evidence.structured_snapshot import (
     STRUCTURED_SNAPSHOT_FIELDS,
     structured_snapshot_digest,
 )

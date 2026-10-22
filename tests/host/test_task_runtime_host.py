@@ -10,8 +10,12 @@ Covers the host seams around the pure decision logic (already pinned by
 * **T3/T4** — a taskless greeting advances input history but commits no task
   and no task outcome (SC-3); the thread-scoped envelope survives a
   run-scoped reset and compaction (SC-5).
-* **T5** — the choice window still opens and resumes under the new
-  ``mode_choice -> reconcile_task -> compaction_gate`` topology (SC-1/SC-4).
+* **T5** — ADR 0104 retired the internal retrieval-mode picker: a routing
+  residual is assigned host-side (``graph`` / ``decision_tier="fallback"``)
+  and opens NO window, while the windows that are still valid (the confirmed
+  Fast extraction proposal) still open, pause and resume under the
+  ``extract_method_choice -> reconcile_task -> compaction_gate`` topology
+  (SC-1/SC-4).
 * The wire projection, stand-in tolerance, task/turn independence, and the
   empty / concurrent / legacy-checkpoint boundary classes (SC-5, SC-8).
 
@@ -36,10 +40,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import ExtractedPage, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.session_compaction import session_token_budget
+from fin.host.session.session_compaction import session_token_budget
 from fin.host.state import reset_input_state
-from fin.host.task_runtime import accept_input, decide
-from fin.host.task_runtime_types import (
+from fin.host.task.task_runtime import accept_input, decide
+from fin.host.task.task_runtime_types import (
     DISPOSITION_SWITCH,
     INPUT_MESSAGE,
     AcceptedInput,
@@ -403,7 +407,7 @@ def test_reset_input_state_omits_the_thread_scoped_envelope() -> None:
 def test_compaction_preserves_the_thread_scoped_task(fresh_store) -> None:
     """A real compaction run (force, evicting) leaves the task envelope
     untouched: the gate writes only ``messages`` (SC-5)."""
-    from fin.host.compaction import _SUMMARY_MARKER
+    from fin.host.session.compaction import _SUMMARY_MARKER
 
     g = compile_graph(
         checkpointer=InMemorySaver(),
@@ -515,44 +519,109 @@ def test_reconcile_node_without_an_accepted_input_manufactures_nothing(
 
 
 # ===========================================================================
-# SC-1 / SC-4 — the choice window does not regress under the new topology
+# SC-1 / SC-4 — the retired mode picker and the windows that are still valid
 # ===========================================================================
 
 
 @pytest.mark.soft_track
-def test_choice_window_still_opens_and_resumes_under_the_reconcile_topology(
+def test_the_retired_mode_window_opens_no_picker_while_a_valid_window_resumes(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
-    """With the window lane on, the paused run still opens ``mode_choice``
-    before any model call and resumes through ``reconcile_task`` into the
-    grounded leaf. The send door has already accepted the input (SC-1)."""
+    """ADR 0104: the internal retrieval-mode picker is retired; the windows
+    that are still valid keep their pause/resume contract.
+
+    Part 1 — the MODE lane: with the HITL lane ON, a grounded turn the
+    routing cascade cannot assign opens NO window. The residual is the
+    host's own recorded decision — ``graph`` at
+    ``decision_tier="fallback"`` with confidence 0.0 and no options — and
+    the run continues to its terminal frames instead of waiting for an
+    operator who would have to understand internal routing.
+
+    Part 2 — a STILL-VALID window (the Fast extraction proposal): the run
+    pauses on the propose window BEFORE ``reconcile_task`` and before any
+    model call; the send door has already accepted the input (SC-1), and the
+    resume carries the SAME run through the reconcile topology into the
+    grounded leaf.
+    """
     g = _install_graph(
         http_app,
         [AIMessage(content="Net sales grew year over year.")],
         enable_choice_window=True,
     )
-    tid = _new_thread(client)
 
+    # ----- part 1: the mode lane opens no picker -----
+    tid = _new_thread(client)
     sent = _send(client, tid, RESEARCH)
     assert sent.status_code == 200
-    events = _parse_sse_events(sent.text)
+    names = [name for name, _ in _parse_sse_events(sent.text)]
+    # No retrieval-mode picker opens for a routing residual.
+    assert "choice_window" not in names
+    # The run was never paused: it reached its terminal frames.
+    assert "status" in names
+    assert names[-1] == "citations"
+    assert g.interrupt_pending(tid) is None
+
+    audit = g._graph.get_state(_cfg(tid)).values["search_mode_decision"]
+    assert audit["search_mode"] == "graph"
+    assert audit["decision_tier"] == "fallback"
+    assert audit["confidence"] == 0.0
+    # No mode-selection options: nothing a client could paint a picker from.
+    assert audit["options"] == []
+    # The fallback keeps the ORIGINAL judge signals instead of inventing a
+    # judge result (spec search-mode-host contract item 6).
+    assert audit["signals"]["mode_jev_exit"] == "no_jev_client"
+
+    # The send door accepted the input and the run reconciled it.
+    runtime = _task_runtime(client, tid)
+    assert runtime["input_version"] == 1
+    assert runtime["reconciliation"]["reconciled_input_version"] == 1
+    assert runtime["current_task"] is not None
+
+    # ----- part 2: a still-valid window opens, pauses and resumes -----
+    window_tid = _new_thread(client)
+    paused = _send(client, window_tid, RESEARCH, propose_extract_method="fast")
+    assert paused.status_code == 200
+    events = _parse_sse_events(paused.text)
     names = [name for name, _ in events]
     assert names[-1] == "choice_window"
     assert events[-1][1]["kind"] == "choice_window"
+    # The open window is the EXTRACT-METHOD one (standard / fast), not a
+    # retrieval-mode picker: the mode is the host's own decision, never an
+    # operator's pick.
+    assert sorted(str(option.get("id")) for option in events[-1][1]["options"]) == [
+        "fast",
+        "standard",
+    ]
     # The paused run emitted no terminal frame (it is not over).
     assert "status" not in names
+    assert "citations" not in names
+    # The window paused BEFORE any model call: the scripted model was never
+    # reached.
+    paused_messages = (
+        g._graph.get_state(_cfg(window_tid)).values.get("messages") or []
+    )
+    assert not any(isinstance(message, AIMessage) for message in paused_messages)
     # The send door accepted the input even though the graph paused.
-    assert _task_runtime(client, tid)["input_version"] == 1
+    assert _task_runtime(client, window_tid)["input_version"] == 1
 
-    resumed = client.post(f"/api/threads/{tid}/resume", json={"pick": "graph"})
+    resumed = client.post(
+        f"/api/threads/{window_tid}/resume", json={"pick": "standard"}
+    )
     assert resumed.status_code == 200
     resumed_names = [name for name, _ in _parse_sse_events(resumed.text)]
     assert "choice_window" not in resumed_names
     assert resumed_names[-1] == "citations"
 
-    audit = g._graph.get_state(_cfg(tid)).values["search_mode_decision"]
-    assert audit["search_mode"] == "graph"
-    assert audit["decision_tier"] == "operator_pick"
+    proposal = g._graph.get_state(_cfg(window_tid)).values["extract_method_proposal"]
+    assert proposal["proposed"] == "fast"
+    assert proposal["picked"] == "standard"
+    # The method pick never speaks for the retrieval mode: the routing
+    # decision is the same host-side fallback.
+    resumed_audit = g._graph.get_state(_cfg(window_tid)).values[
+        "search_mode_decision"
+    ]
+    assert resumed_audit["search_mode"] == "graph"
+    assert resumed_audit["decision_tier"] == "fallback"
 
 
 # ===========================================================================
@@ -627,11 +696,11 @@ def test_task_runtime_is_independent_from_turn_status(
     task_runtime = detail["task_runtime"]
     assert task_runtime["current_task"] is not None
     assert task_runtime["current_task"]["outcome"] == "active"
-    # The turn finishing did not establish task completion. The outcome
-    # boundary ran and recorded the task as still ACTIVE — a positive
-    # statement, not the absence of one, because no grounded assessment
-    # supports the goal on this lane.
-    assert task_runtime["task_outcome"] == "active"
+    # The turn finishing did not establish task completion. With no
+    # grounding assessment the outcome boundary writes nothing onto
+    # task_outcome, so the field stays unknown. The task itself remains
+    # active on current_task.
+    assert task_runtime["task_outcome"] is None
 
 
 # ===========================================================================
@@ -787,6 +856,12 @@ def test_window_pause_then_resume_still_reconciles_the_accepted_input(
     pauses the run BEFORE ``reconcile_task``. The resume carries no run
     config, so the node recovers the accepted input from the committed
     envelope instead of reaching the grounded leaf with none.
+
+    The window is the Fast extraction proposal — one of the two windows that
+    are still valid (ADR 0104 retired the internal retrieval-mode picker;
+    the content clarification and the confirmed Fast proposal remain). It
+    pauses on the same seam the retired mode window used: between
+    ``classify`` and ``reconcile_task``.
     """
     g = _install_graph(
         http_app,
@@ -794,10 +869,25 @@ def test_window_pause_then_resume_still_reconciles_the_accepted_input(
         enable_choice_window=True,
     )
     tid = _new_thread(client)
-    sent = _send(client, tid, RESEARCH)
-    assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
+    sent = _send(client, tid, RESEARCH, propose_extract_method="fast")
+    assert sent.status_code == 200
+    names = [name for name, _ in _parse_sse_events(sent.text)]
+    assert names[-1] == "choice_window"
+    # The paused run emitted no terminal frame (it is not over).
+    assert "status" not in names
+    assert "citations" not in names
 
-    resumed = client.post(f"/api/threads/{tid}/resume", json={"pick": "graph"})
+    # The send door accepted the input and NOTHING reconciled it yet: the
+    # window pauses BEFORE ``reconcile_task``, so no dependent work started
+    # on an unreconciled accepted input.
+    paused = g.task_runtime_state(tid)
+    assert paused.input_version == 1
+    assert paused.reconciliation is None, (
+        "the pause let dependent work start on an unreconciled accepted input"
+    )
+    assert paused.current_task is None
+
+    resumed = client.post(f"/api/threads/{tid}/resume", json={"pick": "standard"})
     assert resumed.status_code == 200
 
     runtime = g.task_runtime_state(tid)
@@ -807,6 +897,10 @@ def test_window_pause_then_resume_still_reconciles_the_accepted_input(
     )
     assert runtime.reconciliation.reconciled_input_version == 1
     assert runtime.current_task is not None
+    # The reconciled input is the ORIGINAL one the door accepted — the node
+    # recovered it from the committed envelope, it did not invent one.
+    assert runtime.input_history[-1].payload == RESEARCH
+    assert runtime.input_history[-1].provenance == "workspace_send"
 
 
 # ===========================================================================
@@ -851,7 +945,9 @@ def test_reply_door_clears_the_pending_question(
     assert after.input_history[-1].choice_id == seeded.pending_question.choices[0]
 
 
-def _seed_pending_question(g: Any, tid: str) -> TaskRuntimeState:
+def _seed_pending_question(
+    g: Any, tid: str, *, question_id: str = "q-seeded"
+) -> TaskRuntimeState:
     """Commit a clarification the way the reconcile node does.
 
     Written back through the checkpointer, because the send door reads the
@@ -869,7 +965,7 @@ def _seed_pending_question(g: Any, tid: str) -> TaskRuntimeState:
             kind=INPUT_MESSAGE,
             goal=RESEARCH,
             question=PendingQuestion(
-                question_id="q-seeded",
+                question_id=question_id,
                 task_id="",
                 task_version=1,
                 prompt="请补充：公司",
@@ -887,47 +983,108 @@ def _seed_pending_question(g: Any, tid: str) -> TaskRuntimeState:
 def test_reply_with_no_pending_question_is_refused(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
-    """T3/SC-4/SC-8: a reply naming no pending question ends the turn as a
-    typed system outcome and leaves the last consistent state untouched.
+    """SC-4/SC-8: a reply naming no pending question is refused at the
+    door, and writes nothing at all.
+
+    Admission validates the reply BEFORE accepting it, so there is no
+    committed input for the reconciliation boundary to reject later: an
+    invalid reply makes no input or scope write. Accepting first and
+    refusing mid-run was the older shape, and it cost a durable
+    ``input_version`` advance plus a turn row for a draft to a question
+    that never existed — a new input manufactured by a stale delivery.
 
     The refusal is ``task_reply_unknown`` — nothing is pending at all —
-    rather than ``task_reply_expired``, which is reserved for a reply to a
-    SUPERSEDED question.
-
-    It surfaces on the SSE wire rather than as a 4xx because acceptance
-    cannot know whether a question is pending: the door commits the
-    input, and only the reconciliation boundary holds the committed
-    envelope it must be judged against. Failing closed there keeps one
-    decision boundary rather than two.
+    rather than ``task_reply_expired``, which is reserved for a reply to
+    a SUPERSEDED question. A surface branches on the token to decide
+    whether to re-read the question list or to tell the operator the
+    question it asked has been replaced.
     """
     g = _install_graph(http_app, [AIMessage(content="ok")])
     tid = _new_thread(client)
     _send(client, tid, RESEARCH)
     before = g.task_runtime_state(tid)
 
-    with client.stream(
-        "POST",
-        f"/api/threads/{tid}/messages",
-        json={
-            "question": RESEARCH,
-            "question_id": "no-such-question",
-            "choice_id": "a",
-        },
-    ) as response:
-        body = "".join(response.iter_text())
-    status = _status_frame(body)
-    assert status["status"] == "refuse"
-    assert status["reason"] == "task_reply_unknown"
+    refused = _send(
+        client,
+        tid,
+        RESEARCH,
+        question_id="no-such-question",
+        choice_id="a",
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error"] == "task_reply_unknown"
     after = g.task_runtime_state(tid)
-    # The input was still DURABLY ACCEPTED (SC-1 advances history once
-    # before any semantic work), but nothing the reply could have changed
-    # moved: no task, question, archive, or outcome.
-    assert after.input_version == before.input_version + 1
-    assert after.input_history[-1].kind == "reply"
+    # Nothing the reply could have changed moved, and no accepted input
+    # was written either: SC-4's counter advances once per accepted
+    # input, and this delivery never became one.
+    assert after.input_version == before.input_version
+    assert after.input_history == before.input_history
     assert after.current_task == before.current_task
     assert after.pending_question == before.pending_question
     assert after.archived_tasks == before.archived_tasks
     assert after.task_outcome == before.task_outcome
+
+
+def test_reply_to_a_superseded_question_is_refused_as_expired(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """A reply naming a question the thread HAS had, but no longer has
+    pending, is ``task_reply_expired`` — and is refused before it writes.
+
+    The question was real and the operator answered it late, which is the
+    case ``task_reply_unknown`` cannot describe: the distinction is what
+    lets a surface say "that question was replaced" instead of "this
+    thread asked you nothing".
+    """
+    g = _install_graph(http_app, [AIMessage(content="ok")])
+    tid = _new_thread(client)
+    _send(client, tid, RESEARCH)
+    _seed_pending_question(g, tid, question_id="q-first")
+    pending = _seed_pending_question(g, tid, question_id="q-second")
+    assert pending.pending_question is not None
+    assert pending.pending_question.question_id == "q-second"
+    before = g.task_runtime_state(tid)
+
+    refused = _send(client, tid, RESEARCH, question_id="q-first", choice_id="公司")
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error"] == "task_reply_expired"
+    # The stale reply resolves nothing: the LIVE question is still the
+    # one this thread is waiting on, and no input was accepted.
+    after = g.task_runtime_state(tid)
+    assert after == before
+    assert after.pending_question is not None
+    assert after.pending_question.question_id == "q-second"
+
+
+def test_the_two_reply_refusal_tokens_stay_distinct(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """The same delivery is UNKNOWN or EXPIRED purely on what the thread
+    holds — the token reports the state, not the delivery.
+
+    Collapsing them would make one of the two answers unreachable from
+    the wire, and a surface would have to guess which clarification the
+    operator meant to answer.
+    """
+    g = _install_graph(http_app, [AIMessage(content="ok"), AIMessage(content="ok")])
+    never_asked = _new_thread(client)
+    _send(client, never_asked, RESEARCH)
+
+    superseded = _new_thread(client)
+    _send(client, superseded, RESEARCH)
+    _seed_pending_question(g, superseded, question_id="q-first")
+    _seed_pending_question(g, superseded, question_id="q-second")
+
+    unknown = _send(
+        client, never_asked, RESEARCH, question_id="q-first", choice_id="公司"
+    )
+    expired = _send(client, superseded, RESEARCH, question_id="q-first", choice_id="公司")
+
+    assert (unknown.status_code, expired.status_code) == (409, 409)
+    assert unknown.json()["detail"]["error"] == "task_reply_unknown"
+    assert expired.json()["detail"]["error"] == "task_reply_expired"
 
 
 def test_restore_without_a_recheck_is_refused_not_adopted(
@@ -951,12 +1108,13 @@ def test_restore_without_a_recheck_is_refused_not_adopted(
 def test_refused_reconciliation_never_reaches_dependent_work(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
-    """SC-1/SC-8: a typed reconciliation refusal ends the run BEFORE any
-    dependent work, and never becomes a clarification for the user.
+    """SC-1/SC-8: a reply naming no pending question is refused BEFORE any
+    run, so no dependent work is ever reachable from it.
 
     Before the repair the node swallowed the refusal and returned an empty
     update, so the lane continued into the model with no committed
-    reconciliation at all.
+    reconciliation at all. Admission now decides first: the refusal is a
+    4xx with no stream, no turn row and no question put to the user.
     """
     g = _install_graph(
         http_app,
@@ -964,30 +1122,24 @@ def test_refused_reconciliation_never_reaches_dependent_work(
         adapter=_tree_read_adapter(),
     )
     tid = _new_thread(client)
-    with client.stream(
-        "POST",
-        f"/api/threads/{tid}/messages",
-        json={
-            "question": RESEARCH,
-            "question_id": "never-opened",
-            "choice_id": "a",
-        },
-    ) as response:
-        body = "".join(response.iter_text())
-    status = _status_frame(body)
-    assert status["status"] == "refuse"
-    assert status["reason"] == "task_reply_unknown"
-    # The refusal is a system outcome: no question is put to the user.
-    assert "请补充" not in body
+    before = g.task_runtime_state(tid)
+
+    refused = _send(
+        client,
+        tid,
+        RESEARCH,
+        question_id="never-opened",
+        choice_id="a",
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error"] == "task_reply_unknown"
+    # The refusal is a system outcome: no question is put to the user,
+    # and the model is never reached to ask one.
+    assert "请补充" not in refused.text
     assert g.task_runtime_state(tid).task_outcome != "complete"
-
-
-def _status_frame(body: str) -> dict[str, Any]:
-    """The ``status`` SSE frame as a dict (the terminal verdict of a run)."""
-    for name, data in _parse_sse_events(body):
-        if name == "status":
-            return cast(dict[str, Any], data)
-    raise AssertionError(f"no status frame in: {body[:400]}")
+    assert g.task_runtime_state(tid) == before
+    assert client.get(f"/api/threads/{tid}").json()["turns"] == []
 
 
 # ===========================================================================

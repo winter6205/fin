@@ -1,4 +1,4 @@
-"""Unit tests for the host-graph ``AgentState`` schema (T2, #29).
+"""Unit tests for the host-graph ``AgentState`` schema (T2).
 
 The state module defines the reducer that accumulates ``evidence``
 across tool calls in a run AND supports an explicit reset path so a
@@ -16,7 +16,7 @@ from typing import get_type_hints
 from langchain_core.messages import AIMessage, HumanMessage
 
 from fin.corpus.extracted import Locator
-from fin.host.citation_gate import EvidenceItem
+from fin.host.grounded.citation_gate import EvidenceItem
 from fin.host.state import (
     AgentState,
     EVIDENCE_RESET,

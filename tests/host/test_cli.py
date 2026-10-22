@@ -525,7 +525,7 @@ def test_render_result_citation_label_reads_display_and_unit():
     on the locator; a renderer that kept a ``page`` fallback would print
     a different number than the citation identity the gate verified.
     """
-    from fin.host.citation_gate import Citation
+    from fin.host.grounded.citation_gate import Citation
 
     as_page = Citation(
         kind="company",
@@ -572,7 +572,7 @@ def test_render_result_prints_a_ledger_row_as_a_record():
     Its version column is the query's ``queried_at``, so the printed
     line always says when the value was true.
     """
-    from fin.host.citation_gate import Citation
+    from fin.host.grounded.citation_gate import Citation
 
     row = Citation(
         kind="database-row",
@@ -604,7 +604,7 @@ def test_render_result_never_prints_an_unknown_kind_as_a_company_row():
     """The old label switch was binary — ``attachment`` else
     ``document_id`` — so an unrecognised kind printed a filing id it
     does not have. An unknown kind prints its own name instead."""
-    from fin.host.citation_gate import Citation
+    from fin.host.grounded.citation_gate import Citation
 
     alien = Citation(
         kind="some-future-kind",
@@ -896,10 +896,14 @@ def test_cli_main_maps_workspace_root_missing_to_exit_one(capsys, tmp_path):
 def test_cli_default_home_resolves_from_env(
     tmp_path, monkeypatch, capsys
 ):
-    """When ``home`` is omitted the runner reads ``$HOME`` at call
-    time (never ``Path.cwd()``). The resolved default is the env's
-    home + ``.fin/default``."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    """When ``home`` is omitted the runner uses the resolved fin home.
+
+    ``FIN_HOME`` points at ``<tmp>/.fin`` so the workspace stays
+    ``<tmp>/.fin/default`` on a linked worktree, and the operator
+    home is not the workspace.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    monkeypatch.setenv("FIN_HOME", str(tmp_path / ".fin"))
 
     state = {"status": "done", "answer": "ok", "citations": ()}
     fake = _FakeGraph(state)

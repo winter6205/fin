@@ -20,9 +20,11 @@ source "$REPO_ROOT/scripts/lib/readiness.sh"
 source "$REPO_ROOT/scripts/lib/fin-root.sh"
 
 KEEP_INFRA=0
+DEMO_ONLY=0
 for arg in "$@"; do
   case "$arg" in
   --keep-infra) KEEP_INFRA=1 ;;
+  --demo) DEMO_ONLY=1 ;;
   *)
     printf 'dev-down: unknown argument %s\n' "$arg" >&2
     exit 2
@@ -35,7 +37,36 @@ done
 # meant an overridden port made `down` watch the wrong socket and delete
 # the pid file of a serve that was still running.
 SERVE_PORT="$WORKBENCH_SERVE_PORT"
-STATE_DIR="$REPO_ROOT/.fin"
+
+# Same run dir as dev-up. Resolve it before docker so a bad FIN_HOME
+# fails before any compose call. Worktree source wins over a shared venv.
+fin_host_python() {
+  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+      "$REPO_ROOT/.venv/bin/python" "$@"
+    return
+  fi
+  PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+    uv run --no-sync python "$@"
+}
+
+resolve_state_dir() {
+  local dir
+  if ! dir="$(fin_host_python -c '
+from fin.host.fin_home import resolve_fin_home, run_dir
+print(run_dir(resolve_fin_home()))
+')"; then
+    printf 'dev-down: could not resolve FIN_HOME\n' >&2
+    exit 1
+  fi
+  [[ -n "$dir" ]] || {
+    printf 'dev-down: could not resolve FIN_HOME\n' >&2
+    exit 1
+  }
+  printf '%s\n' "$dir"
+}
+
+STATE_DIR="$(resolve_state_dir)"
 SERVE_PID_FILE="$STATE_DIR/serve.pid"
 VERDICT_FILE="$STATE_DIR/ready"
 
@@ -70,6 +101,12 @@ stop_serve() {
     log "fin-serve pid $pid is already gone (stale pid file)"
   else
     log "no fin-serve pid file at $SERVE_PID_FILE"
+  fi
+
+  if [[ "$DEMO_ONLY" -eq 1 ]] &&
+    { [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; }; then
+    rm -f "$SERVE_PID_FILE" "$VERDICT_FILE"
+    return 0
   fi
 
   # Wait for the port to go quiet. Killing `uv` should take its python
@@ -107,11 +144,14 @@ stop_serve() {
 # compose failure now names itself and sets the exit status.
 stop_compose() {
   local rc=0
-  log "stopping fin Postgres"
-  if ! docker compose -f "$REPO_ROOT/docker-compose.yml" down; then
+  log "stopping fin dev Postgres"
+  if ! docker compose -p fin-dev -f "$REPO_ROOT/docker-compose.yml" down; then
     printf 'dev-down: stopping fin Postgres FAILED (see docker output above)\n' >&2
     rc=1
   fi
+  # plans/fin-storage-identity.md P1: compose project fin is the
+  # primary-checkout Postgres and this script does not stop it.
+  log "primary-checkout Postgres stays up; fin down stops only the fin-dev project"
   if [[ "$KEEP_INFRA" -eq 1 ]]; then
     log "leaving iknow-memory infra running (--keep-infra)"
     return "$rc"
@@ -130,6 +170,43 @@ stop_compose() {
   fi
   return "$rc"
 }
+
+stop_demo_project() {
+  local project="$1" output id
+  local -a containers=()
+  if ! output="$(docker ps -q --filter "label=com.docker.compose.project=$project")"; then
+    printf 'dev-down: listing %s containers FAILED\n' "$project" >&2
+    return 1
+  fi
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && containers+=("$id")
+  done <<<"$output"
+  if (("${#containers[@]}" == 0)); then
+    log "$project has no running containers"
+    return 0
+  fi
+  log "stopping $project containers"
+  if ! docker stop "${containers[@]}"; then
+    printf 'dev-down: stopping %s containers FAILED\n' "$project" >&2
+    return 1
+  fi
+  return 0
+}
+
+if [[ "$DEMO_ONLY" -eq 1 ]]; then
+  status=0
+  stop_serve || status=1
+  if docker_daemon_answers; then
+    stop_demo_project fin-dev || status=1
+    stop_demo_project iknow-memory-dev || status=1
+  else
+    log "Docker daemon is not answering; demo containers are unavailable"
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    log "demo stopped"
+  fi
+  exit "$status"
+fi
 
 # The daemon gate comes first: without it a dead daemon turned every
 # compose call into a swallowed failure and `fin down` exited 0 having

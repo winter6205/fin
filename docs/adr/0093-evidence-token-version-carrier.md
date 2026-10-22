@@ -79,7 +79,7 @@ and states the refusal with no repair.
    stays frozen. The `schema`-bearing snapshot object is the *egress* object,
    which travels alone rather than inside a list.
 5. **The SQL producer's executor truncates `queried_at` to whole seconds before
-   the value reaches the wire.** This is the tracked change's duty, not fin's. **fin MUST NOT
+   the value reaches the wire.** This is the producer's duty, not fin's. **fin MUST NOT
    normalize, round, or coerce a producer's timestamp**; a fractional or offset
    value is refused as `malformed_evidence_contract` exactly as any other
    malformed value is, and §2.4's ban on silent coercion binds fin here. A row's
@@ -392,7 +392,7 @@ missing.
   scratch `fin-sql-business-db` container, not one of the shared
   `fin-pre330-*` services.
 - **The live search-mode lane (`mcp` marker) — run and passing.**
-  `set -a && . ./.fin/pre330/environment.sh && set +a && FIN_LIVE_IKNOW_ROOT=/home/winner/projects/iknow-memory
+  `set -a && . ./.fin/pre330/environment.sh && set +a && FIN_LIVE_IKNOW_ROOT=/home/operator/projects/iknow-memory
   uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_search_modes_pg_es.py`
   → `11 passed in 4.57s`, exit 0 (also observed at `11 passed in 6.94s`,
   exit 0, in a second session). This exercises the six-container live stack

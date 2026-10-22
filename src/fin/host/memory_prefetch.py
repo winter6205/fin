@@ -153,7 +153,7 @@ def prefetch_overhead_tokens(prefetch_rows: Sequence[Mapping[str, Any]] | None) 
     """Return the ledger delta for a prefetch payload, in estimated tokens.
 
     Uses the same chars/4 approximation as
-    :data:`fin.host.session_compaction.CHARS_PER_TOKEN` so the budget
+    :data:`fin.host.session.session_compaction.CHARS_PER_TOKEN` so the budget
     is one number across the host. Callers feed this value back to
     :meth:`OccupancyCompactor.occupancy` as ``overhead_tokens`` so a
     turn with prefetch rows lands higher on the ledger than the same

@@ -15,7 +15,12 @@
 #   fin check        # preflight only, start nothing
 #   fin status       # is it up, and is the knowledge MCP reachable?
 #   fin down         # stop serve + both compose projects
+#   fin demo         # start the isolated ZEUS demo and open the browser
+#   fin demo --stop  # stop the demo serve + isolated dev stacks
 #   fin logs         # tail this workspace's serve log
+#   fin config show  # effective FIN_* values and which layer won
+#   fin backup       # dump the checkpoint database under FIN_HOME/backups
+#   fin restore --destination-url URL BACKUP_DIR
 #   fin --help
 #
 # `up` / `check` / `status` / `logs` accept one optional checkout path to
@@ -28,7 +33,7 @@
 #
 # Exit codes. `check` / `status` report their own and are the scriptable
 # gate; `up` ends in `exec uv run fin-serve`, so it inherits serve's status
-# and its readiness verdict goes to <checkout>/.fin/ready instead of a code
+# and its readiness verdict goes to <FIN_HOME>/run/ready instead of a code
 # (the reporter runs detached and cannot set the script's status).
 #   0  ready        — serve answers AND the knowledge MCP is reachable
 #   1  usage / not a fin checkout
@@ -104,13 +109,77 @@ cmd_down() {
   bash "$root/scripts/dev-down.sh" "$@"
 }
 
+# Worktree source wins over a shared venv that may point at another checkout.
+fin_host_python() {
+  local root="$1"
+  shift
+  if [[ -x "$root/.venv/bin/python" ]]; then
+    PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}" \
+      "$root/.venv/bin/python" "$@"
+    return
+  fi
+  PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}" \
+    uv run --no-sync python "$@"
+}
+
+fin_run_dir() {
+  fin_host_python "$1" -c '
+from fin.host.fin_home import resolve_fin_home, run_dir
+print(run_dir(resolve_fin_home()))
+'
+}
+
+fin_home_dir() {
+  fin_host_python "$1" -c '
+from fin.host.fin_home import resolve_fin_home
+print(resolve_fin_home())
+'
+}
+
+cmd_demo() {
+  local root="$1" action="$2" base_home
+  [[ -f "$root/scripts/demo.sh" ]] || die "$root/scripts/demo.sh is missing"
+  base_home="$(fin_home_dir "$root")" || die "could not resolve FIN_HOME"
+  [[ -n "$base_home" ]] || die "could not resolve FIN_HOME"
+  exec env FIN_BASE_HOME="$base_home" bash "$root/scripts/demo.sh" "$action" "$base_home"
+}
+
 cmd_logs() {
-  local file="$1/.fin/serve.log"
+  local run file
+  run="$(fin_run_dir "$1")" || die "could not resolve FIN_HOME"
+  file="$run/serve.log"
   if [ -f "$file" ]; then
     exec tail -n "${FIN_LOG_LINES:-50}" -f "$file"
   fi
   printf 'fin: no serve log at %s yet (fin up writes one)\n' "$file" >&2
   return 2
+}
+
+cmd_config_show() {
+  fin_host_python "$1" -c '
+from fin.host.cli import config_show_main
+raise SystemExit(config_show_main())
+'
+}
+
+cmd_backup() {
+  local root="$1"
+  shift
+  fin_host_python "$root" -c '
+import sys
+from fin.host.cli import backup_main
+raise SystemExit(backup_main(sys.argv[1:]))
+' "$@"
+}
+
+cmd_restore() {
+  local root="$1"
+  shift
+  fin_host_python "$root" -c '
+import sys
+from fin.host.cli import restore_main
+raise SystemExit(restore_main(sys.argv[1:]))
+' "$@"
 }
 
 # The help text is the header block between the two markers, so adding a
@@ -154,9 +223,17 @@ main() {
       usage
       exit 0
       ;;
-    up | check | status | down | logs)
+    up | check | status | down | logs | backup | restore | demo)
       command="$1"
       shift
+      ;;
+    config)
+      [[ "${2:-}" == "show" ]] || die "unknown command: config ${2:-}"
+      if [ "$#" -gt 2 ]; then
+        die "unexpected extra argument: $3"
+      fi
+      command="config-show"
+      shift 2
       ;;
     -*)
       die "unknown option $1 (try: fin --help)"
@@ -170,7 +247,7 @@ main() {
 
   # `down` forwards its own flags and acts on the checkout under $PWD;
   # every other command takes at most one optional checkout path.
-  if [ "$command" != "down" ] && [ "$#" -gt 0 ]; then
+  if [ "$command" != "down" ] && [ "$command" != "backup" ] && [ "$command" != "restore" ] && [ "$command" != "demo" ] && [ "$#" -gt 0 ]; then
     target_dir="$1"
     shift
     if [ ! -d "$target_dir" ]; then
@@ -178,8 +255,21 @@ main() {
     fi
   fi
 
-  if [ "$command" != "down" ] && [ "$#" -gt 0 ]; then
+  if [ "$command" != "down" ] && [ "$command" != "backup" ] && [ "$command" != "restore" ] && [ "$command" != "demo" ] && [ "$#" -gt 0 ]; then
     die "unexpected extra argument: $1"
+  fi
+
+  local demo_action="start"
+  if [ "$command" = "demo" ]; then
+    if [ "$#" -eq 0 ]; then
+      demo_action="start"
+    elif [ "$#" -eq 1 ] && [ "$1" = "--stop" ]; then
+      demo_action="stop"
+      shift
+    else
+      printf 'fin demo accepts only --stop\n' >&2
+      exit 2
+    fi
   fi
 
   # The checkout must be found BEFORE anything inside it can be sourced.
@@ -216,7 +306,13 @@ main() {
   # bare `command not found` and an exit code outside the 0/1/2/3 table.
   # `logs` only tails a file, so it needs neither.
   case "$command" in
-  logs) ;;
+  logs | config-show | backup | restore) ;;
+  demo)
+    command -v curl >/dev/null || die "curl is required"
+    if [[ "$demo_action" == "start" ]]; then
+      command -v jq >/dev/null || die "jq is required"
+    fi
+    ;;
   *)
     command -v curl >/dev/null || die "curl is required"
     command -v jq >/dev/null || die "jq is required"
@@ -227,7 +323,11 @@ main() {
   up) cmd_up "$root" ;;
   check) cmd_check "$root" ;;
   status) cmd_status "$root" ;;
+  demo) cmd_demo "$root" "$demo_action" ;;
   logs) cmd_logs "$root" ;;
+  config-show) cmd_config_show "$root" ;;
+  backup) cmd_backup "$root" "$@" ;;
+  restore) cmd_restore "$root" "$@" ;;
   down) cmd_down "$root" "$@" ;;
   *) die "unreachable command $command" ;;
   esac

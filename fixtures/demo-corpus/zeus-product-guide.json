@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-product-guide",
+  "title": "ZEUS Product Guide",
+  "content": "ZEUS Product Guide · Page 1\nSection 1 describes the AEGIS Edge Gateway.\nAEGIS is the ZEUS edge gateway appliance for on-premises\ndeployment. Each unit carries 8 SFP+ ports rated at 10 Gbps each\nand a sustained throughput of 40 Gbps under the standard\nbenchmark profile. Median latency measured at full 40 Gbps\nload is 1.8 milliseconds.\nList price is USD 12,450 per unit, effective 2024-03-04. The\nprice includes a 36-month warranty and 24x7 support. The\nSeverity 1 support response commitment is 30 minutes from the\nfirst acknowledged ticket.\nShipping weight is 6.4 kg and the unit draws 210 watts at full\nline-rate load.\nSection owner: Ravi Chandrasekhar, Vice President of Product.\n\nZEUS Product Guide · Page 2\nSection 2 describes the HELIOS Analytics Suite.\nHELIOS is the ZEUS fleet analytics and predictive maintenance\nsuite. It is licensed in annual seat subscriptions. A HELIOS\nsubscription covers up to 250 monitored gateways and is priced\nat USD 2,900 per seat per year.\nHELIOS requires AEGIS gateway firmware 4.1.0 or later. Gateways\nrunning firmware older than 4.1.0 are not supported and are not\ncovered by the 24x7 support commitment.\nTelemetry is retained for 400 days on the standard plan and\nfor 1,460 days on the regulated plan. The product reached\ngeneral availability on 2024-06-11.\nSection owner: Ravi Chandrasekhar, Vice President of Product.",
+  "chunks": [
+    {
+      "content": "ZEUS Product Guide · Page 1\nSection 1 describes the AEGIS Edge Gateway.\nAEGIS is the ZEUS edge gateway appliance for on-premises\ndeployment. Each unit carries 8 SFP+ ports rated at 10 Gbps each\nand a sustained throughput of 40 Gbps under the standard\nbenchmark profile. Median latency measured at full 40 Gbps\nload is 1.8 milliseconds.\nList price is USD 12,450 per unit, effective 2024-03-04. The\nprice includes a 36-month warranty and 24x7 support. The\nSeverity 1 support response commitment is 30 minutes from the\nfirst acknowledged ticket.\nShipping weight is 6.4 kg and the unit draws 210 watts at full\nline-rate load.\nSection owner: Ravi Chandrasekhar, Vice President of Product.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Product Guide · Page 2\nSection 2 describes the HELIOS Analytics Suite.\nHELIOS is the ZEUS fleet analytics and predictive maintenance\nsuite. It is licensed in annual seat subscriptions. A HELIOS\nsubscription covers up to 250 monitored gateways and is priced\nat USD 2,900 per seat per year.\nHELIOS requires AEGIS gateway firmware 4.1.0 or later. Gateways\nrunning firmware older than 4.1.0 are not supported and are not\ncovered by the 24x7 support commitment.\nTelemetry is retained for 400 days on the standard plan and\nfor 1,460 days on the regulated plan. The product reached\ngeneral availability on 2024-06-11.\nSection owner: Ravi Chandrasekhar, Vice President of Product.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "product_description",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "8-K",
+    "period": "2024-03-04",
+    "filing_date": "2024-03-04"
+  },
+  "valid_from": "2024-03-04T00:00:00Z"
+}

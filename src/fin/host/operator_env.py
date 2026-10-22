@@ -1,13 +1,14 @@
-"""Operator process entry: load a local ``.env``, then preflight it.
+"""Retrieve-adapter diagnostics for the operator process.
 
 ``compile_for_runtime`` still reads ``os.environ`` only. Tests that
-call it stay hermetic. ``fin-serve`` and ``python -m fin`` apply
-this file first so a checked-in-ignored ``.env`` is part of boot,
-not a hidden shell ritual.
+call it stay hermetic. ``fin-serve`` and ``python -m fin`` project
+``~/.fin/settings.yaml`` first
+(:func:`fin.host.operator_settings.apply_operator_settings`), so
+operator settings are part of boot. There is no dotenv fill step.
 
 Existing process env wins (``setdefault``): CI and explicit exports
-are not overwritten. A missing file is a no-op — production can
-inject vars without shipping a file.
+are not overwritten. A missing settings file is a no-op — production
+can inject vars without shipping a file.
 
 The product boot path no longer warns from here. ``fin.host.http.serve()``
 calls :func:`fin.host.knowledge_mcp.publish_knowledge_mcp`, which probes the
@@ -27,10 +28,22 @@ see whether the server completes the handshake. New code should read the
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Mapping, MutableMapping
+import os
+from typing import Mapping
 
 logger = logging.getLogger(__name__)
+
+#: The environment key naming the trusted corpus scope a public corpus upload
+#: derives document identity from. It is STABLE configuration, not a
+#: per-request value: same bytes in the same scope reuse an identity, so
+#: a value that changed between processes would strand every previously
+#: accepted document behind a new one.
+CORPUS_SCOPE_ID_ENV = "FIN_CORPUS_SCOPE_ID"
+
+#: The scope used when nothing is configured. A constant, not a random
+#: or host-derived value, so an unconfigured deployment is still
+#: deterministic across restarts and machines.
+DEFAULT_CORPUS_SCOPE_ID = "fin-default"
 
 
 # The two typed reachability values (ADR 0033). "Unreachable" means
@@ -39,115 +52,6 @@ logger = logging.getLogger(__name__)
 # about the port, not a claim that a reachable server will succeed.
 RETRIEVE_REACHABLE = "reachable"
 RETRIEVE_UNREACHABLE = "unreachable"
-
-
-def parse_env_file(text: str) -> dict[str, str]:
-    """Parse KEY=VALUE lines. Comments, blanks, and malformed lines drop."""
-    pairs: dict[str, str] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if not key:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        pairs[key] = value
-    return pairs
-
-
-def find_env_file(*, start: Path | None = None) -> Path | None:
-    """Walk from ``start`` (cwd by default) up to the project root.
-
-    The closest ``.env`` wins. Walking stops at the first directory
-    that contains ``pyproject.toml`` so a stray ``~/.env`` is never
-    loaded because the operator launched from a nested cwd. When that
-    root is a linked worktree with no ``.env``, the main checkout's
-    ``.env`` is used instead.
-    """
-    current = (start or Path.cwd()).resolve()
-    while True:
-        candidate = current / ".env"
-        if candidate.is_file():
-            return candidate
-        if (current / "pyproject.toml").is_file():
-            return _worktree_main_dotenv(current)
-        parent = current.parent
-        if parent == current:
-            return None
-        current = parent
-
-
-def _worktree_main_dotenv(project_root: Path) -> Path | None:
-    import subprocess
-
-    try:
-        completed = subprocess.run(
-            [
-                "git",
-                "rev-parse",
-                "--path-format=absolute",
-                "--show-toplevel",
-                "--git-dir",
-                "--git-common-dir",
-            ],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None  # EXIT: git is not executable
-    lines = completed.stdout.splitlines()
-    if completed.returncode != 0 or len(lines) != 3:
-        return None
-    toplevel = Path(lines[0])
-    git_dir = Path(lines[1])
-    common = Path(lines[2])
-    if not common.is_absolute() or git_dir == common:
-        return None
-    if toplevel.resolve() != project_root.resolve():
-        return None
-    main = common.parent.resolve()
-    if main == project_root.resolve():
-        return None
-    env_file = main / ".env"
-    if env_file.is_file():
-        return env_file
-    return None
-
-
-def apply_dotenv(
-    *,
-    environ: MutableMapping[str, str] | None = None,
-    start: Path | None = None,
-) -> Path | None:
-    """Fill unset keys from the discovered ``.env``. Returns the path loaded."""
-    import os
-
-    target: MutableMapping[str, str]
-    if environ is None:
-        target = os.environ
-    else:
-        target = environ
-    path = find_env_file(start=start)
-    if path is None:
-        return None
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("operator .env exists but could not be read: %s", path)
-        return None
-    for key, value in parse_env_file(text).items():
-        target.setdefault(key, value)
-    return path
 
 
 def resolve_retrieve_adapter_kind(
@@ -187,6 +91,27 @@ def resolve_retrieve_adapter_kind(
         )
         return DEFAULT_RETRIEVE_ADAPTER
     return kind
+
+
+def resolve_corpus_scope_id(
+    *, environ: Mapping[str, str] | None = None
+) -> str:
+    """The trusted corpus scope a public corpus upload derives identity from.
+
+    ``FIN_CORPUS_SCOPE_ID`` when set, otherwise
+    :data:`DEFAULT_CORPUS_SCOPE_ID`. Read from host configuration only —
+    never from a filename, metadata field, filter or model argument —
+    because the scope is the one input that makes the same bytes land on
+    the same document id across retries and processes.
+
+    A blank value is treated as unset so a lower layer or the default can
+    win, matching how every other ``FIN_*`` reader treats whitespace. An
+    injected scope is always a non-empty string; the endpoint refuses a
+    blank one rather than minting an unscoped identity.
+    """
+    source: Mapping[str, str] = os.environ if environ is None else environ
+    configured = (source.get(CORPUS_SCOPE_ID_ENV) or "").strip()
+    return configured or DEFAULT_CORPUS_SCOPE_ID
 
 
 def probe_retrieve_reachability(
@@ -270,12 +195,12 @@ def warn_if_mcp_retrieve_unreachable(
 
 
 __all__ = [
+    "CORPUS_SCOPE_ID_ENV",
+    "DEFAULT_CORPUS_SCOPE_ID",
     "RETRIEVE_REACHABLE",
     "RETRIEVE_UNREACHABLE",
-    "apply_dotenv",
-    "find_env_file",
-    "parse_env_file",
     "probe_retrieve_reachability",
+    "resolve_corpus_scope_id",
     "resolve_retrieve_adapter_kind",
     "warn_if_mcp_retrieve_unreachable",
 ]

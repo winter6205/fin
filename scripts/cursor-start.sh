@@ -35,22 +35,21 @@ done
 pg_isready -h 127.0.0.1 -p 5432 -U fin -d fin
 
 # --------------------------------------------------------------------
-# LLM boot defaults (official MiniMax Chat Completions)
+# LLM endpoint default (official MiniMax Chat Completions)
 # --------------------------------------------------------------------
 # Process env / Cloud secrets win. These exports only fill gaps so a
 # pod that injects FIN_API_KEY still hits official chat
 # instead of localhost:20128. Never assign the key here.
-log "llm env defaults"
+log "llm endpoint defaults"
 export FIN_BASE_URL="${FIN_BASE_URL:-https://api.minimaxi.com/v1}"
-export FIN_MODEL="${FIN_MODEL:-MiniMax-M3}"
 export FIN_CHECKPOINT_URL="${FIN_CHECKPOINT_URL:-postgresql://fin:fin@localhost:5432/fin?sslmode=disable}"
 
 # --------------------------------------------------------------------
 # Attachment boot bounds
 # --------------------------------------------------------------------
-# serve() reads all four bounds before it binds a port, and this boot loads
-# no .env file, so a pod that injected none would not come up at all. The
-# template is the source; an injected process variable still wins.
+# serve() reads all four bounds before it binds a port. This boot does not
+# apply ~/.fin/settings.yaml itself (serve() does); the template fills a pod
+# that injected none. An injected process variable still wins.
 # shellcheck source=scripts/lib/attachment-bounds.sh
 source "$REPO_ROOT/scripts/lib/attachment-bounds.sh"
 log "attachment bounds defaults"

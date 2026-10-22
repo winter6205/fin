@@ -467,7 +467,7 @@ def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
 # ----- the task-runtime family -----
 #
 # Question/task runtime T2-T6. Defined in
-# :mod:`fin.host.task_runtime_types` and re-exported HERE so the whole
+# :mod:`fin.host.task.task_runtime_types` and re-exported HERE so the whole
 # named-failure vocabulary keeps ONE import surface, exactly as the
 # retrieve-side codes are defined in :mod:`fin.retrieve.tiers` and
 # re-exported above. Import them from this module; importing them from
@@ -479,7 +479,7 @@ def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
 # ``task_permission_denied`` says a current permission fact refuses the
 # operation rather than a source being unbound. Re-labelling one with
 # another is what ADR 0008 forbids.
-from fin.host.task_runtime_types import (  # noqa: E402
+from fin.host.task.task_runtime_types import (  # noqa: E402
     TASK_ALREADY_RECONCILED,
     TASK_APPLICABILITY_UNRESOLVED,
     TASK_CAPABILITY_UNAVAILABLE,

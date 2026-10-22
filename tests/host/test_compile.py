@@ -1,17 +1,17 @@
-"""Tests for the durable v1 compile (T8, #17).
+"""Tests for the durable v1 compile (T8).
 
 These tests cover three responsibilities:
 
 1. **Compose + env wiring** — ``docker compose config`` exits 0
    (or, when docker is not installed, ``docker-compose.yml``
    parses to a valid YAML spec). The Postgres service's URL
-   matches the ``FIN_CHECKPOINT_URL`` example in
-   ``.env.example`` (scheme, host, port, db, user, password,
+   matches the ``checkpoint.url`` example in
+   ``settings.example.yaml`` (scheme, host, port, db, user, password,
    sslmode).
 2. **Typed env-var plumbing** — ``compile_for_runtime`` raises
    ``MissingCheckpointURLError`` when ``FIN_CHECKPOINT_URL`` is
-   unset; reads ``FIN_MODEL`` (with the documented default) when
-   no explicit value is supplied; wraps transient Postgres
+   unset; requires a configured non-empty ``FIN_MODEL`` when no
+   explicit value is supplied; wraps transient Postgres
    connection failures into a typed error rather than re-raising
    ``psycopg.OperationalError`` directly.
 
@@ -20,8 +20,8 @@ mocked via ``monkeypatch`` so the default ``uv run pytest -q``
 suite stays hermetic.
 
 Reference: ADR 0015 (``PostgresSaver`` + ``FIN_CHECKPOINT_URL``,
-``InMemorySaver`` only in tests), ADR 0022 (``FIN_MODEL`` default
-``MiniMax-M3`` on official MiniMax Chat Completions at
+``InMemorySaver`` only in tests), ADR 0022 (``FIN_MODEL`` configured
+by the operator on an OpenAI-compatible Chat Completions endpoint at
 ``FIN_BASE_URL`` default ``https://api.minimaxi.com/v1``), spec
 success-criteria item 7 (``docker compose config`` exits 0 and
 the example URL matches the service).
@@ -29,11 +29,11 @@ the example URL matches the service).
 
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 import types
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlparse
 
 import psycopg
@@ -42,10 +42,11 @@ import yaml
 
 from fin.host.compile import (
     DEFAULT_BASE_URL,
-    DEFAULT_MODEL,
     EXPECTED_CHECKPOINT_URL,
     CheckpointSetupError,
+    HostCompileError,
     MissingCheckpointURLError,
+    MissingModelError,
     compile_for_runtime,
     compile_for_runtime_dev,
 )
@@ -59,7 +60,10 @@ def _project_root() -> Path:
 
 
 COMPOSE_PATH = _project_root() / "docker-compose.yml"
-ENV_EXAMPLE_PATH = _project_root() / ".env.example"
+PRODUCTION_COMPOSE_PATH = (
+    _project_root() / "compose" / "docker-compose.production.yml"
+)
+SETTINGS_EXAMPLE_PATH = _project_root() / "settings.example.yaml"
 
 
 # ----- helpers -----
@@ -70,40 +74,26 @@ def _load_compose_spec() -> dict:
     return yaml.safe_load(COMPOSE_PATH.read_text())
 
 
-def _load_env_example() -> dict[str, str]:
-    """Parse ``.env.example`` as a simple ``KEY=VALUE`` map.
+def _load_settings_example() -> dict[str, str]:
+    """Project ``settings.example.yaml`` through the operator settings loader.
 
-    Comments and blank lines are ignored. Values are shell-
-    expanded in two narrow ways so a template like
-    ``${FIN_MODEL:-MiniMax-M3}`` resolves to the
-    fallback (``MiniMax-M3``) — i.e. what the operator
-    sees when they have not set the variable. This matches the
-    contract that ``.env.example`` is a self-documenting template
-    AND that the resolved defaults match the production
-    constants.
-
-    Recognised patterns:
-
-    * ``${VAR}`` → ``"<unset>"`` (placeholder with no fallback).
-    * ``${VAR:-default}`` → ``default``.
-    * anything else → literal text.
+    Placeholders expand from the mapping passed here, the same way boot
+    expands ``${NAME}`` from the process environment. The dummy keys are
+    not the committed file: the template stores ``${FIN_API_KEY}`` and
+    ``${FIN_JEV_API_KEY}``.
     """
-    pairs: dict[str, str] = {}
-    placeholder = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
-    for raw in ENV_EXAMPLE_PATH.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip()
-        m = placeholder.fullmatch(value)
-        if m is not None:
-            fallback = m.group(2)
-            value = fallback if fallback is not None else "<unset>"
-        pairs[key.strip()] = value
-    return pairs
+    from fin.host.operator_settings import project_operator_settings
+
+    text = SETTINGS_EXAMPLE_PATH.read_text(encoding="utf-8")
+    assert "${FIN_API_KEY}" in text
+    assert "${FIN_JEV_API_KEY}" in text
+    return project_operator_settings(
+        SETTINGS_EXAMPLE_PATH,
+        environ={
+            "FIN_API_KEY": "example-api-key",
+            "FIN_JEV_API_KEY": "example-jev-key",
+        },
+    )
 
 
 def _service_url(env_map: dict[str, str]) -> str:
@@ -162,24 +152,24 @@ def test_compose_uses_postgres_16_alpine() -> None:
 
 
 def test_env_example_has_required_keys() -> None:
-    env = _load_env_example()
+    env = _load_settings_example()
     assert "FIN_CHECKPOINT_URL" in env, (
-        ".env.example must define FIN_CHECKPOINT_URL (ADR 0015)"
+        "settings.example.yaml must define FIN_CHECKPOINT_URL (ADR 0015)"
     )
     assert "FIN_MODEL" in env, (
-        ".env.example must define FIN_MODEL (ADR 0022)"
+        "settings.example.yaml must define FIN_MODEL (ADR 0022)"
     )
     assert "FIN_BASE_URL" in env, (
-        ".env.example must define FIN_BASE_URL (ADR 0022 — "
+        "settings.example.yaml must define FIN_BASE_URL (ADR 0022 — "
         "official MiniMax Chat Completions endpoint)"
     )
     assert "FIN_API_KEY" in env, (
-        ".env.example must define FIN_API_KEY "
+        "settings.example.yaml must define FIN_API_KEY "
         "(Bearer token for official MiniMax Chat Completions — "
         "ADR 0022 update 2026-08-27 hard switch)"
     )
     assert "FIN_JEV_API_KEY" in env, (
-        ".env.example must define FIN_JEV_API_KEY "
+        "settings.example.yaml must define FIN_JEV_API_KEY "
         "(TypeSafe Jev host judge; operator pastes the key)"
     )
     assert env["FIN_JEV_MODEL"] == "jev-latest"
@@ -187,12 +177,12 @@ def test_env_example_has_required_keys() -> None:
 
 
 def test_env_example_url_matches_expected() -> None:
-    env = _load_env_example()
+    env = _load_settings_example()
     assert env["FIN_CHECKPOINT_URL"] == EXPECTED_CHECKPOINT_URL
 
 
 def test_env_example_url_is_well_formed_postgres() -> None:
-    url = _load_env_example()["FIN_CHECKPOINT_URL"]
+    url = _load_settings_example()["FIN_CHECKPOINT_URL"]
     parsed = urlparse(url)
     assert parsed.scheme == "postgresql"
     assert parsed.hostname == "localhost"
@@ -203,21 +193,20 @@ def test_env_example_url_is_well_formed_postgres() -> None:
     assert parsed.query == "sslmode=disable"
 
 
-def test_env_example_default_model_matches_adr_0013() -> None:
-    env = _load_env_example()
-    assert env["FIN_MODEL"] == DEFAULT_MODEL
-    assert env["FIN_MODEL"] == "MiniMax-M3"
+def test_env_example_requires_an_explicit_nonempty_model() -> None:
+    env = _load_settings_example()
+    assert env["FIN_MODEL"].strip()
 
 
 def test_env_example_default_base_url_matches_default_constant() -> None:
-    env = _load_env_example()
+    env = _load_settings_example()
     assert env["FIN_BASE_URL"] == DEFAULT_BASE_URL
     # The default SHOULD include /v1 — the official OpenAI SDK
     # appends /chat/completions itself. Without /v1 the SDK
     # would hit /chat/completions (404).
     assert env["FIN_BASE_URL"] == "https://api.minimaxi.com/v1"
     assert env["FIN_BASE_URL"].endswith("/v1"), (
-        ".env.example FIN_BASE_URL must end with /v1; the "
+        "settings.example.yaml FIN_BASE_URL must end with /v1; the "
         "OpenAI SDK appends /chat/completions"
     )
 
@@ -225,15 +214,17 @@ def test_env_example_default_base_url_matches_default_constant() -> None:
 def test_compose_service_url_matches_env_example_url() -> None:
     """End-to-end URL-match acceptance gate (spec item 7).
 
-    The URL the operator sees in ``.env.example`` must be the URL
+    The URL the operator sees in ``settings.example.yaml`` must be the URL
     ``docker compose`` would resolve against the ``postgres``
     service. We do NOT assert a literal string equality because
     compose env vars do not encode the URL query string; we
     instead assert each part (scheme, host, port, db, user,
-    password) on the ``.env.example`` URL plus the same parts on
-    the compose service.
+    password) on the ``settings.example.yaml`` URL plus the same parts on
+    the production compose service.
     """
-    pg = _load_compose_spec()["services"]["postgres"]
+    pg = yaml.safe_load(PRODUCTION_COMPOSE_PATH.read_text(encoding="utf-8"))[
+        "services"
+    ]["postgres"]
     env_section = pg.get("environment", {})
     # docker-compose accepts both list-of-strings ("K=V") and
     # map ({K: V}) syntax. PyYAML returns a dict for the map
@@ -278,7 +269,7 @@ def test_compose_service_url_matches_env_example_url() -> None:
     )
 
     # The compose-derived URL (without sslmode — compose does
-    # not encode query params) must match the .env.example URL
+    # not encode query params) must match the settings.example.yaml URL
     # on every URL part that compose CAN derive.
     derived = (
         f"postgresql://{env_map['POSTGRES_USER']}:"
@@ -288,7 +279,7 @@ def test_compose_service_url_matches_env_example_url() -> None:
     expected = EXPECTED_CHECKPOINT_URL.split("?", 1)[0]
     assert derived == expected, (
         f"compose-derived URL {derived!r} must equal the "
-        f".env.example URL minus the sslmode query ({expected!r})"
+        f"settings.example.yaml URL minus the sslmode query ({expected!r})"
     )
 
 
@@ -332,6 +323,77 @@ def test_compile_for_runtime_raises_missing_checkpoint_url(
         compile_for_runtime()
 
 
+@pytest.mark.parametrize("configured_model", [None, " \t "])
+def test_compile_for_runtime_rejects_missing_or_blank_model(
+    monkeypatch: pytest.MonkeyPatch, configured_model: str | None
+) -> None:
+    env = {} if configured_model is None else {"FIN_MODEL": configured_model}
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
+    monkeypatch.setattr(
+        "fin.host.compile.compile_graph", lambda **_kw: "compiled-graph"
+    )
+
+    with pytest.raises(HostCompileError) as excinfo:
+        compile_for_runtime(
+            checkpointer_url="postgresql://placeholder", env=env
+        )
+
+    assert isinstance(excinfo.value, MissingModelError)
+    assert "FIN_MODEL" in str(excinfo.value)
+    assert captured == {}, "missing configuration must not build a model"
+
+
+def test_compile_for_runtime_rejects_blank_argument_before_environment_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
+    monkeypatch.setattr(
+        "fin.host.compile.compile_graph", lambda **_kw: "compiled-graph"
+    )
+
+    with pytest.raises(HostCompileError) as excinfo:
+        compile_for_runtime(
+            checkpointer_url="postgresql://placeholder",
+            model_name=" \t ",
+            env={"FIN_MODEL": "environment-model"},
+        )
+
+    assert isinstance(excinfo.value, MissingModelError)
+    assert captured == {}, "a blank explicit value must not fall back to env"
+
+
+def test_compile_for_runtime_rejects_non_string_explicit_model() -> None:
+    with pytest.raises(MissingModelError):
+        compile_for_runtime(
+            checkpointer_url="postgresql://placeholder",
+            model_name=cast(str, 7),
+            env={"FIN_MODEL": "environment-model"},
+        )
+
+
+def test_compile_for_runtime_prefers_explicit_model_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
+    monkeypatch.setattr(
+        "fin.host.compile.compile_graph", lambda **_kw: "compiled-graph"
+    )
+
+    compile_for_runtime(
+        checkpointer_url="postgresql://placeholder",
+        model_name="argument-model",
+        env={"FIN_MODEL": "environment-model"},
+    )
+
+    assert captured["model"] == "argument-model"
+
+
 def _install_fake_langchain_openai(
     monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]
 ) -> None:
@@ -369,7 +431,7 @@ def _install_fake_langchain_openai(
         def bind_tools(self, _tools: object) -> "_FakeChatOpenAI":
             return self
 
-        # T3 (#34): ``compile_graph`` layers the no-thinking
+        # T3: ``compile_graph`` layers the no-thinking
         # preference onto the tool binding via ``.bind(extra_body=...)``
         # — the real ChatOpenAI (Runnable) exposes ``bind``; the fake
         # mirrors it so the compile path runs end-to-end.
@@ -391,18 +453,17 @@ def _install_fake_postgres_saver(
     monkeypatch.setitem(sys.modules, "langgraph.checkpoint.postgres", pg_mod)
 
 
-def test_compile_for_runtime_uses_default_model_when_unset(
+def test_compile_for_runtime_keeps_endpoint_and_key_behavior_with_configured_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``FIN_MODEL`` and ``FIN_BASE_URL`` fall back to the
-    official MiniMax Chat Completions defaults when env is unset.
+    """A configured model keeps endpoint and API-key fallback behavior intact.
 
     The model-construction step is stubbed via a fake
     ``ChatOpenAI``. PostgresSaver is stubbed too, so we reach
     ``compile_graph`` and can confirm the function's end-to-end
     plumbing without a live database.
     """
-    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-test-model")
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.delenv("FIN_API_KEY", raising=False)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
@@ -423,8 +484,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
 
     result = compile_for_runtime()
     assert result == "compiled-graph"
-    assert captured["model"] == DEFAULT_MODEL
-    assert captured["model"] == "MiniMax-M3"
+    assert captured["model"] == "synthetic-test-model"
     assert captured["base_url"] == DEFAULT_BASE_URL
     # The OpenAI SDK appends /chat/completions; base_url must
     # include /v1 so the SDK hits /v1/chat/completions.
@@ -471,6 +531,7 @@ def test_compile_passes_minimax_extra_body_as_chatopenai_field(
     other gateways (Volcengine Ark, etc.) reject it as InvalidParameter.
     """
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    monkeypatch.setenv("FIN_MODEL", "synthetic-test-model")
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
@@ -492,7 +553,7 @@ def test_compile_omits_minimax_thinking_body_for_non_minimax_gateway(
     monkeypatch.setenv(
         "FIN_BASE_URL", "https://arkcn-beijing.volces.com/api/coding/v1"
     )
-    monkeypatch.setenv("FIN_MODEL", "glm-5.3-flash")
+    monkeypatch.setenv("FIN_MODEL", "synthetic-nondefault-model")
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)
@@ -503,7 +564,7 @@ def test_compile_omits_minimax_thinking_body_for_non_minimax_gateway(
 
     compile_for_runtime()
     assert captured["extra_body"] is None
-    assert captured["model"] == "glm-5.3-flash"
+    assert captured["model"] == "synthetic-nondefault-model"
 
 
 def test_compile_for_runtime_reads_fin_base_url_from_env(
@@ -514,6 +575,7 @@ def test_compile_for_runtime_reads_fin_base_url_from_env(
     official Chat Completions URL via env (e.g. overseas
     ``https://api.minimax.io/v1``)."""
     monkeypatch.setenv("FIN_BASE_URL", "https://api.example.com/v1")
+    monkeypatch.setenv("FIN_MODEL", "synthetic-test-model")
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
     captured: dict[str, object] = {}
@@ -526,8 +588,8 @@ def test_compile_for_runtime_reads_fin_base_url_from_env(
 
     compile_for_runtime()
     assert captured["base_url"] == "https://api.example.com/v1"
-    # base_url override does not change the default model.
-    assert captured["model"] == DEFAULT_MODEL
+    # base_url override does not change the configured model.
+    assert captured["model"] == "synthetic-test-model"
 
 
 def test_compile_for_runtime_passes_fin_api_key_as_api_key(
@@ -539,6 +601,7 @@ def test_compile_for_runtime_passes_fin_api_key_as_api_key(
     secret value must reach ChatOpenAI without ever being
     logged or echoed."""
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    monkeypatch.setenv("FIN_MODEL", "synthetic-test-model")
     monkeypatch.setenv("FIN_API_KEY", "sk-test-fake-key")
 
     captured: dict[str, object] = {}
@@ -564,6 +627,7 @@ def test_compile_for_runtime_wraps_setup_failure_as_typed_error(
     kinds; spec: error message does not leak sensitive details).
     """
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://bad")
+    monkeypatch.setenv("FIN_MODEL", "synthetic-test-model")
 
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)
@@ -575,6 +639,51 @@ def test_compile_for_runtime_wraps_setup_failure_as_typed_error(
     # The original error is chained via __cause__ so operators
     # can still debug, but the visible type is ours.
     assert isinstance(excinfo.value.__cause__, psycopg.OperationalError)
+
+
+def test_compile_runtime_handle_closes_postgres_after_graph_compile_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A graph factory failure releases the saver acquired earlier in boot."""
+    from fin.host import compile as compile_module
+
+    close_calls: list[tuple[object, ...]] = []
+
+    class _TrackedSaver:
+        def setup(self) -> None:
+            return None
+
+        @classmethod
+        def from_conn_string(
+            cls, _url: str, *, pipeline: bool = False
+        ) -> "_TrackedCM":
+            return _TrackedCM()
+
+    class _TrackedCM:
+        def __enter__(self) -> _TrackedSaver:
+            return _TrackedSaver()
+
+        def __exit__(self, *exc: object) -> None:
+            close_calls.append(exc)
+
+    _install_fake_postgres_saver(monkeypatch, _TrackedSaver)
+    monkeypatch.setattr(compile_module, "_build_default_model", lambda **_kw: object())
+    monkeypatch.setattr(compile_module, "build_jev_client", lambda **_kw: None)
+    monkeypatch.setattr(
+        compile_module, "_resolve_retrieve_adapter", lambda _env: object()
+    )
+
+    def _compile_graph(**_kwargs: object) -> object:
+        raise RuntimeError("graph construction failed")
+
+    monkeypatch.setattr(compile_module, "compile_graph", _compile_graph)
+
+    with pytest.raises(RuntimeError, match="graph construction failed"):
+        compile_module.compile_runtime_handle(
+            checkpointer_url="postgresql://placeholder"
+        )
+
+    assert len(close_calls) == 1
 
 
 # ----- fake PostgresSaver (no live connect) -----
@@ -657,6 +766,7 @@ def test_compile_for_runtime_dev_uses_in_memory_saver(
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-test-model")
 
     import warnings
 
@@ -669,8 +779,8 @@ def test_compile_for_runtime_dev_uses_in_memory_saver(
     assert any("FIN_CHECKPOINT_URL" in m for m in messages), messages
     # 2. The dev path returned a non-None compiled graph (proxy).
     assert graph is not None
-    # 3. Model defaults flowed through to ChatOpenAI (no env overrides).
-    assert captured["model"] == DEFAULT_MODEL
+    # 3. The explicit test model flowed through to ChatOpenAI.
+    assert captured["model"] == "synthetic-test-model"
     assert captured["base_url"] == DEFAULT_BASE_URL
 
 
@@ -688,25 +798,27 @@ def test_compile_for_runtime_dev_does_not_require_postgres(
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-test-model")
 
     graph = compile_for_runtime_dev()
     assert graph is not None
     # Model wiring happened end-to-end (the prod path's checkpointer
     # plumbing was bypassed — if it had not been, the missing
     # URL would have raised).
-    assert captured["model"] == DEFAULT_MODEL
+    assert captured["model"] == "synthetic-test-model"
 
 
-def test_cursor_start_exports_official_chat_defaults() -> None:
-    """Cloud Agent ``start`` must setdefault official Chat Completions
-    so a pod that only injects ``FIN_API_KEY`` still
-    talks to MiniMax, not localhost:20128.
-    """
+def test_cursor_start_does_not_invent_a_model() -> None:
+    """Cloud Agent ``start`` may supply the endpoint but not model identity."""
     text = (_project_root() / "scripts" / "cursor-start.sh").read_text()
     assert (
         f'FIN_BASE_URL="${{FIN_BASE_URL:-{DEFAULT_BASE_URL}}}"' in text
     )
-    assert f'FIN_MODEL="${{FIN_MODEL:-{DEFAULT_MODEL}}}"' in text
+    assert not any(
+        line.lstrip().startswith("FIN_MODEL=")
+        or line.lstrip().startswith("export FIN_MODEL=")
+        for line in text.splitlines()
+    )
     # Must not bake a key. Comments may name the variable.
     assigned = [
         line

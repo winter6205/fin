@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-quarterly-summary",
+  "title": "ZEUS Quarterly Financial Summary",
+  "content": "ZEUS Quarterly Financial Summary · Page 1\nSection 1 reports the unaudited consolidated statements for the\nthree months ended 2024-09-30.\nTotal revenue for the three months ended 2024-09-30 was\nUSD 412,300,000, against USD 361,800,000 for the comparable\nthree months ended 2023-09-30, an increase of 13.96%.\nGross profit was USD 247,380,000, a gross margin of 60.0%.\nNet income for the same three months was USD 61,845,000, and\ndiluted earnings per share were USD 1.42.\nNet cash provided by operating activities for the nine months\nended 2024-09-30 was USD 98,700,000. The balance sheet held\ncash and cash equivalents of USD 214,500,000 at 2024-09-30\nand no debt was outstanding.\nThese figures are unaudited and all amounts are in USD.\n\nZEUS Quarterly Financial Summary · Page 2\nSection 2 reports segment results and the full-year outlook\nissued on 2024-10-28.\nAEGIS segment revenue for the three months ended 2024-09-30\nwas USD 288,610,000, up 16.2% year on year. HELIOS segment\nrevenue for the same three months was USD 123,690,000, up 9.8%\nyear on year.\nFull-year 2024 revenue guidance is USD 1,610,000,000 at the low\nend and USD 1,640,000,000 at the high end. Guidance was\nissued on 2024-10-28 by Daniel Okonkwo, Chief Financial\nOfficer, and was not changed during the quarter.\nZEUS does not expect to pay a quarterly dividend before the\nfirst quarter of 2025. All amounts are in USD.",
+  "chunks": [
+    {
+      "content": "ZEUS Quarterly Financial Summary · Page 1\nSection 1 reports the unaudited consolidated statements for the\nthree months ended 2024-09-30.\nTotal revenue for the three months ended 2024-09-30 was\nUSD 412,300,000, against USD 361,800,000 for the comparable\nthree months ended 2023-09-30, an increase of 13.96%.\nGross profit was USD 247,380,000, a gross margin of 60.0%.\nNet income for the same three months was USD 61,845,000, and\ndiluted earnings per share were USD 1.42.\nNet cash provided by operating activities for the nine months\nended 2024-09-30 was USD 98,700,000. The balance sheet held\ncash and cash equivalents of USD 214,500,000 at 2024-09-30\nand no debt was outstanding.\nThese figures are unaudited and all amounts are in USD.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Quarterly Financial Summary · Page 2\nSection 2 reports segment results and the full-year outlook\nissued on 2024-10-28.\nAEGIS segment revenue for the three months ended 2024-09-30\nwas USD 288,610,000, up 16.2% year on year. HELIOS segment\nrevenue for the same three months was USD 123,690,000, up 9.8%\nyear on year.\nFull-year 2024 revenue guidance is USD 1,610,000,000 at the low\nend and USD 1,640,000,000 at the high end. Guidance was\nissued on 2024-10-28 by Daniel Okonkwo, Chief Financial\nOfficer, and was not changed during the quarter.\nZEUS does not expect to pay a quarterly dividend before the\nfirst quarter of 2025. All amounts are in USD.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "financial_report_summary",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "10-Q",
+    "period": "2024 Q3",
+    "filing_date": "2024-10-28"
+  },
+  "valid_from": "2024-10-28T00:00:00Z"
+}

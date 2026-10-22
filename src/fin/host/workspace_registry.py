@@ -35,6 +35,18 @@ DEFAULT_ROOT_NAME: str = "default"
 # ---------------------------------------------------------------------------
 
 
+def workspace_root_for_fin_home(fin_home: Path | str) -> Path:
+    """Default 工作区 under a resolved fin home: ``<fin_home>/default``.
+
+    ``default_workspace_root`` still joins ``<home>/.fin/default`` for
+    callers that pass ``$HOME``. The process seam passes the resolved
+    fin home here so a worktree does not mkdir ``~/.fin``.
+    """
+    path = Path(fin_home) / DEFAULT_ROOT_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def default_workspace_root(home: Path | str) -> Path:
     """Return the default 工作区 directory under ``<home>/.fin/default``.
 
@@ -54,4 +66,5 @@ def default_workspace_root(home: Path | str) -> Path:
 __all__ = [
     "DEFAULT_ROOT_NAME",
     "default_workspace_root",
+    "workspace_root_for_fin_home",
 ]

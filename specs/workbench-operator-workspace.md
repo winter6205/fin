@@ -2,18 +2,18 @@
 
 ## Assumption gate (confirmed 2026-09-06; amended 2026-09-06)
 
-Operator confirmed the program in-thread (issue the tracked change as Focus 5, not as the first knife). Amendment 2026-09-06 confirmed via Wave A freeze: one global default 工作区; no `workspaces/<slug>`; no left-rail 指定/新建. These are in force:
+Operator confirmed the program in-thread (Focus 5, not as the first knife). Amendment 2026-09-06 confirmed via Wave A freeze: one global default 工作区; no `workspaces/<slug>`; no left-rail 指定/新建. These are in force:
 
-1. Product is **fin**, an enterprise **knowledge-QA** entry point (the 入口, not the 库; [ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)). Product copy and identity must not call fin a research agent. SEC filings are the first corpus seed, not the product name (the tracked change).
+1. Product is **fin**, an enterprise **knowledge-QA** entry point (the 入口, not the 库; [ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)). Product copy and identity must not call fin a research agent. SEC filings are the first corpus seed, not the product name.
 2. Three names, one each: **工作台** = the local web UI; **工作区** = the one global default directory `$HOME/.fin/default`; **知识库** = the one shared corpus behind retrieve / `list_files` / ingest. There is no sidebar control that creates a 工作区 or a second 知识库.
 3. Every **research thread** lives in that one 工作区. Multiplicity is threads, not filesystem folders. No left rail 指定/新建. No `$HOME/.fin/workspaces/<slug>`. Future many-libraries / tenants / collections is out of this spec.
 4. Do not add `fin_thread.project_root` as a product column. Do not scope `GET /api/threads` by directory. In-flight Wave A T3 WIP that added per-thread roots is discarded, not completed.
 5. **知识库** stays one process-wide catalog (`catalog_path` / ingest tree / **retrieve port**). **user profile** is `$HOME/.fin/user.md` only. **memory fact** workspace key is the one default path (tests inject home).
 6. Boot never treats `Path.cwd()` as the implicit 工作区. `compile_for_runtime` / `compile_graph` do **not** bake a process-wide `workspace_root` (not cwd, not default). HTTP/CLI inject `configurable.workspace_root` = resolved `$HOME/.fin/default` (tests inject home). `graph.py` does **not** import `thread_store`. Profile read and memory tools read the key from that configurable per call. Omit / empty at call time → typed `WorkspaceRootMissingError` (name implementer-open), **EXIT**, never `Path.cwd()`, never a silent default inside the graph. The `_IDEMPOTENCE_CACHE` key drops `workspace_root_key`.
-7. Host system prefix follows `docs/guides/prompt-development.md`: 说明书不是闸; system 无全库目录; prefix bytes stable inside a thread. Assembly order: identity → soul → usage → **user profile** → **memory existence pointer**. Four **track**s share identity/soul and swap usage only. Tool field caps (`page_limit`) and citation-gate numbers (32-character span, repair cap) stay in schema / **citation verifier**, not in persona prose. the tracked change is Focus 5 and runs after Foci 1–4 so identity is written once against the real roots.
+7. Host system prefix follows `docs/guides/prompt-development.md`: 说明书不是闸; system 无全库目录; prefix bytes stable inside a thread. Assembly order: identity → soul → usage → **user profile** → **memory existence pointer**. Four **track**s share identity/soul and swap usage only. Tool field caps (`page_limit`) and citation-gate numbers (32-character span, repair cap) stay in schema / **citation verifier**, not in persona prose. Focus 5 runs after Foci 1–4 so identity is written once against the real roots.
 8. Code may keep the parameter name `workspace_root` for the 工作区 directory (avoid a shotgun rename). It must not mean the UI. This spec is fin-only (no iknow / iknow-memory edits).
 9. Default `uv run pytest -q` stays green with no live SEC and no live memory server. Prompt gold sets re-pin; behavior of retrieve / verifier / Soft-Track track names does not change.
-10. Tracker: this file is the program contract. Focus 5 tracer is the tracked change. Foci 1–4 stay on the tracked change. T2 already landed default-root + never-cwd **and** a multi-root `/api/workspaces` bind/create registry; the remaining wave keeps the former and unships the latter.
+10. Tracker: this file is the program contract. The Focus 5 tracer and the Foci 1–4 work are tracked separately. T2 already landed default-root + never-cwd **and** a multi-root `/api/workspaces` bind/create registry; the remaining wave keeps the former and unships the latter.
 
 → These are in force for this spec.
 
@@ -59,7 +59,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
   **Focus 4 — 钉语料**
   - `GET /api/corpus`, ingest doors (ADR 0047), and `list_files` stay one 知识库 for the process. Empty catalog is empty (no fallback to a hardcoded 12-filing SEC list). Repo `data/corpus/` may seed the first-run library; it is not identity text.
 
-  **Focus 5 — 钉说明书** (the tracked change)
+  **Focus 5 — 钉说明书**
   - Split host prompts: identity (Name / Kind = fin, enterprise **knowledge-QA** agent — the 入口, not the 库) → soul (how to speak / refuse; parametric memory is not evidence) → usage (tool _choice_ and citation _behavior_ per **track**) → **user profile** → **memory existence pointer**.
   - Identity does not name 10-Q, frozen-12, `cwd`, or “`$HOME/.fin` is the home of sessions”. Usage may say answers are grounded in this 知识库 via tools. Clarify options are not a hardcoded AAPL/MSFT/AMZN quarter list in all four prompts; research usage does not restate `page_limit` or “32 or more characters”.
   - Fixtures first, then copy (`docs/guides/prompt-development.md`). Adjacent turns in one thread: system prefix deep-equal (profile block may change if the file changed; identity/soul/usage/pointer bytes do not). Existing prompt tests re-pin.
@@ -106,7 +106,7 @@ Each line is binary. Wave plans map 1:1 onto a subset. Default `uv run pytest -q
 
 **Inherits:** Python 3.12 + uv + pytest; slices `src/fin/corpus/`, `src/fin/retrieve/`, `src/fin/host/`, SPA `web/`; ScriptedChatModel + InMemorySaver default tests; `FIN_CHECKPOINT_URL` product Postgres (ADR 0015); one compiled **host graph** (ADR 0013); **citation verifier** (ADR 0021 / 0046); workspace HTTP + stream (ADR 0023–0026); Soft-Track (ADR 0027); retrieve MCP / Fake pytest (ADR 0032); two ingest doors (ADR 0047); **memory fact** workspace isolation at the store (`specs/cross-session-operator-memory.md` SC6 / SC13, ADR 0048) with one product key; prompt rules in `docs/guides/prompt-development.md`. Prior specs: `specs/workspace.md`, `specs/enterprise-kb-agent.md`, `specs/cross-session-operator-memory.md`. Sibling iknow is read-only reference for identity/soul/usage split and “no implicit cwd”, not a code source. Wave A T1 copy and T2 `default_workspace_root` + never-cwd are already on `feat/workbench-operator-workspace`.
 
-**Changes this spec adds:** one global default 工作区; never `Path.cwd()`; HTTP/CLI inject of that default into `configurable.workspace_root`; unship T2 multi-root `/api/workspaces` bind/create and `known_roots.json`; glossary split 工作台 / 工作区 / 知识库; host prompt assembly identity/soul/usage (the tracked change) after those roots exist. Does not add `thread.project_root`, left rail, or a second retrieve catalog.
+**Changes this spec adds:** one global default 工作区; never `Path.cwd()`; HTTP/CLI inject of that default into `configurable.workspace_root`; unship T2 multi-root `/api/workspaces` bind/create and `known_roots.json`; glossary split 工作台 / 工作区 / 知识库; host prompt assembly identity/soul/usage after those roots exist. Does not add `thread.project_root`, left rail, or a second retrieve catalog.
 
 ## 待写入 (persist after ACR)
 
@@ -127,12 +127,12 @@ bounded-context-guardian: yes — Focus 3 inject seam names HTTP/CLI as injector
 defensive-contract-validator: yes — Test allocation names empty / negative / overflow / concurrent / exception; SC3–SC8 bind those classes including omit configurable.workspace_root and unshipped bind/create
 error-handling-enforcer: yes — omit/empty configurable.workspace_root → typed WorkspaceRootMissingError EXIT never Path.cwd() never silent default inside the graph; HOME/default resolve typed not cwd; 409 concurrent_run unchanged
 complexity-anti-drift: yes — inject (HTTP/CLI) vs consume (graph per-call configurable) vs bake-removal (compile-time cwd closures / workspace_root_key) vs unship T2 multi-root HTTP; catalog compile-time; Focus 5 splits identity/soul/usage on Wave B
-minimal-change-verifier: yes — discard uncommitted T3 project_root WIP; remaining Wave A is two tracers (inject-default, unship multi-root API) not left rail; Focus 5 the wayfinder program; do not fold into the tracked change
+minimal-change-verifier: yes — discard uncommitted T3 project_root WIP; remaining Wave A is two tracers (inject-default, unship multi-root API) not left rail; Focus 5 tracer; do not fold into Focus 5
 ```
 
 **OVERALL: PASS — writing-plans may amend Wave A.** Spec path: `specs/workbench-operator-workspace.md`.
 
-Sequencing: two session-waves: Wave A = Foci 1–4 (`plans/workbench-operator-workspace.md`); Wave B = Focus 5 / the tracked change (`plans/host-prompt-assembly.md`). Do not fold Wave A into the the tracked change prompt branch.
+Sequencing: two session-waves: Wave A = Foci 1–4 (`plans/workbench-operator-workspace.md`); Wave B = Focus 5 (`plans/host-prompt-assembly.md`). Do not fold Wave A into the Focus 5 prompt branch.
 
 Affected surfaces (declared):
 
@@ -141,4 +141,4 @@ Affected surfaces (declared):
 - `web/` only if T2 left a 工作区 picker (must not add one)
 - `tests/host/`
 
-This spec is **one logical program**, not one commit. Wave A remaining = discard T3 WIP + inject-default tracer + unship-multi-root tracer. Wave B stays the tracked change after A merges.
+This spec is **one logical program**, not one commit. Wave A remaining = discard T3 WIP + inject-default tracer + unship-multi-root tracer. Wave B stays in Focus 5 after A merges.

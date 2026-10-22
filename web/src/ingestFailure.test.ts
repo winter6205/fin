@@ -51,12 +51,13 @@ describe("describeIngestFailure", () => {
     }
   });
 
-  // Identity now comes from the form's two required fields and the
-  // filename never participates, so renaming the file is not the fix.
-  it("points at company and period on document_id_missing", () => {
+  // Identity is derived server-side and the form has no field for it, so
+  // the copy must not send the operator back to company / period.
+  it("does not ask for company or period on document_id_missing", () => {
     const notice = describeIngestFailure(ingestError("document_id_missing"));
-    expect(notice.message).toContain("公司");
-    expect(notice.message).toContain("期间");
+    expect(notice.message).toContain("编号");
+    expect(notice.message).not.toContain("公司");
+    expect(notice.message).not.toContain("期间");
   });
 
   it("says this submission started nothing on concurrent_run (409)", () => {
@@ -119,6 +120,19 @@ describe("describeIngestFailure", () => {
       describeIngestFailure(ingestError("push_service_unavailable", 503))
         .message,
     );
+  });
+
+  // Two named refusals must have actionable copy too — a blank notice
+  // would read as "nothing wrong".
+  it("gives actionable copy for the upload-metadata refusals", () => {
+    const noId = describeIngestFailure(ingestError("document_id_not_allowed"));
+    expect(noId.message).toContain("编号");
+    expect(noId.message).not.toContain("通用");
+    expect(noId.message).not.toContain("document_id_not_allowed");
+
+    const badMeta = describeIngestFailure(ingestError("invalid_upload_metadata"));
+    expect(badMeta.message).toContain("*");
+    expect(badMeta.message).not.toContain("invalid_upload_metadata");
   });
 
   it("still says something for an untyped failure", () => {

@@ -2,30 +2,42 @@
 // restores turns from GET (no re-invoke).
 
 import { memo, useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
-import { useParams } from "react-router-dom";
-import AnswerWithCitations from "../components/CitationChips";
-import VisualClaims from "../components/VisualClaims";
+import { NavLink, useParams } from "react-router-dom";
+import AnswerWithCitations from "../capabilities/evidence/components/CitationChips";
+import VisualClaims from "../capabilities/evidence/components/VisualClaims";
 import Composer from "../components/Composer";
+// The demo door back to the homepage. The provider is an ANCESTOR of
+// every route (App.tsx), so the presentation it carries — the server's
+// confirmed demo mode — is the fact the link is decided on.
+import { useDemoPresentation } from "../components/DemoModeSurface";
 // question-workspace: the task surfaces. Each renders one pure module's
 // decision, so the judgement stays unit-tested in plain code.
 import ArchiveList from "../components/ArchiveList";
 import ClarificationCard, {
   RefusedClarificationNotice,
-} from "../components/ClarificationCard";
-import TaskPanel from "../components/TaskPanel";
+} from "../capabilities/clarification/components/ClarificationCard";
+import TaskPanel from "../capabilities/task/components/TaskPanel";
+// The document-choice card (specs/qa-chain-grounded-experience.md §GE-4).
+// Rendered instead
+// of ClarificationCard whenever the pending question is a document choice,
+// because its candidates must show title/section/summary rather than the
+// wire's opaque choice ids.
+import DocumentChoiceCard from "../capabilities/clarification/components/DocumentChoiceCard";
+import { documentChoiceSurface } from "../capabilities/clarification/documentChoiceSurface";
 import {
   clarificationRegion,
   type ClarificationRegion,
-} from "../clarificationRegion";
+} from "../capabilities/clarification/clarificationRegion";
 import {
   restoreDecision,
   type RestoreDecision,
 } from "../archiveRestore";
-import { taskState, type TaskStateView } from "../taskState";
+import { taskState, turnStatusLabel, type TaskStateView } from "../capabilities/task/taskState";
 import type {
   ChoiceWindow,
   Comparison,
   PendingQuestionView,
+  SearchModeDecision,
   ThreadDetail,
   ToolSummary,
   Turn,
@@ -46,7 +58,7 @@ import {
   shouldRenderStreamErrorKind,
   streamErrorKindRowText,
 } from "../streamErrorKind";
-import { turnVisualClaims } from "../visualClaims";
+import { turnVisualClaims } from "../capabilities/evidence/visualClaims";
 import {
   canSubmitFeedback,
   feedbackErrorVisible,
@@ -71,6 +83,7 @@ import {
 } from "../store";
 import { occupancyPercent, parseThreadOccupancy } from "../threadOccupancy";
 import { threadViewState, type ThreadViewState } from "../threadViewState";
+import { threadEntryIsLive } from "../threadEntry";
 
 const TRANSCRIPT_BOTTOM_TOLERANCE = 4;
 
@@ -317,15 +330,60 @@ function OccupancyBadge({
   );
 }
 
+function searchModeDecisionForThread(
+  turns: Turn[],
+  inFlight: boolean,
+): SearchModeDecision | null | undefined {
+  if (inFlight) return undefined;
+  const latestTurn = turns[turns.length - 1];
+  if (!latestTurn) return undefined;
+  return latestTurn.search_mode_decision ?? null;
+}
+
+/** The latest turn row, or null on a thread that has not started one. */
+function latestTurnOrNull(turns: readonly Turn[]): Turn | null {
+  return turns[turns.length - 1] ?? null;
+}
+
 // T2 fix: the SPA's refuse / step_cap ordinary-person copy is the
 // server-emitted ``assistant_message`` (see run_payload.ORDINARY_PERSON_COPY).
 // A client-side duplicate was rendering two near-identical sentences and
 // leaking the raw enum reason ("(unknown_locator)"). Delete the duplicate
 // so ``assistant_message`` is the sole user-facing copy on those turns.
 
+/**
+ * The demo door back to the homepage.
+ *
+ * It exists only on a DEMO conversation, and the fact comes from the
+ * demo presentation the ancestor provider carries — true only when the
+ * server confirmed demo mode. Going home must not reset the corpus,
+ * delete the conversation or cancel an answer in flight: this link
+ * only navigates.
+ *
+ * Prop-driven on purpose: the thread page's own body reads the
+ * workspace store, whose state a server render cannot see, so the
+ * demo-only rule is asserted on this piece directly (this project's
+ * vitest setup has no DOM testing library).
+ */
+export function DemoHomeLink({ enabled }: { enabled: boolean }) {
+  if (!enabled) return null;
+  return (
+    <NavLink
+      to="/"
+      data-testid="demo-home-link"
+      className="shrink-0 border border-black px-2 py-1 text-xs hover:bg-tool hover:text-white"
+    >
+      返回演示首页
+    </NavLink>
+  );
+}
+
 export default function ThreadPage() {
   const { thread_id } = useParams<{ thread_id: string }>();
   const activeThread = useWorkspaceStore((s) => s.activeThread);
+  // The demo door back to the homepage (T3). The hook is called above
+  // the early return so the hook count stays stable across renders.
+  const demo = useDemoPresentation();
   const transcriptViewportRef = useRef<HTMLDivElement>(null);
   const transcriptContentRef = useRef<HTMLDivElement>(null);
   const shouldFollowTranscriptRef = useRef(true);
@@ -337,6 +395,24 @@ export default function ThreadPage() {
   // thread (reload / switch back). GET only - no graph invoke.
   useEffect(() => {
     if (!thread_id) return;
+    // T2: a thread that is already answering on THIS client keeps its
+    // live answer — a re-read here would race the stream. The store
+    // guard is the primary defense; this effect does not add a second
+    // read of its own in that case. It asks the SAME rule the store
+    // guard asks (``threadEntryIsLive``), so the read it skips and the
+    // read the store skips are the same read. When the operator LEFT
+    // the thread while its send was in flight, the live state is gone
+    // and the read is required.
+    const state = useWorkspaceStore.getState();
+    if (
+      threadEntryIsLive({
+        threadId: thread_id,
+        sendingThreadId: state.sendingThreadId,
+        activeThreadId: state.activeThread?.id ?? null,
+      })
+    ) {
+      return;
+    }
     const open = useWorkspaceStore.getState().openThread;
     void open(thread_id).catch(() => undefined);
   }, [thread_id]);
@@ -445,6 +521,13 @@ export default function ThreadPage() {
     projectionUnreadable: projectionUnreadableFor(surface, thread_id),
     submission: submissionNoticeFor(surface, thread_id),
   });
+  const searchModeDecision = searchModeDecisionForThread(
+    activeThread.turns,
+    activeThread.in_flight === true,
+  );
+  // The developer trace section describes the turn currently on screen;
+  // let the same latest-row selection feed the task panel once, here.
+  const currentTurn = latestTurnOrNull(activeThread.turns);
   const restore = restoreDecision(restoreFactsFor(surface, thread_id));
 
   return (
@@ -458,6 +541,8 @@ export default function ThreadPage() {
             创建于 {new Date(activeThread.created_at).toLocaleString()}
           </p>
         </div>
+        {/* The demo door back to the homepage (T3). */}
+        <DemoHomeLink enabled={demo.enabled} />
         <OccupancyBadge occupancy={parseThreadOccupancy(activeThread)} />
         <ExportLinks threadId={thread_id} turns={activeThread.turns} />
       </header>
@@ -485,6 +570,8 @@ export default function ThreadPage() {
         region={region}
         restore={restore}
         pendingQuestion={pendingQuestion}
+        searchModeDecision={searchModeDecision}
+        currentTurn={currentTurn}
       />
 
       <Composer threadId={thread_id} />
@@ -504,12 +591,16 @@ function TaskRegion({
   region,
   restore,
   pendingQuestion,
+  searchModeDecision,
+  currentTurn,
 }: {
   threadId: string;
   taskView: TaskStateView;
   region: ClarificationRegion;
   restore: RestoreDecision;
   pendingQuestion: PendingQuestionView | null;
+  searchModeDecision: SearchModeDecision | null | undefined;
+  currentTurn: Turn | null;
 }) {
   const openTaskClarification = useWorkspaceStore(
     (s) => s.openTaskClarification,
@@ -522,9 +613,27 @@ function TaskRegion({
     if (pendingQuestion) openTaskClarification(threadId);
   }, [threadId, pendingQuestion, openTaskClarification]);
 
+  // A ``document_choice`` gets its OWN card (§GE-4).
+  // The two are mutually exclusive by construction — this returns null for
+  // anything that is not a document choice, so an ordinary clarification can
+  // never acquire document-choice control state, and a document choice never
+  // falls back to the id-printing clarification card.
+  const documentChoice = documentChoiceSurface(
+    pendingQuestion,
+    region.card.draft,
+    region.card.submitting,
+  );
+
   return (
     <div className="shrink-0 space-y-2 border-t border-black bg-page px-4 py-2 max-h-72 overflow-y-auto">
-      {region.card.draft ? (
+      {documentChoice ? (
+        <DocumentChoiceCard
+          threadId={threadId}
+          surface={documentChoice}
+          submitting={region.card.submitting}
+          refusalKind={region.card.refusalKind}
+        />
+      ) : region.card.draft ? (
         <ClarificationCard
           threadId={threadId}
           draft={region.card.draft}
@@ -539,7 +648,12 @@ function TaskRegion({
           outcome={region.refused.outcome}
         />
       ) : null}
-      <TaskPanel state={taskView} />
+      <TaskPanel
+        state={taskView}
+        searchModeDecision={searchModeDecision}
+        threadId={threadId}
+        currentTurn={currentTurn}
+      />
       <ArchiveList threadId={threadId} decision={restore} />
     </div>
   );
@@ -746,7 +860,7 @@ function ChoiceWindowCard({
   );
 }
 
-// T4 workflow (the tracked change): download this thread's comparison or citation
+// T4 workflow: download this thread's comparison or citation
 // bundle. Plain anchors — the browser performs the GET and saves the
 // file, so there is no blob juggling and no second copy of the data in
 // the SPA. A kind the thread never produced is not rendered at all
@@ -794,11 +908,11 @@ const TurnView = memo(function TurnView({
   threadId: string;
   threadInFlight: boolean;
 }) {
-  // T4 (#37): while THIS turn is live (optimistic send or a
+  // T4: while THIS turn is live (optimistic send or a
   // lock-held latest row) the tool rows stay open and the live
   // thinking burst stays expanded; after the run both collapse.
   const live = turn.in_flight === true;
-  // turn-trace-folds (the tracked change): the burst timeline. A live run carries
+  // turn-trace-folds: the burst timeline. A live run carries
   // the folded bursts from the store; a GET-restored row (or legacy
   // state without trace_items) builds one thinking fold + one tool
   // fold from the persisted blob — spec line 41 allows this.
@@ -826,7 +940,7 @@ const TurnView = memo(function TurnView({
           {turn.question}
         </div>
       </div>
-      {/* Trace (turn-trace-folds the tracked change): sibling thinking/tool bursts
+      {/* Trace (turn-trace-folds): sibling thinking/tool bursts
           in arrival order, unframed on page bg between user bubble
           and answer card. Each burst streams expanded while live and
           auto-collapses at burst end; a manual toggle wins over the
@@ -877,16 +991,12 @@ const TurnView = memo(function TurnView({
           data-testid="turn-answer-card"
           className="border border-black bg-card p-3"
         >
-          {/* T4 (#37): while THIS turn streams, the optimistic status
+          {/* T4: while THIS turn streams, the optimistic status
               placeholder would read "done" (the wire carries no
               running status per spec line 30) — hide the status line
               until the run actually ends. */}
           {!live ? (
-            <StatusLine
-              status={turn.status}
-              reason={turn.status_reason ?? ""}
-              track={resolveTurnTrack(turn)}
-            />
+            <StatusLine turn={turn} track={resolveTurnTrack(turn)} />
           ) : null}
           {turn.answer ? (
             <AnswerWithCitations
@@ -928,7 +1038,7 @@ const TurnView = memo(function TurnView({
       <VisualClaims threadId={threadId} claims={visualClaims} />
       {/* T8: the thumbs tail card — the operator's verdict on this
           turn, rendered after the answer card so it reads as a
-          per-turn action. T3 (the tracked change): gated to the LAST terminal
+          per-turn action. T3: gated to the LAST terminal
           turn of a thread that is not in_flight (showThumbs) —
           older turns show nothing; canSubmitFeedback stays the
           persist gate inside FeedbackControls. */}
@@ -947,7 +1057,7 @@ const TurnView = memo(function TurnView({
 // surfaces as an inline "提交失败，请重试" hint next to the thumbs;
 // the hint clears on the next submit (transition pinned in
 // ``turnFeedback.feedbackErrorVisible``).
-// T3 (the tracked change): the word buttons (有帮助 / 没帮助) become stroke SVG
+// T3: the word buttons (有帮助 / 没帮助) become stroke SVG
 // thumbs (no emoji, no words) — same stroke idiom as Sidebar's
 // 16x16 nav icons. testids / aria-pressed / inline retry copy keep
 // their existing contract; canSubmitFeedback stays the persist
@@ -1006,7 +1116,7 @@ function FeedbackControls({
   );
 }
 
-// T3 (the tracked change): stroke thumbs-up / thumbs-down icon, one path set
+// T3: stroke thumbs-up / thumbs-down icon, one path set
 // mirrored vertically for "down" — matches the Sidebar nav-icon
 // idiom (16x16 viewBox, stroke currentColor, no fill).
 function ThumbIcon({ direction }: { direction: "up" | "down" }) {
@@ -1141,7 +1251,7 @@ function formatThinkingDuration(ms: number): string {
   return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
 }
 
-// turn-trace-folds (the tracked change): one thinking burst fold. Live = expanded
+// turn-trace-folds: one thinking burst fold. Live = expanded
 // with the FULL burst text (viewport pinned to the tail — no
 // start-of-text clamp as the live view). Collapsed = 「深度思考」
 // header (+ duration when the run measured one), burst body hidden.
@@ -1202,7 +1312,7 @@ function ThinkingFold({
 // already follows the streaming tail because each frame appends at
 // the bottom of the transcript.
 
-// turn-trace-folds (the tracked change): one tool burst fold. Live = expanded,
+// turn-trace-folds: one tool burst fold. Live = expanded,
 // each call a compact row (name + human one-liner; running rows show
 // the 运行中… placeholder). Collapsed = 「工具」 header + call count.
 // Same manual-override semantics as ThinkingFold; the default never
@@ -1243,12 +1353,10 @@ function ToolsFold({ calls, live }: { calls: ToolSummary[]; live: boolean }) {
 }
 
 function StatusLine({
-  status,
-  reason: _reason,
+  turn,
   track,
 }: {
-  status: Turn["status"];
-  reason: string;
+  turn: Pick<Turn, "status" | "in_flight">;
   track?: Turn["track"];
 }) {
   // Soft-Track T5: light research-only hint on the status line.
@@ -1263,22 +1371,14 @@ function StatusLine({
     </span>
   ) : null;
 
-  if (status === "done") {
-    return (
-      <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">
-        完成
-        {hint}
-      </p>
-    );
-  }
   // T2 fix: refuse / step_cap ordinary-person copy is the server's
   // ``assistant_message`` rendered by the parent ``TurnView``. ``StatusLine``
   // is now a small status label only — no client-side duplicate copy and
-  // no raw ``reason`` enum leak.
-  const label = status === "refuse" ? "未完成" : "步数上限（step_cap）";
+  // no raw ``reason`` enum leak. The wording comes from ``taskState`` so the
+  // developer trace fallback reads the SAME strings.
   return (
     <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">
-      {label}
+      {turnStatusLabel(turn)}
       {hint}
     </p>
   );

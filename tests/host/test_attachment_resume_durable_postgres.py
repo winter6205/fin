@@ -51,9 +51,9 @@ from pydantic import Field
 from fin.corpus.extracted import Locator
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.host import EvidenceItem, ScriptedChatModel, compile_graph
-from fin.host.attachment_job_store import PostgresThreadAttachmentJobStore
-from fin.host.attachment_prepare import AttachmentPreparationService
-from fin.host.attachment_store import PostgresAttachmentStore
+from fin.host.attachment.attachment_job_store import PostgresThreadAttachmentJobStore
+from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+from fin.host.attachment.attachment_store import PostgresAttachmentStore
 from fin.host.graph import ATTACHMENT_PREPARATION_INTERRUPT_KIND
 from fin.host.run_control import RunControl
 from fin.host.state import reset_input_state

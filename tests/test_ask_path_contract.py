@@ -35,7 +35,7 @@ import pytest
 _ASK_PATH_MODULES = (
     "fin",
     "fin.host",
-    "fin.host.citation_gate",
+    "fin.host.grounded.citation_gate",
     "fin.host.cli",
     "fin.host.compile",
     "fin.host.graph",

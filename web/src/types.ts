@@ -75,6 +75,9 @@ export interface Citation {
   // Safe display name for an attachment; a company citation sends "".
   filename: string;
   quote: string;
+  // Active ask/stream display metadata derived by the host from trusted
+  // full evidence text. Older persisted rows have no section.
+  section?: string;
   // The retained snapshot a database-row citation opens. Absent on a
   // document citation, which is why the host dumps it with
   // `exclude_none` — every stored filing citation keeps the exact wire
@@ -209,6 +212,50 @@ export interface TrackDecision {
   signals?: Record<string, unknown>;
 }
 
+export type RetrieveMode = "lexical" | "graph" | "global" | "sql";
+export type SearchModeDecisionTier =
+  | "rules"
+  | "jev"
+  | "inherit"
+  // ADR 0104: the residual case. The cascade could not assign a mode, so
+  // the policy default applies — a recorded decision, not an unnamed one.
+  | "fallback"
+  | "clarify"
+  | "typed_fail"
+  | "operator_pick";
+
+/** The bounded diagnostic signals one decision carries (spec
+ * search-mode-host item 6). The allowlist is exactly these four keys:
+ * the judge's EXIT, the label it returned, the confidence it returned and
+ * the error type of a failed call. The host records more than this; the
+ * extra keys stay in the host's machine record and never reach the
+ * browser.
+ *
+ * The judge's LABEL names a 档, so it is machine diagnostics only: the
+ * rendered receipt shows the EXIT, the confidences and the error type,
+ * never the retrieval implementation. */
+export interface SearchModeDecisionSignals {
+  mode_jev_exit?: string;
+  mode_jev_label?: string;
+  mode_jev_confidence?: number;
+  mode_jev_error_type?: string;
+}
+
+/** Developer-only audit data carried by the live terminal status frame.
+ * It is not persisted; a reloaded history row can therefore be absent. */
+export interface SearchModeDecision {
+  search_mode?: RetrieveMode | null;
+  decision_tier?: SearchModeDecisionTier;
+  confidence?: number;
+  // The bounded diagnostic bag the host nests under ``signals``. It is
+  // KEPT rather than discarded, because on a fallback the top-level
+  // confidence is policy uncertainty (0.0) and the judge's own label
+  // probability lives here — dropping it would present the fallback as
+  // the judge being sure.
+  signals?: SearchModeDecisionSignals;
+  failure_code?: string | null;
+}
+
 // T3 (spec line 32): one human-readable row per tool call observed
 // in the run; the SPA renders `summary` in the tools region and
 // correlates with the live SSE frames by `tool_call_id`. Mirrors
@@ -219,7 +266,7 @@ export interface ToolSummary {
   tool_call_id: string;
 }
 
-// turn-trace-folds (the tracked change): one sibling burst on the per-turn trace
+// turn-trace-folds: one sibling burst on the per-turn trace
 // timeline — a thinking burst or a tool burst, in arrival order.
 // ``live`` is true while that burst is still accepting frames; at
 // burst end it flips false and the fold auto-collapses (the UI keeps
@@ -364,9 +411,12 @@ export interface Turn {
   question: string;
   status: RunStatus;
   status_reason?: string;
+  // A5: null / omitted is unknown. ``insufficient_evidence`` on a
+  // done turn is a partial answer, not a complete one.
+  semantic_outcome?: string | null;
   answer: string;
   citations: Citation[];
-  // E6 (the tracked change): this run's per-row evidence refusals — the decoded
+  // E6: this run's per-row evidence refusals — the decoded
   // SSE ``evidence_refusals`` entries and the history read's
   // ``rejected_citations`` rows, folded into ONE field so a reloaded turn
   // renders identically. A refused citation is never silently dropped and
@@ -376,14 +426,14 @@ export interface Turn {
   // T3: the run's streamed thinking prose (header-only when the
   // thinking fold is collapsed). Empty when the model surfaced no reasoning.
   thinking_text?: string;
-  // T4 (#37): total thinking duration in ms. After the run the
+  // T4: total thinking duration in ms. After the run the
   // thinking region collapses to a one-line duration label
   // ("Thought for 4.2s"); 0 / undefined when no thinking streamed.
   thinking_duration_ms?: number;
   // T3: one entry per tool call observed this run (dicts, not
   // strings - T1's placeholder shape).
   tool_summaries?: ToolSummary[];
-  // turn-trace-folds (the tracked change): the burst timeline this session folded
+  // turn-trace-folds: the burst timeline this session folded
   // from the live stream. Optional — GET-restored rows build it in
   // the view layer (traceItemsFromTurn) since the server keeps no
   // burst history. Maintained in parallel with thinking_text /
@@ -398,6 +448,8 @@ export interface Turn {
   track?: SoftTrack;
   // Soft-Track: optional audit blob from GET history / RunRecord.
   track_decision?: TrackDecision;
+  // Live workspace receipt; absent on older peers and history records.
+  search_mode_decision?: SearchModeDecision;
   // T4 (spec line 38): GET-while-running signal on the turn row.
   // Mirrors ``fin.host.workspace_http.TurnRow.in_flight``. True
   // only on the most-recent row of a thread whose lock is held,
@@ -498,7 +550,7 @@ export interface ThreadDetail extends ThreadListItem {
   task_runtime?: TaskRuntimeView;
 }
 
-// ----- T4 workflow (the tracked change): watchlist + in-app notices -----
+// ----- T4 workflow: watchlist + in-app notices -----
 //
 // Mirrors fin.host.watchlist (``fin.watchlist.v1``). ``forms`` empty
 // means every form type — the operator watched the issuer, not a
@@ -544,6 +596,12 @@ export type KnowledgeMcpState = "missing" | "fault" | "reachable";
 // boot publishes ``knowledge_mcp: "missing"`` — never 可达.
 export type RetrieveAdapterKind = "mcp" | "fake";
 
+export interface WorkspaceRunCounts {
+  active: number;
+  paused: number;
+  suspected_stuck: number;
+}
+
 export interface WorkspaceStatus {
   knowledge_mcp: KnowledgeMcpState;
   retrieve_adapter_kind: RetrieveAdapterKind;
@@ -564,14 +622,26 @@ export interface WorkspaceStatus {
   // identity, and iknow's separate dashboard HTTP process is not a
   // dependency fin may take. Carries no readiness claim.
   bound_collection_name: string;
+  // Process-wide run state aggregates. The status response publishes
+  // counts only, without any per-run identity or timing data.
+  run_counts: WorkspaceRunCounts;
 }
 
 export interface Filing {
   document_id: string;
-  company: string;
-  period: string;
+  // T6: ``company`` / ``period`` are optional display metadata on a
+  // metadata-free corpus row — absent, never an invented empty string —
+  // so the financial callers that still expect them see a nullable
+  // value rather than a wrong one.
+  company?: string | null;
+  period?: string | null;
   version: string;
   page_count: number;
+  // T6 display fields: the sanitized title and the deterministic
+  // document type. Required on new rows; optional here so a row from a
+  // peer predating T6 still typechecks.
+  title?: string;
+  doc_type?: string;
   // Spec SC3: the EDGAR form type behind the row (``10-Q``, ``10-K``,
   // ``8-K``, ...). ``null`` on a corpus row the catalog was never
   // given a form for; optional so a peer predating SC3 still
@@ -580,6 +650,51 @@ export interface Filing {
 
   // T1 does not render these; they exist in the payload.
   [key: string]: unknown;
+}
+
+// ----- T6: the generic catalog overview -----
+//
+// A separate shape from ``Filing``: that one is the FINANCIAL
+// compatibility projection with a fixed six-key set, while an ordinary
+// uploaded document has no company / period / form at all.
+
+/** One catalog document as the generic read model carries it. Absent
+ * optional metadata is OMITTED on the wire, so ``company`` /
+ * ``period`` are absent rather than null for a metadata-free document. */
+export interface CatalogDocument {
+  document_id: string;
+  version: string;
+  title: string;
+  doc_type: string;
+  page_count: number;
+  company?: string;
+  period?: string;
+}
+
+/** One grouping bucket: a value (or the 未分类 placeholder) and the
+ * documents under it. */
+export interface CatalogGroup {
+  value: string;
+  document_ids: string[];
+}
+
+/** One QUALIFYING grouping dimension — only dimensions with at least two
+ * distinct non-empty values are offered, so a corpus where every document
+ * shares one type offers no grouping at all. ``title`` is never a
+ * dimension: it is a display/filter value. */
+export interface CatalogDimension {
+  key: "doc_type" | "company" | "period";
+  label: string;
+  groups: CatalogGroup[];
+}
+
+/** GET /api/corpus/overview. ``flat_titles`` is the fallback the operator
+ * reads when no dimension qualifies — never shown beside a real
+ * grouping. */
+export interface CatalogOverview {
+  documents: CatalogDocument[];
+  dimensions: CatalogDimension[];
+  flat_titles: string[];
 }
 
 // ----- corpus-serve-ingest T5: the two upload doors (ADR 0047) -----
@@ -649,6 +764,26 @@ export interface GraphIndexReport {
   error: { code: string; message: string } | null;
 }
 
+// T6: the unresolved catalog-publication warning on a polled job.
+// ``code`` and every other field is a CLOSED vocabulary the server
+// derives from the audit trail — never raw exception text, a path or a
+// DSN — so the SPA renders a fixed 安全 copy from ``code`` and never
+// echoes a server string. ``attempts`` is the latest 1-based attempt
+// number, not a count.
+export interface CatalogWarning {
+  code: "catalog_publication_failed" | "catalog_publication_pending";
+  attempts: number;
+  // Present on a typed failed attempt (``catalog_publication_failed``).
+  failure_code?:
+    | "catalog_row_invalid"
+    | "catalog_corrupt"
+    | "catalog_unavailable";
+  failure_stage?: "validate" | "read" | "lock" | "write";
+  // Present on a pending attempt (``catalog_publication_pending``):
+  // always ``"recovery"`` today.
+  stage?: "recovery";
+}
+
 // Body of GET /api/corpus/ingest/{job_id} — the polled job status.
 // ``text_ready`` is fin's per-source readiness, derived from ``state``
 // being ``ready``; it is a distinct field precisely so the two
@@ -665,6 +800,11 @@ export interface JobStatus {
   error_message: string | null;
   text_ready: boolean;
   graph: GraphIndexReport | null;
+  // T6: the unresolved catalog-publication warning, or ``null`` once a
+  // success is recorded. ``catalog_warning_count`` is the number of
+  // DOCUMENTS with an unresolved publication, not attempts.
+  catalog_warning?: CatalogWarning | null;
+  catalog_warning_count?: number;
 }
 
 // ----- Thread attachment: the attachment lifecycle -----
@@ -730,7 +870,7 @@ export interface ThreadAttachment {
 // without an explicit user action, treat a saved restriction as a live
 // grant, or infer task completion from a citation / run end / lookup.
 
-/** ``fin.host.task_runtime_types.TASK_OUTCOMES``. ``null`` = taskless. */
+/** ``fin.host.task.task_runtime_types.TASK_OUTCOMES``. ``null`` = taskless. */
 export type TaskOutcome = "active" | "complete" | "cancelled";
 
 /** The current task, as Runtime reports it. Mirrors
@@ -777,6 +917,32 @@ export interface ArchivedTaskSummary {
  * ``choices`` already carries exactly one trailing ``"other"`` — the
  * host appends it, so this surface never adds a second Other and never
  * has to guess which option was Other. */
+/** The two closed ``pending_question.purpose`` values (contract
+ * §Document clarification: ``purpose`` distinguishes the ordinary
+ * clarification from the grounded document choice). SSOT
+ * ``fin.host.task.task_runtime_types.DOCUMENT_CHOICE_PURPOSES``. */
+export type PendingQuestionPurpose = "task_clarification" | "document_choice";
+
+/** One admitted candidate's presentation metadata and its source
+ * reference, mirroring ``choice_details[]`` (contract §Document
+ * clarification). ``label``/``summary`` are what the operator reads and
+ * are NEVER citation evidence or stored permission; the identity is
+ * rechecked at read time through ``source_ref``. ``section`` is ``null``
+ * when the whole source was admitted. */
+export interface ChoiceSourceRefView {
+  source_kind: "corpus" | "attachment";
+  source_id: string;
+  version: string;
+  section: string | null;
+}
+
+export interface ChoiceDetailView {
+  choice_id: string;
+  label: string;
+  summary: string;
+  source_ref: ChoiceSourceRefView;
+}
+
 export interface PendingQuestionView {
   question_id: string;
   task_id: string;
@@ -786,6 +952,16 @@ export interface PendingQuestionView {
   prompt: string;
   choices: string[];
   input_version: number;
+  /** ``document_choice`` names the run it interrupts through
+   * ``origin_run_id`` and carries one to four ``choice_details``. A
+   * ``task_clarification`` — every question asked before the document
+   * choice existed — defaults to ``task_clarification`` with
+   * ``choice_details=[]`` and may carry ``origin_run_id=null``. Optional
+   * so an older host that omits them still decodes as the ordinary
+   * clarification. */
+  purpose?: PendingQuestionPurpose;
+  origin_run_id?: string | null;
+  choice_details?: ChoiceDetailView[];
 }
 
 /** The committed decision about one accepted input. Mirrors
@@ -815,7 +991,7 @@ export interface AcceptedInputRow {
 
 /**
  * The closed named-failure vocabulary of the task runtime (contract
- * §Named failures; SSOT ``fin.host.task_runtime_types.TASK_FAILURE_KINDS``).
+ * §Named failures; SSOT ``fin.host.task.task_runtime_types.TASK_FAILURE_KINDS``).
  *
  * A task door can refuse a request two ways, and both must read as a
  * refusal rather than as a transport hiccup: BEFORE any run, as an HTTP

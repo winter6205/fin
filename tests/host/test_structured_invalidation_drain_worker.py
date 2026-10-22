@@ -40,10 +40,11 @@ from typing import Any, Callable
 
 import pytest
 
-from fin.host.attachment_prep_worker import DrainCadence
-from fin.host.evidence_contract import RETRIEVE_UNAVAILABLE
-from fin.host.structured_evidence import build_stored_record, structured_snapshots_of
-from fin.host.structured_evidence_drain_worker import (
+from fin.host.application.lifetime import RuntimeHandle
+from fin.host.attachment.attachment_prep_worker import DrainCadence
+from fin.host.evidence.evidence_contract import RETRIEVE_UNAVAILABLE
+from fin.host.evidence.structured_evidence import build_stored_record, structured_snapshots_of
+from fin.host.evidence.structured_evidence_drain_worker import (
     INVALIDATION_DRAIN_CONSUMER_ID,
     INVALIDATION_DRAIN_INTERVAL_SECONDS,
     INVALIDATION_DRAIN_MAX_INTERVAL_SECONDS,
@@ -781,6 +782,31 @@ def test_start_with_no_transport_bound_acquires_no_thread(monkeypatch: Any) -> N
     assert {thread.name for thread in threading.enumerate()} == before
 
 
+def test_app_owned_invalidation_start_without_transport_returns_idempotent_stop(
+    monkeypatch: Any,
+) -> None:
+    """An app with no producer acquires neither a drain nor a global worker."""
+    from fin.host import workspace_http
+
+    monkeypatch.setattr(
+        workspace_http, "default_invalidation_drain_transport", lambda: None
+    )
+    monkeypatch.setattr(
+        workspace_http,
+        "StructuredInvalidationDrainWorker",
+        lambda *_args, **_kwargs: pytest.fail("no transport must not build a worker"),
+    )
+    before = {thread.name for thread in threading.enumerate()}
+
+    stop = workspace_http.start_application_invalidation_drain_worker(
+        store=object()
+    )
+    stop()
+    stop()
+
+    assert {thread.name for thread in threading.enumerate()} == before
+
+
 def test_a_bound_transport_is_used_by_a_start_without_injected_seams() -> None:
     """The transport seam, end to end: bind once, start with no transport
     argument, and the drain calls THAT pair.
@@ -872,6 +898,7 @@ def test_serve_starts_the_drain_before_binding_and_stops_it_first(
     uvicorn binds and stops it first, and it receives the boot-resolved store
     (the same instance the other workers scrub through)."""
     import fin.corpus.ingest_storage as ingest_storage
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
     import uvicorn
 
@@ -879,22 +906,32 @@ def test_serve_starts_the_drain_before_binding_and_stops_it_first(
     store_stub = object()
     service_stub = object()
 
-    monkeypatch.setattr(http_module, "apply_dotenv", lambda: None)
-    monkeypatch.setattr(http_module, "get_attachment_budgets", lambda: None)
+    # The boot refuses an undeclared durable checkpointer before it opens
+    # anything, so this deployment has to state one. Nothing connects to
+    # it: the compile seam is the only thing that would.
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    monkeypatch.setattr(composition_module, "apply_operator_settings", lambda: None)
+    monkeypatch.setattr(composition_module, "attachment_budgets", lambda: None)
     monkeypatch.setattr(ingest_storage, "preflight_ingest_storage", lambda: None)
-    monkeypatch.setattr(http_module, "publish_knowledge_mcp", lambda: None)
-    monkeypatch.setattr(http_module, "compile_for_http", lambda: object())
-    monkeypatch.setattr(http_module, "default_thread_store", lambda: store_stub)
-    monkeypatch.setattr(http_module, "get_workspace_root", lambda: tmp_path)
+    monkeypatch.setattr(composition_module, "publish_knowledge_mcp", lambda: None)
+    # The boot seam is the closeable runtime handle, not the graph-only
+    # compile it delegates to, so that is what has to be stubbed here.
     monkeypatch.setattr(
-        http_module, "default_attachment_service", lambda: service_stub
+        composition_module,
+        "_compile_http_runtime",
+        lambda **_kwargs: RuntimeHandle(None),
     )
-    monkeypatch.setattr(http_module, "start_ingest_worker", lambda: None)
+    monkeypatch.setattr(composition_module, "default_thread_store", lambda: store_stub)
+    monkeypatch.setattr(composition_module, "get_workspace_root", lambda: tmp_path)
     monkeypatch.setattr(
-        http_module, "start_attachment_prep_worker", lambda _service: None
+        composition_module, "default_attachment_service", lambda: service_stub
+    )
+    monkeypatch.setattr(composition_module, "start_application_ingest_worker", lambda: None)
+    monkeypatch.setattr(
+        composition_module, "start_application_attachment_prep_worker", lambda _service: None
     )
     monkeypatch.setattr(
-        http_module, "start_attachment_resume_worker", lambda **_kw: None
+        composition_module, "start_application_attachment_resume_worker", lambda **_kw: None
     )
 
     drain_kwargs: dict[str, Any] = {}
@@ -903,15 +940,15 @@ def test_serve_starts_the_drain_before_binding_and_stops_it_first(
         events.append("drain_start")
         drain_kwargs.update(kwargs)
 
-    monkeypatch.setattr(http_module, "start_invalidation_drain_worker", _drain_start)
+    monkeypatch.setattr(composition_module, "start_application_invalidation_drain_worker", _drain_start)
     monkeypatch.setattr(
-        http_module,
+        composition_module,
         "stop_invalidation_drain_worker",
         lambda: events.append("drain_stop"),
     )
-    monkeypatch.setattr(http_module, "stop_attachment_resume_worker", lambda: None)
-    monkeypatch.setattr(http_module, "stop_attachment_prep_worker", lambda: None)
-    monkeypatch.setattr(http_module, "stop_ingest_worker", lambda: None)
+    monkeypatch.setattr(composition_module, "stop_attachment_resume_worker", lambda: None)
+    monkeypatch.setattr(composition_module, "stop_attachment_prep_worker", lambda: None)
+    monkeypatch.setattr(composition_module, "stop_ingest_worker", lambda: None)
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: events.append("serve"))
 
     http_module.serve()

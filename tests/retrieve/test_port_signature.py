@@ -24,6 +24,7 @@ from typing import get_type_hints
 import pytest
 
 from fin.retrieve import tool as retrieve_tool_module
+from fin.retrieve.bm25 import BM25Adapter
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
 from fin.retrieve.port import RetrievePort
@@ -45,6 +46,7 @@ _PORT_PARAMETERS = _parameters(RetrievePort.retrieve)
         pytest.param(MCPRetrieveAdapter.retrieve, id="mcp-retrieve"),
         pytest.param(MCPRetrieveAdapter.aretrieve, id="mcp-aretrieve"),
         pytest.param(FakeRetrievePort.retrieve, id="fake-retrieve"),
+        pytest.param(BM25Adapter.retrieve, id="bm25-retrieve"),
     ],
 )
 def test_adapter_signature_matches_the_port(method: object) -> None:
@@ -79,6 +81,27 @@ def test_mcp_adapter_rejects_positional_document_id() -> None:
     adapter = MCPRetrieveAdapter(command=None)
     with pytest.raises(TypeError):
         adapter.retrieve("revenue", "DOC-2023Q1")  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        pytest.param(BM25Adapter({}), id="bm25"),
+        pytest.param(FakeRetrievePort(), id="fake"),
+    ],
+)
+def test_every_adapter_accepts_the_wrapper_s_whole_call(adapter: object) -> None:
+    """``fin.retrieve.tool.retrieve`` forwards EVERY port parameter.
+
+    The signature equality above compares names, kinds and defaults; it
+    cannot catch an adapter whose body rejects a forwarded keyword. The
+    observable half is that the wrapper's own default call works against
+    each implementation — an adapter missing one parameter raises
+    ``TypeError`` at the seam a caller would otherwise hit only after
+    swapping adapters in a run.
+    """
+    result = retrieve_tool_module.retrieve("revenue", limit=3, adapter=adapter)
+    assert isinstance(result, dict)
 
 
 def test_tool_types_its_dependency_against_the_port() -> None:

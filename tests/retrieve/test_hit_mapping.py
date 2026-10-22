@@ -29,7 +29,7 @@ import pytest
 from fin.corpus.extracted import Locator
 from fin.corpus.parsers._common import UnitLocator
 from fin.corpus.push import serialize_source_ref
-from fin.host.evidence_admission import admit_retrieved_chunks
+from fin.host.evidence.evidence_admission import admit_retrieved_chunks
 from fin.retrieve.hit_mapping import (
     MAPPING_FAILURE_LOG_ENV,
     MAPPING_FAILURE_MALFORMED_HIT,
@@ -470,5 +470,5 @@ def test_adapter_counts_drops_even_without_a_configured_ledger() -> None:
         locator_map={},
     )
 
-    assert adapter.retrieve("revenue") == {"chunks": []}
+    assert adapter.retrieve("revenue") == {"chunks": [], "distribution": "zero"}
     assert adapter.mapping_failures.count() > 0

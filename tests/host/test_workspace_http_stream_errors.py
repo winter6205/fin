@@ -75,13 +75,13 @@ def _make_openai_error(cls: type, msg: str) -> Any:
 
 def test_classify_authentication_error_maps_to_auth() -> None:
     """openai.AuthenticationError -> "auth" + Chinese copy mentioning
-    the key in ``.env`` so the operator knows what to fix."""
+    the key in ``~/.fin/settings.yaml`` so the operator knows what to fix."""
     import openai
 
     err = _make_openai_error(openai.AuthenticationError, "bad token")
     kind, copy = classify_stream_exception(err)
     assert kind == "auth"
-    assert ".env" in copy
+    assert "settings.yaml" in copy
 
 
 def test_classify_permission_denied_maps_to_auth() -> None:
@@ -370,7 +370,7 @@ def test_mid_stream_auth_failure_classifies_and_emits_status_classified(
 ) -> None:
     """A graph whose first model call raises ``AuthenticationError``
     produces a refuse frame carrying ``status_classified: "auth"``
-    AND Chinese user copy that mentions the .env token — never the
+    AND Chinese user copy that names settings.yaml — never the
     English fallback."""
     import openai
 
@@ -385,7 +385,7 @@ def test_mid_stream_auth_failure_classifies_and_emits_status_classified(
 
     assert status["status"] == "refuse"
     assert status["status_classified"] == "auth"
-    assert ".env" in status["assistant_message"]
+    assert "settings.yaml" in status["assistant_message"]
     # The English fallback is gone — the SPA gets actionable copy.
     assert "Try sending the question again" not in status["assistant_message"]
 
@@ -504,7 +504,7 @@ def test_normal_path_does_not_emit_status_classified(
     http_app.dependency_overrides[get_graph] = lambda: g
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "Hello!")
     status = _status_payload(events)
 
     assert status["status"] == "done"

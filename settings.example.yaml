@@ -1,0 +1,37 @@
+# Copy this file to ~/.fin/settings.yaml.
+llm:
+  model: MiniMax-M3.1-Flash
+  baseUrl: https://api.minimaxi.com/v1
+  apiKey: ${FIN_API_KEY}
+checkpoint:
+  url: postgresql://fin:fin@localhost:5433/fin?sslmode=disable
+retrieve:
+  adapter: mcp
+jev:
+  apiKey: ${FIN_JEV_API_KEY}
+  model: jev-latest
+  baseUrl: https://api.typesafe.ai
+memory:
+  enabled: true
+# Trusted corpus scope for metadata-free uploads (T6 document identity).
+# Defaults to "fin-default" when unset; a stable, explicit value keeps the
+# same bytes on the same document id across processes. Changing it later
+# gives previously accepted documents new identities.
+# corpus:
+#   scopeId: fin-default
+attachment:
+  maxBytes: 4194304
+  maxPdfPages: 80
+  visionCallsPerRun: 89
+  visionCropCallsPerRun: 8
+  heron:
+    timeoutS: 900
+    slicePass: false
+# Durable corpus bytes. Uncomment to boot without FIN_CORPUS_INGEST_STORE=memory.
+# accessKey and secretKey are optional; boto3 needs them for some S3 endpoints.
+# objectStore:
+#   url: http://127.0.0.1:8333
+#   bucket: fin-dev
+#   accessKey: ${FIN_OBJECT_STORE_ACCESS_KEY}
+#   secretKey: ${FIN_OBJECT_STORE_SECRET_KEY}
+#   region: us-east-1

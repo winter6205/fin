@@ -11,12 +11,18 @@ dependencies = [
     "langchain-openai>=1.6.0",
     "langgraph>=1.2.11",
     "langgraph-checkpoint-postgres>=2.0.0",
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-semantic-conventions==0.66b1",
     "pdfplumber>=0.11.10",
     "python-multipart>=0.0.9",
+    "pyyaml==6.0.3",
     "psycopg[binary]>=3.2.0",
     "psycopg-pool>=3.2.0",
     "rank-bm25>=0.2.2",
     "uvicorn>=0.30.0",
+    "redis>=5",
 ]
 
 [project.optional-dependencies]

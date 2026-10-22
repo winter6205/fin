@@ -18,7 +18,7 @@ This script is that evidence. It is a probe, not a seam:
 * provider config comes from fin's own helper
   (:func:`fin.host.compile._build_default_model`), so the probe cannot
   drift from the product boot path and re-implements no provider
-  selection, no hardcoded model or base URL;
+  construction or base URL selection; the model itself must be configured;
 * it asks the two distinct ADR 0089 questions (presence, meaning) plus a
   third structured call, and records provider-reported usage, latency,
   response length, and the image dimensions actually sent, per call;
@@ -39,15 +39,13 @@ retried into a pass.
 
 Usage::
 
-    cd <dir whose .env holds FIN_MODEL / FIN_BASE_URL / FIN_API_KEY>
     uv run python <path>/scripts/g4_vision_probe.py
     uv run python <path>/scripts/g4_vision_probe.py --render-only
     uv run python <path>/scripts/g4_vision_probe.py --image <file> \
         --series "Total net sales" --mean 94186.5 --out <json>
 
-A git worktree has no ``.env`` of its own; ``--dotenv-start <dir>`` then points
-the search at the checkout that does, otherwise the provider rejects fin's
-placeholder key.
+Credentials come from ``~/.fin/settings.yaml`` (``llm.apiKey``) or from
+``FIN_API_KEY`` already in the process. There is no ``.env`` search.
 
 ``--image`` points the same three questions at a file on disk instead of the
 throwaway page; ``--series``, ``--mean`` and ``--out`` are then required, because
@@ -66,6 +64,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import sys
 import time
@@ -78,7 +77,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from fin.host import compile as host_compile  # noqa: E402
-from fin.host.operator_env import apply_dotenv, find_env_file  # noqa: E402
+from fin.host.operator_settings import apply_operator_settings  # noqa: E402
 
 # ----- measured inputs ------------------------------------------------
 
@@ -791,13 +790,6 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=f"artifact path (default: {ARTIFACT_PATH}, and required with "
         "--image so a file probe cannot overwrite the page record",
     )
-    parser.add_argument(
-        "--dotenv-start",
-        type=Path,
-        default=Path.cwd(),
-        help="directory to search for the operator .env (default: cwd), "
-        "resolved by fin.host.operator_env.find_env_file",
-    )
     args = parser.parse_args(argv)
     if args.image is not None and (args.series is None or args.mean is None):
         parser.error("--image needs --series and --mean to carry a witness")
@@ -856,6 +848,16 @@ def summary_line(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    loaded = None
+    if not args.render_only:
+        loaded = apply_operator_settings()
+        if not os.environ.get("FIN_MODEL", "").strip():
+            print(
+                "probe: FIN_MODEL is required; set it in the process environment "
+                "or configure llm.model in ~/.fin/settings.yaml",
+                file=sys.stderr,
+            )
+            return 2
     target = target_for(args)
     if args.image is None:
         image_path = SCRATCH_DIR / "probe_page.png"
@@ -885,15 +887,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if find_env_file(start=args.dotenv_start) is None:
+    if loaded is None and not os.environ.get(host_compile.FIN_API_KEY_ENV, "").strip():
         print(
-            "probe: warning: no operator .env found from "
-            f"{args.dotenv_start}; the configured key env name "
-            f"({host_compile.FIN_API_KEY_ENV}) may be unset and "
+            "probe: warning: ~/.fin/settings.yaml is missing and "
+            f"{host_compile.FIN_API_KEY_ENV} is unset; "
             "fin's placeholder key will be rejected by the provider",
             file=sys.stderr,
         )
-    apply_dotenv(start=args.dotenv_start)
     client, api_key = build_client()
     config = config_block(client)
     scrubber = Scrubber((api_key, "sk-no-key-required"))

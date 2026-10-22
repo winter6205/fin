@@ -105,9 +105,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.object_store import InMemoryObjectStore, create_object_store
 from fin.corpus.object_store_errors import UnknownObjectKeyError
-from fin.host.attachment_job_store import PostgresThreadAttachmentJobStore
-from fin.host.attachment_store import PostgresAttachmentStore
-from fin.host.citation_gate import (
+from fin.host.attachment.attachment_job_store import PostgresThreadAttachmentJobStore
+from fin.host.attachment.attachment_store import PostgresAttachmentStore
+from fin.host.grounded.citation_gate import (
     _LOCATOR_REGEX,  # noqa: PLC2701 - the gate's own token shape is the SSOT
 )
 from fin.host.graph import compile_graph

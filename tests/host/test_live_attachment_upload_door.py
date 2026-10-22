@@ -14,7 +14,7 @@ answer the two questions this door's acceptance turns on:
 
 So this module drives the real product composition —
 :func:`fin.host.workspace_http._build_default_attachment_service` for the
-stores and :func:`fin.host.attachment_budgets.from_environ` for the
+stores and :func:`fin.host.attachment.attachment_budgets.from_environ` for the
 bounds, both called as production calls them — against the Postgres at
 ``FIN_CHECKPOINT_URL``, over two harnesses:
 
@@ -29,7 +29,7 @@ bounds, both called as production calls them — against the Postgres at
 What is real here, and what is not
 ----------------------------------
 Real: the FastAPI app and route, the bounded body reader, the deployed
-``FIN_ATTACHMENT_*`` bounds read from ``.env.example``,
+``FIN_ATTACHMENT_*`` bounds read from ``settings.example.yaml``,
 ``PostgresThreadStore`` and ``PostgresAttachmentStore`` on a live
 Postgres, the object-store adapter the product selects from the
 environment, and the committed gold payloads under ``data/corpus/``.
@@ -82,7 +82,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from fin.host.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
+from fin.host.attachment.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLD_DIR = REPO_ROOT / "data" / "corpus" / "g4_attachment_gold"
@@ -110,16 +110,16 @@ pytestmark = pytest.mark.mcp
 
 @pytest.fixture(scope="module")
 def deployed_bounds() -> dict[str, str]:
-    """The four bounds exactly as ``.env.example`` ships them.
+    """The four bounds exactly as ``settings.example.yaml`` ships them.
 
     Read from the template rather than restated here, so this module can
     never bless a number the deployment does not carry.
     """
-    from fin.host.operator_env import parse_env_file
+    from fin.host.operator_settings import shipped_attachment_bounds
 
-    values = parse_env_file((REPO_ROOT / ".env.example").read_text())
+    values = shipped_attachment_bounds(repo_root=REPO_ROOT)
     missing = [key for key in BOUND_KEYS if key not in values]
-    assert not missing, f".env.example lost {missing}"
+    assert not missing, f"settings.example.yaml lost {missing}"
     return {key: values[key] for key in BOUND_KEYS}
 
 
@@ -157,11 +157,12 @@ def budgets(
     ``tests/host/conftest.py`` applies to its boot fixture.
     """
     import fin.host.http as http_module
-    from fin.host.attachment_budgets import from_environ
+    import fin.host.application.composition as composition_module
+    from fin.host.attachment.attachment_budgets import from_environ
 
     for key, value in deployed_bounds.items():
         monkeypatch.setenv(key, value)
-    monkeypatch.setattr(http_module, "_http_attachment_budgets_singleton", None)
+    monkeypatch.setattr(composition_module, "_http_attachment_budgets_singleton", None)
     return from_environ(environ=os.environ)
 
 
@@ -449,8 +450,8 @@ def door(postgres_url: str, budgets: Any) -> Iterator[dict[str, Any]]:
     observation without replacing it.
     """
     import fin.host.workspace_http as workspace_http
-    from fin.host.attachment_prepare import AttachmentPreparationService
-    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+    from fin.host.attachment.attachment_store import PostgresAttachmentStore
     from fin.host.http import (
         app,
         get_attachment_budgets,
@@ -1281,7 +1282,7 @@ def test_live_server_uploaded_row_is_not_a_recovery_candidate(
     """
     import psycopg
 
-    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.attachment.attachment_store import PostgresAttachmentStore
 
     payload = _payload(MIXED_PDF)
     uploaded_thread = live_server.create_thread()

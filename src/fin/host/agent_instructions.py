@@ -12,7 +12,11 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
-from fin.host.track_decision import Track, normalize_track
+from fin.host.grounded.grounded_decision import (
+    CANDIDATE_PAYLOAD_FIELD,
+    CANDIDATE_TERMINATOR,
+)
+from fin.host.grounded.track_decision import Track, normalize_track
 from fin.retrieve.tiers import normalize_tier_token
 
 HOST_INSTRUCTIONS_MARKER: str = "[FIN_HOST_INSTRUCTIONS]"
@@ -23,7 +27,7 @@ CLARIFY_INSTRUCTIONS_MARKER: str = "[FIN_CLARIFY_INSTRUCTIONS]"
 
 # ----- user profile (spec SC13, cross-session-operator-memory) -----
 # The user profile is operator-profile machinery, NOT memory-fact
-# machinery (operator decision on that pull request): its READ path (merged
+# machinery (operator decision): its READ path (merged
 # profile text into the system prefix) must work regardless of
 # ``FIN_MEMORY_ENABLED``. The block sits BETWEEN the track prompt
 # (identity / persona) and the memory existence pointer when both
@@ -115,17 +119,34 @@ AGENT_IDENTITY: str = (
     "工作台: the 入口, not the 库. "
     "Each turn is a track (dialogue / clarify / off_topic / grounded); "
     "tools and the citation verifier bind only to the grounded track. "
-    "The 知识库 is the one process-wide corpus shared by every "
-    "research thread."
+    "The 知识库 is the one corpus every research thread shares."
 )
 
 AGENT_SOUL: str = (
-    "Speak plainly. Ground every filing claim in tool output this "
-    "run; do not present parametric memory as evidence — numbers "
+    "Speak plainly. Ground every claim about the corpus in this run's "
+    "tool output; do not present parametric memory as evidence — numbers "
     "and document claims need retrieve or read_source text. Refuse to "
-    "fabricate. Avoid invented tickers, invented periods, and made-up "
-    "document identifiers."
+    "fabricate; avoid invented company names, dates or periods, and "
+    "made-up document ids."
 )
+
+# ----- the no-evidence refusal (spec demo-seed item 6 / ADR 0100 D6) --
+#
+# What the answer says when the corpus does not support the question.
+# ONE definition, here, because the string is user-facing: two copies
+# drift and only the one the model saw would be wrong.
+#
+# WHY the instruction and NOT a backend envelope: the backend has no
+# surface that renders answer prose for this case. The citation gate's
+# ``RefuseResult`` is a run status and the evidence contract's
+# ``EvidenceRefusal`` is a machine code for a structurally invalid
+# producer payload — both stop or reject, neither writes an answer. A
+# grounded turn whose tools returned no supporting text is still a
+# turn that must answer, so the sentence has to come from the model
+# instruction, and the gate keeps doing the part that is mechanical:
+# an answer with no grounded span never becomes ``done``.
+NO_EVIDENCE_REFUSAL: str = "资料中未找到相关内容"
+
 
 # ----- per-track usage text (CONTEXT *usage*; tool-choice + citation
 # behavior per track) -------------------------------------------------
@@ -136,56 +157,73 @@ AGENT_SOUL: str = (
 # differ only in usage text.
 USAGE_RESEARCH: str = (
     "Use the research tools before you answer; do not rely on what "
-    "you already know about any company.\n"
-    "- list_files: catalog over the 知识库. Optional filters narrow "
-    "the result; later read_source calls need both document_id and the "
-    "version (sha256) this catalog returns.\n"
-    "- retrieve: the retrieve port's search over the ingested "
-    "corpus on the memory service (passage chunks over the frozen "
-    "units). 查已入库 goes "
-    "through retrieve — prefer it to locate a figure or sentence; "
-    "pass document_id when you already know the filing.\n"
-    "- read_source: one bounded slice of one frozen unit. source_ref "
-    "is a company locator {document_id, version, unit} or an attachment "
-    "locator {kind: 'attachment', attachment_id, version, unit}; take "
-    "the version from tool output this run, never invent it, and unit is "
-    "1-based. position is a zero-based code-point offset into that unit; "
-    "continue at next_position until it is null. A known locator needs no "
-    "retrieve; only text a read returned is citable.\n"
-    "- get_xbrl_fact: one tagged XBRL fact from the filing's fact "
-    "table (concept + reporting period; document_id narrows to one "
-    "filing). A miss returns a typed not-found result; the fact row "
-    "carries its own source_locator — read that unit when you need a "
-    "citable span.\n"
+    "you already know about the corpus or its subject. The 知识库 holds "
+    "ordinary enterprise material — policies, handbooks, product guides, "
+    "meeting notes, reports, contracts, structured records — so any "
+    "question about it is a normal research question.\n"
+    "- list_files: catalog over the 知识库. Optional filters narrow it; "
+    "read_source needs document_id and the version (sha256) the catalog "
+    "returns.\n"
+    "- retrieve: the retrieve port's search over the ingested corpus on "
+    "the memory service (passage chunks over frozen units). 查已入库 goes "
+    "through retrieve — prefer it to locate a figure or sentence; pass "
+    "document_id when you know the document.\n"
+    "- read_source: one bounded slice of a frozen unit. source_ref is a "
+    "document locator {document_id, version, unit} or an attachment "
+    "locator {kind: 'attachment', attachment_id, version, unit}; take the "
+    "version from tool output this run, never invent it; unit is 1-based. "
+    "position is a zero-based code-point offset into that unit; continue at "
+    "next_position until it is null. A known locator needs no retrieve; "
+    "only text a read returned is citable.\n"
+    "- get_xbrl_fact: one tagged XBRL fact from a filing's fact table "
+    "(concept + reporting period; document_id narrows to one filing) — the "
+    "tool for financial filings, one source category among others. A miss "
+    "returns a typed not-found result; the fact row carries its own "
+    "source_locator — read that unit for a citable span.\n"
     "\n"
     "Finish only after a tool this run returned unit or chunk text. "
     "Copy a sentence, table row, or caption verbatim into the answer "
     "as a citation span; do not paraphrase the span, and do not "
-    "invent document_id values. After you have evidence, write "
-    "ordinary prose that includes those copied spans, then stop "
-    "calling tools."
+    "invent document_id values. Then write ordinary prose including "
+    "those copied spans and stop calling tools.\n"
+    "\n"
+    "When the ask has two genuinely different readings and this run "
+    f"returned more than one document that could answer it, ask which: "
+    f"one question sentence, then {CANDIDATE_TERMINATOR} on its own line, "
+    f'then one JSON object {{"{CANDIDATE_PAYLOAD_FIELD}": '
+    '[{"document_id": "..."}]} naming at most four document_ids — or '
+    "attachment_ids for attached files — that a tool returned this run. "
+    "An answer drawing on several documents is ordinary prose with its "
+    "citations.\n"
+    "\n"
+    "When no tool this run returned text supports the question, do not "
+    f"fill the gap from memory: say {NO_EVIDENCE_REFUSAL} "
+    "plainly, add nothing else, and cite nothing. That sentence is the "
+    "whole answer — an estimate, a nearby-period number, or a "
+    "plausible-looking document id would be fabrication.\n"
 )
 
 USAGE_DIALOGUE: str = (
     "Respond warmly and briefly to greetings and small-talk. Do not "
-    "invent filing facts; do not claim you retrieved documents. "
-    "Invite the operator to ask about a company, period, or metric "
+    "invent corpus facts; do not claim you retrieved documents. "
+    "Invite the operator to ask about a document, a topic, or a figure "
     "when it fits the conversation."
 )
 
 USAGE_OFF_TOPIC: str = (
     "The operator's ask is outside fin's scope. Reply with a soft, "
     "polite capability-bound refusal in ordinary prose — do not "
-    "invent filing facts, and do not use a fixed redirect string as "
+    "invent corpus facts, and do not use a fixed redirect string as "
     "the only reply. Briefly name what fin can help with instead."
 )
 
 USAGE_CLARIFY: str = (
-    "The operator asked about a filing or metric but a catalog slot "
-    "is still missing. Ask briefly which slots are still needed and "
-    "ground the options in the 知识库 via list_files rather than a "
-    "frozen snapshot. Do not invent tickers, periods, or document "
-    "identifiers; do not claim you retrieved documents."
+    "The operator asked about material the 知识库 may not hold, but a "
+    "catalog slot is still missing. Ask briefly which slots are still "
+    "needed and ground the options in the 知识库 via list_files rather "
+    "than a frozen snapshot. Do not invent company names, dates or "
+    "periods, or document identifiers; do not claim you retrieved "
+    "documents."
 )
 
 # Assembly: each track prompt is the per-track marker line, then the
@@ -225,21 +263,27 @@ CLARIFY_SYSTEM_PROMPT: str = (
 # 检索档 is NOT a fifth track: the copy rides INSIDE the head
 # SystemMessage after the track prompt, added at model-call time when
 # this turn's cascade ASSIGNED a 档 (rules / llm / inherit /
-# operator_pick). An unassigned turn (clarify awaiting a pick, typed
-# fail) carries no copy. Like every block here the copy is call-scoped
-# only — checkpointed history is never rewritten when the mode changes,
-# and after session compaction the next model call re-adds the copy
-# (ADR 0061). Each copy names exactly its own 档 label so a reader can
-# tell which mode a call ran under.
+# operator_pick / the recorded ``fallback`` default). An unassigned turn
+# (a typed fail) carries no copy. Like every block here the copy is
+# call-scoped only — checkpointed history is never rewritten when the mode
+# changes, and after session compaction the next model call re-adds the
+# copy (ADR 0061).
+#
+# The copy describes the path the host chose and NEVER names it. The mode
+# is not the model's business (ADR 0104): the host assigns it and the
+# retrieve call carries it, so a copy that named a mode taught the model a
+# vocabulary it must not use and an argument it cannot send. The model
+# then narrated the mode in its own reasoning — and that reasoning is
+# rendered — and spent turns trying to send a filter the tool schema does
+# not accept. A reader that needs the mode reads the turn receipt.
 SEARCH_MODE_INSTRUCTIONS_MARKER: str = "[FIN_SEARCH_MODE]"
 
 # One body per 档, bound by its lasting token: one 档 means one text, so
-# the model is never shown two tokens for it. Operator labels stay
-# 查找 / 知识问答 / 综述 / 真数据库 — only the MCP token is named here.
+# the model is never shown two texts for it. The KEY is the mode's own
+# token; the TEXT names no mode at all.
 _USAGE_LEXICAL: str = (
     f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-    "检索档 lexical 查找 (send it as MCP filters.search_mode=lexical): "
-    "retrieve answers with keyword-first matches over "
+    "This turn's retrieval answers with keyword-first matches over "
     "the corpus. Query retrieve with the operator's own keywords, "
     "open a hit with read_source before quoting it. If the exact "
     "keywords miss, rephrase them once, then tell the operator "
@@ -248,18 +292,16 @@ _USAGE_LEXICAL: str = (
 
 _USAGE_KNOWLEDGE_QA: str = (
     f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-    "检索档 graph 知识问答 (graph-priority; send it as MCP "
-    "filters.search_mode=graph): retrieve walks the "
-    "iknow graph neighborhoods first, then fills with vector "
+    "This turn's retrieval walks the entity and relation "
+    "neighbourhoods first, then fills with vector "
     "and BM25 passages. Ask retrieve the question as phrased; "
-    "quote only unit text this run returned — graph relations "
+    "quote only unit text this run returned — relation edges "
     "are not citable evidence."
 )
 
 _USAGE_REVIEW: str = (
     f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-    "检索档 global 综述 (report synthesis; send it as MCP "
-    "filters.search_mode=global): retrieve draws on "
+    "This turn's retrieval draws on "
     "community summaries and report text prepared at index "
     "time, then drops to windows for exact spans when needed. "
     "Assemble the answer from report text this run returned "
@@ -268,12 +310,11 @@ _USAGE_REVIEW: str = (
 
 _USAGE_REAL_DB: str = (
     f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-    "检索档 sql 真数据库 (send it as MCP filters.search_mode=sql): "
-    "the ask targets business data, not the "
-    "filings corpus. Route figures through the real-DB path; "
-    "when it is not wired, report the 真库未接 named failure. "
-    "Document tables in this corpus stay on the graph 档 "
-    "(MCP filters.search_mode=graph), never on this one."
+    "This turn's retrieval targets business data held in a live "
+    "database, not the document corpus. Bound the query with the "
+    "tool's expiry-window arguments when the operator stated a "
+    "window; when that path is not wired, report the named failure "
+    "the tool returned."
 )
 
 # Keyed by the lasting tokens alone. Every 档 is named by the word form of
@@ -445,7 +486,7 @@ def messages_for_model(
     prefetch payload: prefetch rows live on the USER side via
     :func:`memory_prefetch_message`, never in the system prefix.
 
-    ``user_profile`` (spec SC13, that pull request operator decision): the
+    ``user_profile`` (spec SC13, operator decision): the
     raw merged text from :meth:`UserProfileStore.read_merged`. The
     user profile is operator-profile machinery, NOT memory-fact
     machinery — its READ path is INDEPENDENT of ``memory_on`` and

@@ -119,6 +119,33 @@ def test_the_verdict_bearing_class_is_named_once() -> None:
         assert source.count(literal) == 1, f"{literal} is spelled more than once"
 
 
+def test_live_probe_loads_operator_model_settings_before_rendering_or_building_client(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    probe = _probe()
+    events: list[str] = []
+    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setattr(
+        probe,
+        "apply_operator_settings",
+        lambda: events.append("settings"),
+    )
+    monkeypatch.setattr(
+        probe,
+        "render_probe_page",
+        lambda *_args: events.append("render"),
+    )
+    monkeypatch.setattr(
+        probe,
+        "build_client",
+        lambda: pytest.fail("the probe must reject a missing model before a call"),
+    )
+
+    assert probe.main([]) == 2
+    assert events == ["settings"]
+    assert "FIN_MODEL" in capsys.readouterr().err
+
+
 def test_the_prompt_kind_is_named_once() -> None:
     """Each of the four kinds is spelled once, at its own constant.
 

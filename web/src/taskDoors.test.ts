@@ -46,6 +46,32 @@ function pendingQuestion(): PendingQuestionView {
   };
 }
 
+/** The host's TERMINAL clarification with real options and no candidate
+ * details. */
+function terminalQuestion(): PendingQuestionView {
+  return {
+    question_id: QUESTION_ID,
+    task_id: "task-1",
+    task_version: 1,
+    prompt: "请补充：公司/期间",
+    choices: ["苹果公司", "2023 年度", "other"],
+    input_version: 1,
+    purpose: "task_clarification",
+    origin_run_id: null,
+    choice_details: [],
+  };
+}
+
+/** The host's TERMINAL free-text-only clarification: Other is the only
+ * choice, so the typed text is the whole reply. */
+function freeTextOnlyQuestion(): PendingQuestionView {
+  return {
+    ...terminalQuestion(),
+    prompt: "请补充：公司/期间",
+    choices: ["other"],
+  };
+}
+
 function archiveRow(overrides: Partial<ArchivedTaskSummary> = {}): ArchivedTaskSummary {
   return {
     archive_id: "archive-task-1-v1",
@@ -110,13 +136,18 @@ function detailBody(projection: unknown): Record<string, unknown> {
 
 /** Records every POST body the store sends, and answers the GET that
  * follows each door with ``projection``. */
-function stubTaskDoor(projection: unknown): { bodies: unknown[] } {
+function stubTaskDoor(projection: unknown): {
+  bodies: unknown[];
+  urls: string[];
+} {
   const bodies: unknown[] = [];
+  const urls: string[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (_url: string, init?: RequestInit) => {
       const url = String(_url);
       if (init?.method === "POST") {
+        urls.push(url);
         bodies.push(JSON.parse(String(init.body ?? "{}")));
         // A terminal SSE status frame: the reply/restore door answers a
         // stream, so a well-formed one keeps the store off its error
@@ -138,7 +169,7 @@ function stubTaskDoor(projection: unknown): { bodies: unknown[] } {
       });
     }),
   );
-  return { bodies };
+  return { bodies, urls };
 }
 
 function stubTaskRefusal(
@@ -242,6 +273,111 @@ describe("submitTaskReply", () => {
     await useWorkspaceStore.getState().submitTaskReply(THREAD_ID);
     expect(door.bodies[0]).toMatchObject({ choice_id: "2023" });
     expect(door.bodies[0]).not.toHaveProperty("free_text");
+  });
+
+  it("posts a listed real option with the question it answers, on the messages door", async () => {
+    seedTaskThread(envelope({ pending_question: terminalQuestion() }));
+    const store = useWorkspaceStore.getState();
+    store.openTaskClarification(THREAD_ID);
+    store.selectTaskChoice(THREAD_ID, "2023 年度");
+    const door = stubTaskDoor(envelope());
+
+    await useWorkspaceStore.getState().submitTaskReply(THREAD_ID);
+
+    expect(door.bodies).toHaveLength(1);
+    expect(door.bodies[0]).toMatchObject({
+      question_id: QUESTION_ID,
+      choice_id: "2023 年度",
+    });
+    expect(door.bodies[0]).not.toHaveProperty("free_text");
+    // A terminal task clarification is answered by a fresh run on the
+    // send door, never by the graph resume route.
+    expect(door.urls).toHaveLength(1);
+    expect(door.urls[0]).toContain(`/threads/${THREAD_ID}/messages`);
+    expect(door.urls.some((url) => url.includes("/resume"))).toBe(false);
+  });
+
+  it("materializes the reply's NEW turn and folds its streamed answer", async () => {
+    // The observed bad case: the host created a new turn for the reply,
+    // but the SPA treated it as a resume-shaped stream with no patcher,
+    // so the turn never appeared and the operator saw an unanswered card.
+    seedTaskThread(
+      envelope({
+        current_task: {
+          task_id: "task-1",
+          goal: "ZEUS 年假政策是什么？",
+          expected_result: "",
+          task_version: 1,
+          necessary_conditions: [],
+          outcome: "active",
+          outcome_reason: "",
+          created_at_input_version: 1,
+        },
+        pending_question: terminalQuestion(),
+      }),
+    );
+    const store = useWorkspaceStore.getState();
+    store.openTaskClarification(THREAD_ID);
+    store.selectTaskChoice(THREAD_ID, "2023 年度");
+    const runId = "22222222-2222-4222-8222-222222222222";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const href = String(url);
+        if (init?.method === "POST") {
+          const frames = [
+            `event: status\ndata: ${JSON.stringify({ run_id: runId, status: "running" })}\n\n`,
+            `event: answer\ndata: ${JSON.stringify({ text: "年假 22 天" })}\n\n`,
+            `event: status\ndata: ${JSON.stringify({ run_id: runId, status: "done", assistant_message: "年假 22 天" })}\n\n`,
+          ].join("");
+          return new Response(frames, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        if (href.endsWith("/api/threads")) {
+          return new Response("[]", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify(detailBody(envelope())), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+
+    await useWorkspaceStore.getState().submitTaskReply(THREAD_ID);
+
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].run_id).toBe(runId);
+    expect(turns[0].status).toBe("done");
+    expect(turns[0].answer).toContain("年假 22 天");
+    // The reply turn carries the original task goal beside the pick.
+    expect(turns[0].question).toContain("ZEUS 年假政策是什么？");
+    expect(turns[0].question).toContain("2023 年度");
+  });
+
+  it("posts a free-text-only answer without an Other click", async () => {
+    seedTaskThread(envelope({ pending_question: freeTextOnlyQuestion() }));
+    const store = useWorkspaceStore.getState();
+    store.openTaskClarification(THREAD_ID);
+    // No selectTaskChoice: the only choice is the reserved Other, so the
+    // typed text is the answer.
+    store.setTaskOtherText(THREAD_ID, "ZEUS，2024 年第三季度");
+    const door = stubTaskDoor(envelope());
+
+    await useWorkspaceStore.getState().submitTaskReply(THREAD_ID);
+
+    expect(door.bodies).toHaveLength(1);
+    expect(door.bodies[0]).toMatchObject({
+      question_id: QUESTION_ID,
+      choice_id: "other",
+      free_text: "ZEUS，2024 年第三季度",
+    });
+    expect(door.urls[0]).toContain(`/threads/${THREAD_ID}/messages`);
   });
 });
 
@@ -454,6 +590,51 @@ describe("openThread task recovery (W4)", () => {
     // Display recovery is separate from resuming execution: a reload
     // must not submit an empty or bodyless resume request.
     expect(bodies).toHaveLength(0);
+  });
+
+  it("keeps a terminal clarification through the GET decode, then replies with its question_id", async () => {
+    // Raw wire shape: the decoder is the only thing that can carry this
+    // question from the server to the store, so the reply proves the
+    // decoded pending question survived.
+    useWorkspaceStore.setState({
+      clarificationDrafts: {},
+      workspaceOperations: EMPTY_WORKSPACE_OPERATIONS,
+    });
+    const door = stubTaskDoor({
+      current_task: null,
+      archived_tasks: [],
+      pending_question: {
+        question_id: QUESTION_ID,
+        task_id: "task-1",
+        task_version: 1,
+        prompt: "请补充：公司/期间",
+        choices: ["苹果公司", "2023 年度", "other"],
+        input_version: 1,
+        purpose: "task_clarification",
+        origin_run_id: null,
+        choice_details: [],
+      },
+      reconciliation: null,
+      task_outcome: null,
+      input_version: 1,
+      input_history: [],
+    });
+
+    await useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    expect(
+      useWorkspaceStore.getState().taskRuntime[THREAD_ID]?.pending_question?.choices,
+    ).toEqual(["苹果公司", "2023 年度", "other"]);
+
+    const store = useWorkspaceStore.getState();
+    store.openTaskClarification(THREAD_ID);
+    store.selectTaskChoice(THREAD_ID, "苹果公司");
+    await useWorkspaceStore.getState().submitTaskReply(THREAD_ID);
+
+    expect(door.bodies[0]).toMatchObject({
+      question_id: QUESTION_ID,
+      choice_id: "苹果公司",
+    });
   });
 
   it("reads an absent envelope as taskless rather than broken", async () => {

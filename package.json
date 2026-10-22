@@ -4,12 +4,20 @@
   "description": "Repo hooks only. App code is Python (pyproject) and web/.",
   "scripts": {
     "prepare": "husky",
+    "lint:s5": "sh scripts/lint-s5.sh --changed",
+    "lint:s5:staged": "sh scripts/lint-s5.sh --changed --staged",
+    "lint:s5:all": "sh scripts/lint-s5.sh web/src",
     "typecheck": "uv run --no-sync pyright",
-    "typecheck:staged": "node scripts/pyright-staged.mjs"
+    "typecheck:staged": "node scripts/pyright-staged.mjs",
+    "seed:demo": "uv run --no-sync python scripts/seed_demo.py",
+    "test:stream": "node --test tests/run-stream-checks.test.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "eslint": "^10.10.0",
     "husky": "^9.1.7",
-    "typescript-eslint": "^8.70.0"
+    "pg": "^8.23.1",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^5.0.3"
   }
 }

@@ -143,7 +143,8 @@ class CapabilityAwareFakePort:
         search_mode: str | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
-    ) -> dict[str, list[Chunk]]:
+        filters: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Return ``{"chunks": [...]}`` with every capability on.
 
         The product path does not choose: the service's default is all-on, so
@@ -152,9 +153,10 @@ class CapabilityAwareFakePort:
         not a 档, so it mirrors only the token validation — an open 档 is
         answered with the same all-on script, an illegal one raises the port's
         named error. The window pair joins the same signature for parity and
-        is IGNORED: this fake scripts capability rankings, not a ledger, so
-        the window gate (``resolve_sql_window``) belongs to the product wire
-        adapter, not here.
+        is IGNORED, as is the generic metadata filter: this fake scripts
+        capability rankings, not a ledger, so the window gate
+        (``resolve_sql_window``) and the filter contract belong to the
+        product wire adapter, not here.
         """
         resolve_search_mode(search_mode)
         effective = all_on_configuration(self._keys)

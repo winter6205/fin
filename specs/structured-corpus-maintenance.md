@@ -62,7 +62,8 @@ Exact text from `docs/CONTEXT.md`, **派生索引**:
 ADRs 0090/0094 preserve corpus ownership, incremental checks, provenance,
 explicit resolutions, separate readiness, and stale-worker fencing. ADRs
 0091–0093 remain unchanged for legacy row evidence. This contract refines the
-accepted direction without claiming that the tracked change is satisfied.
+accepted direction without claiming that the existing acceptance obligations
+are satisfied.
 
 Existing iknow index jobs, maintenance handlers, dedup helpers, and projection
 outbox are reuse candidates. Read-only exploration found that index readiness
@@ -263,7 +264,8 @@ the desired pair, not acknowledgement by every external search store.
 `conflict_checks` means checks targeting that desired pair and current affected
 dependencies: it remains pending while extraction is pending, even if an older
 published pair had a completed check. External-store readiness is distinct;
-its detailed reconciliation is the tracked change, while serving guards apply immediately.
+its detailed reconciliation is a follow-up issue, while serving guards apply
+immediately.
 
 `read_revision` changes for query-visible data/display values, published
 extraction, active support, identity, resolution, or scope authorization changes.

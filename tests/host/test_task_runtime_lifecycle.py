@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import pytest
 
-from fin.host.task_runtime import (
+from fin.host.task.task_runtime import (
     accept_input,
     decide,
     pending_question_payload,
     record_cancellation,
 )
-from fin.host.task_runtime_types import (
+from fin.host.task.task_runtime_types import (
     ARCHIVE_LIMIT,
     DISPOSITION_AWAIT_REPLY,
     DISPOSITION_CONTINUE,

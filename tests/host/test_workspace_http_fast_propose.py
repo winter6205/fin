@@ -318,6 +318,8 @@ def _seed_standard_catalog(tmp_path: Path) -> Path:
         [
             {
                 "document_id": "AAPL-2022Q3",
+                "title": "Apple filing",
+                "doc_type": "narrative",
                 "company": "Apple",
                 "period": "2022 Q3",
                 "version": "a" * 64,

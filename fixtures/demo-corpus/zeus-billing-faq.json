@@ -1,0 +1,20 @@
+{
+  "source_ref": "zeus-billing-faq",
+  "title": "ZEUS Billing FAQ",
+  "content": "ZEUS Billing FAQ · Page 1\nSection 1: Invoices and credits\nQ: When is an invoice due? A: Within 30 calendar days after receipt, unless the signed order states another term. Q: Where can I find a credit? A: Credits appear as a separate line on the next invoice. Q: Who can request a billing correction? A: The account billing contact. Supplier terms in zeus-supplier-agreement-template, Section 1, apply only when that agreement is signed.",
+  "chunks": [
+    {
+      "content": "ZEUS Billing FAQ · Page 1\nSection 1: Invoices and credits\nQ: When is an invoice due? A: Within 30 calendar days after receipt, unless the signed order states another term. Q: Where can I find a credit? A: Credits appear as a separate line on the next invoice. Q: Who can request a billing correction? A: The account billing contact. Supplier terms in zeus-supplier-agreement-template, Section 1, apply only when that agreement is signed.",
+      "index": 0
+    }
+  ],
+  "metadata": {
+    "document_type": "faq",
+    "page_count": 1,
+    "company": "ZEUS",
+    "form": "10-Q",
+    "period": "2024 Q3",
+    "filing_date": "2024-09-16"
+  },
+  "valid_from": "2024-09-16T00:00:00Z"
+}

@@ -1,4 +1,4 @@
-"""Run-scoped evidence locators on the workspace turn row (T1, the tracked change).
+"""Run-scoped evidence locators on the workspace turn row (T1).
 
 Spec `specs/enterprise-kb-agent.md` Focus 5 / SC8: each terminal
 workspace **run** persists the locators this run retrieved or read
@@ -243,7 +243,7 @@ def test_postgres_insert_and_read_round_trip_evidence_locators(monkeypatch) -> N
 
 def _evidence_item(unit: int, text: str) -> Any:
     from fin.corpus.extracted import Locator
-    from fin.host.citation_gate import EvidenceItem
+    from fin.host.grounded.citation_gate import EvidenceItem
 
     return EvidenceItem(
         locator=Locator(

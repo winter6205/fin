@@ -36,8 +36,8 @@ from typing import Annotated, Any, Final, Literal, TypedDict
 from langchain_core.messages import BaseMessage, HumanMessage
 from langgraph.graph.message import add_messages
 
-from fin.host.citation_gate import Citation, EvidenceItem
-from fin.host.track_decision import Track
+from fin.host.grounded.citation_gate import Citation, EvidenceItem
+from fin.host.grounded.track_decision import Track
 
 
 # ----- evidence reducer + reset sentinel (ADR 0016 / spec SC62) -----
@@ -271,7 +271,7 @@ class StatusSnapshot(TypedDict, total=False):
 
     ``search_mode`` (search-mode host T1): the 检索档 assigned to this
     retrieve job, carried by the mode-patch append
-    (``fin.host.search_mode_decision.mode_snapshot_patch``). A
+    (``fin.host.grounded.search_mode_decision.mode_snapshot_patch``). A
     company-change wipe emits no such key, which is exactly what makes
     the inherit tier stop inheriting across a new job.
     """
@@ -293,7 +293,7 @@ class StatusSnapshot(TypedDict, total=False):
 # "done"``. ``status_reason`` carries the gate's refuse reason or
 # ``"step_cap"``; the full vocabulary lives in ONE place,
 # ``fin.host.named_failures`` (the 具名失败 codes) plus the
-# ``fin.host.citation_gate`` verdicts — this comment deliberately
+# ``fin.host.grounded.citation_gate`` verdicts — this comment deliberately
 # does not re-list them, because a re-listed set drifts.
 class AgentState(TypedDict, total=False):
     """The state the host graph (T6) writes to.
@@ -371,7 +371,7 @@ class AgentState(TypedDict, total=False):
         search-mode host T4 (ADR 0068 / 0079): the Fast 抽图 PROPOSE
         audit — ``{proposed, picked, applied, operator_confirmed,
         decision_tier}`` plus ``apply_error`` on a typed refusal (shape
-        SSOT: ``fin.host.extract_method_proposal``). Doubles as the
+        SSOT: ``fin.host.question.extract_method_proposal``). Doubles as the
         minimal trigger: an input seed ``{"proposed": "fast"}`` with no
         ``picked`` opens the propose window on a grounded run; the node
         completes the audit with the operator pick. ``applied`` is
@@ -447,10 +447,18 @@ class AgentState(TypedDict, total=False):
         folds prior + new itself), so ``reset_input_state``'s ``[]``
         genuinely clears it and a follow-up send cannot inherit the
         previous run's verdict.
+    retrieve_attempted
+        GE-2 (specs/qa-chain-grounded-experience.md): run-scoped boolean,
+        overwrite semantics, ``True`` once the model invoked ``retrieve``
+        at least once this run. Independent of the outcome counts: a
+        typed error or a binding refusal is an attempt but must NOT enter
+        ``retrieve_outcomes`` — that channel feeds
+        ``retrieve_blocking_failure``, which would relabel the named
+        EXIT.
     visual_claims
         ADR 0089 / spec T5: one provenance row per visual observation this
         run read (shape SSOT:
-        :data:`fin.host.visual_evidence.VISUAL_CLAIM_FIELDS`). A
+        :data:`fin.host.evidence.visual_evidence.VISUAL_CLAIM_FIELDS`). A
         generated observation is DERIVED material, never a source
         quote, so it keeps its own channel rather than joining
         ``citations`` — the citation gate never sees these rows and
@@ -499,6 +507,18 @@ class AgentState(TypedDict, total=False):
     in_flight: bool
     track: Track
     track_decision: dict[str, Any]
+    # QA-chain T8: the run-scoped product route intent and how it was
+    # routed. A projection of ``track_decision`` written once by
+    # ``classify_node``; run-scoped like the track audit, so
+    # ``reset_input_state`` clears it.
+    route_intent: str
+    route_source: str
+    # The host's one scope statement for a clarify-track follow-up that
+    # retrieval proved answerable from a single source scope. Call-scoped
+    # at model time (never written back as a message); run-scoped here
+    # like the other routing audit fields, so a follow-up cannot inherit
+    # it.
+    clarify_scope_note: str
     # search-mode host T1: run-scoped 档 audit (overwrite semantics,
     # single writer ``classify_node``); see the field docstring above.
     search_mode_decision: dict[str, Any]
@@ -533,6 +553,9 @@ class AgentState(TypedDict, total=False):
     # and a follow-up send would inherit the previous run's outcome —
     # the exact stale verdict the run-scoped reset exists to prevent.
     retrieve_outcomes: list[dict[str, int]]
+    # GE-2: run-scoped attempt flag; the class docstring above is the SSOT
+    # for why it is separate from the outcome channel.
+    retrieve_attempted: bool
     # ADR 0089 / spec T5: the visual-claim rows this run read, on their OWN
     # channel (never ``citations``). Additive — several reads in one run keep
     # several tokens — which is why it takes a reducer and a reset sentinel
@@ -553,7 +576,7 @@ class AgentState(TypedDict, total=False):
     # not a clear), which is why clearing takes the sentinel instead.
     structured_evidence: Annotated[list[dict[str, Any]], _structured_evidence_reducer]
     # Question/task runtime T2–T4: the thread-scoped task envelope
-    # (``fin.host.task_runtime_types.TaskRuntimeState``), stored as its
+    # (``fin.host.task.task_runtime_types.TaskRuntimeState``), stored as its
     # one state dict. Thread-scoped and therefore OMITTED from
     # ``reset_input_state`` below, exactly like ``status_snapshots``:
     # a run-scoped reset, a resume, and a compaction all preserve task
@@ -574,6 +597,28 @@ class AgentState(TypedDict, total=False):
     # verdict is about one turn's evidence and must not survive into the
     # next.
     grounding_assessment: dict[str, Any]
+    # R3: this run's semantic outcome. ``None`` is unknown (stored NULL).
+    # Overwrite, run-scoped — a follow-up must not inherit it.
+    semantic_outcome: str | None
+    # Optional recorded host-gate snapshot for the outcome apply. Empty
+    # means the seams are unwired and the outcome node stays fail-closed.
+    host_gates: dict[str, Any]
+    # QA-chain T9: this run's admitted grounded DECISION — the audit of
+    # ``fin.host.grounded.grounded_decision.admit_decision``, written once by the
+    # grounded admission node. Run-scoped, like every other turn verdict,
+    # so a follow-up send can never inherit the previous turn's decision
+    # and re-open its choice. It is an AUDIT only: the candidate set is
+    # never stored here — the one candidate authority is
+    # ``task_runtime.pending_question``.
+    grounded_decision: dict[str, Any]
+    # QA-chain T9: the admitted source-scope SNAPSHOT for this thread,
+    # appended by the document-choice resume. Thread-scoped, like
+    # ``status_snapshots`` and ``task_runtime``, and therefore OMITTED
+    # from ``reset_input_state``: an accepted restriction survives the
+    # run-scoped reset and a resume, because "a fresh unscoped input keeps
+    # the previous restriction" is exactly the rule the shared contract
+    # freezes. ``{}`` means no accepted restriction yet.
+    source_scope: dict[str, Any]
 
 
 def reset_input_state(
@@ -636,6 +681,13 @@ def reset_input_state(
         # rewrites track + track_decision on the new run.
         # status_snapshots are durable thread history (T3) — omit.
         "track_decision": {},
+        # QA-chain T8: the route intent/source are projections of this
+        # run's track decision, so they reset with it.
+        "route_intent": "",
+        "route_source": "",
+        # The clarify scope statement belongs to the turn that produced
+        # it; a later send decides its own scope.
+        "clarify_scope_note": "",
         # search-mode host T1: the 档 audit is run-scoped like the track
         # audit; the durable 档 lives on ``status_snapshots`` (inherit
         # source), not here — omit that channel as above.
@@ -654,6 +706,8 @@ def reset_input_state(
         # retrieve calls — a stale ``corpus_not_ready`` cannot outlive
         # its run.
         "retrieve_outcomes": [],
+        # GE-2: the attempt flag is run-scoped for the same reason.
+        "retrieve_attempted": False,
         # ADR 0089: a visual claim belongs to the run that proved the
         # raster it names, so a follow-up send starts with none — the
         # page may have been re-uploaded under a new version and the
@@ -669,9 +723,15 @@ def reset_input_state(
         # stale ``supported`` assessment would complete the NEXT task
         # on evidence gathered for a different question.
         "grounding_assessment": {},
-        # task_runtime is deliberately OMITTED: it is thread-scoped task
-        # history, and a run-scoped reset must not erase it. Same reason
-        # ``status_snapshots`` is omitted above.
+        "semantic_outcome": None,
+        "host_gates": {},
+        # QA-chain T9: this run's admitted grounded decision is a
+        # turn verdict, so a follow-up send starts with none — a stale
+        # ``choice`` must never reopen its window on the next question.
+        "grounded_decision": {},
+        # task_runtime and source_scope are deliberately OMITTED: both are
+        # thread-scoped history, and a run-scoped reset must not erase
+        # them. Same reason ``status_snapshots`` is omitted above.
     }
 
 

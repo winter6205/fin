@@ -1,33 +1,21 @@
-# docker-compose for v1 durable checkpoints (T8, #17).
-#
-# One service: Postgres 16 on alpine. The credentials below are
-# DEV-ONLY — never use them in production. They match the
-# ``FIN_CHECKPOINT_URL`` example in ``.env.example``; that match
-# is the spec acceptance gate (spec success-criteria item 7).
-#
-# Operators who prefer a native Postgres server may use one with
-# the same URL (ADR 0015). This compose file is the local
-# delivery; the contract is the URL, not the deployment.
-#
-# The healthcheck lets ``docker compose up`` exit cleanly once
-# Postgres is ready, and CI runners can wait on
-# ``pg_isready`` instead of sleeping.
+# Dev-only Postgres. Production is compose/docker-compose.production.yml,
+# installed under ~/.fin/compose/ and started with project name fin.
+# This file must not publish host port 5433 or name fin_postgres_data.
+name: fin-dev
 
 services:
   postgres:
     image: postgres:16-alpine
+    container_name: fin-dev-postgres
     environment:
       POSTGRES_DB: fin
       POSTGRES_USER: fin
       POSTGRES_PASSWORD: fin
-    # Listen on 5433 in the container so the published port is 5433:5433
-    # (same number on host and in-container). 5432 stays free for
-    # iknow-memory-infra Postgres, which is also 5432:5432.
     command: ["postgres", "-p", "5433"]
     ports:
-      - "5433:5433"
+      - "5435:5433"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - fin_dev_postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fin -d fin -p 5433"]
       interval: 5s
@@ -35,4 +23,5 @@ services:
       retries: 5
 
 volumes:
-  postgres-data:
+  fin_dev_postgres_data:
+    name: fin_dev_postgres_data

@@ -1,10 +1,12 @@
 # Spec: Question and task runtime
 
+> **Adopted QA-chain amendment (2026-10-16):** The operator accepted the routing, retrieval, lifecycle and scoped persistence proposals. This canonical module contract incorporates the relevant behaviour below; the [shared wire contract](question-task-runtime-contract.md) freezes representation. [Routing/grounded](qa-chain-grounded-experience.md), [server/receipts](qa-chain-server-runtime.md), and [catalog/retrieval](qa-chain-corpus-retrieval.md) own their deltas. The journey acceptance contract remains the sole integrated acceptance gate. No implementation or acceptance pass is claimed.
+
 > **Status:** Decision-level module specification for independent development. The shared wire contract and implementation details remain downstream decisions.
 > **Architecture review:** Passed decision-level review; see the review record below. This is not implementation approval.
-> **Integration:** One of four module specifications. the tracked change remains the only integrated product-acceptance contract.
+> **Integration:** One of four module specifications. The journey acceptance contract remains the only integrated product-acceptance gate.
 
-**Decision basis:** issue map and its approved QE-01–QE-06 decisions.
+**Decision basis:** the issue map and its approved QE-01–QE-06 decisions.
 
 ## Objective
 
@@ -18,45 +20,42 @@ alignment for a later contract-freezing step before parallel implementation.
 ## Confirmed decisions and provenance
 
 1. **Existing host state remains the only task authority.** The current LangGraph AgentState and configured checkpointer hold the authoritative task
-   state; ThreadStore terminal rows, run status, and research snapshots are projections or separate concerns. Provenance: issue  task-state
+   state; ThreadStore terminal rows, run status, and research snapshots are projections or separate concerns. Provenance: task-state
    decision; [ADR 0002](../docs/adr/0002-langgraph-runtime.md), [ADR
    0005](../docs/adr/0005-agent-loop-verifier-langgraph-durability.md), and [ADR 0015](../docs/adr/0015-postgres-checkpointer.md).
 2. **A thread has one current task and may keep locatable archived tasks.** Switching preserves a historical task snapshot and its run/evidence
-   references. Explicit restore rechecks current conditions, source authority, versions, and evidence applicability. Provenance: issue; [ADR 0026](../docs/adr/0026-workspace-streaming-resume.md).
+   references. Explicit restore rechecks current conditions, source authority, versions, and evidence applicability. Provenance:
+   [ADR 0026](../docs/adr/0026-workspace-streaming-resume.md).
 3. **Task and input changes have distinct versions.** Every accepted message, valid clarification reply, or explicit restore request advances input
    history once. A task version changes only when its goal, expected result, or necessary conditions materially change. A revision mismatch alone does
-   not invalidate unchanged work. Provenance: issue; issue 
-   J13–J18.
+   not invalidate unchanged work. Provenance: J13–J18.
 4. **Every accepted input receives one semantic reconciliation before dependent work.** The model proposes the decision; the host validates and
    persists a consistent task transition, reconciliation marker, and execution disposition together. No separate classifier or second task store is
-   introduced. Provenance: issue; existing routing in
-   [graph.py](../src/fin/host/graph.py).
+   introduced. Provenance: existing routing in [graph.py](../src/fin/host/graph.py).
 5. **Clarification is for actionable user-held information, not operational failure.** Preserve the full question and choices, provide an Other path,
    and retain the selected choice and any original free text. Dismissal supplies no answer; obsolete replies cannot revive another task. Provenance:
-   issue; issue 
    J07.
 6. **Task outcome and turn outcome are separate.** A turn may end with an answer, partial result, clarification, cancellation, or system failure while
-   a task remains active. A run ending successfully does not by itself establish task completion. Provenance: issue; issue; issue 
-   J12/J19/J20.
+   a task remains active. A run ending successfully does not by itself establish task completion. Provenance: J12/J19/J20.
 7. **Source selection and grounded assessment belong to peer modules.** Runtime consumes the source-scope decision and the evidence-grounding
    assessment, but does not redefine their meaning, duplicate their policy, or treat a saved source selection as current permission. Provenance:
-   issue  responsibility decision;
-   [source-scope spec](question-source-scope.md); [grounded-answer spec](question-grounded-answer.md).
+   the runtime responsibility decision; [source-scope spec](question-source-scope.md); [grounded-answer spec](question-grounded-answer.md).
 8. **Host application integration has one owner.** The host integration owner wires graph compilation, HTTP entry points, prompts, stream/payload
    mapping, and history projections. Peer module development returns decisions or proposals and does not co-edit those integration files. Provenance:
    approved four-module ownership decision in this task.
-9. **The four module specs are independently developed; integration is covered by the tracked change.** There is no fifth integration-acceptance spec. Concrete
-   shared wire contracts must be frozen downstream before parallel implementation. Provenance: user's direction in this task and issue.
+9. **The four module specs are independently developed; integration is covered by the journey acceptance contract.** There is no fifth integration-acceptance spec. Concrete
+   shared wire contracts must be frozen downstream before parallel implementation. Provenance: user's direction in this task and
+   the journey acceptance contract.
 10. **No new provider, retrieval backend, service target, or numeric execution budget is selected here.** Continue to respect existing host
-    capabilities and limits. Provenance: issue; issue.
+    capabilities and limits.
 
 ## Boundaries
 
 - **Does:** Decide task/input authority and version semantics; original-input provenance; mandatory reconciliation; question and reply lifecycle;
   archive, restore, and history recovery; active-run input ordering; cancellation and late-result handling; task/turn outcome distinction; and failure
   responsibilities.
-- **Confirms with human:** No behavior decision remains open in this draft. Technical choices listed under Open Questions remain unselected by the
-  issue map and require inventory or later contract alignment before implementation.
+- **Confirms with human:** No T0 behavior or shared representation decision remains open. Operational implementation follows the server contract,
+  T1 evidence and downstream acceptance; a new product or authority decision returns to the operator.
 - **Out of this spec:** Exact field names and payload shapes; endpoint signatures; checkpoint serialization, migration mechanism, and archive
   encoding; source-scope policy and UI presentation; grounding/evidence sufficiency rules; graph scheduler internals; numeric budgets; retrieval
   strategy; and implementation plans, fixtures, or test code.
@@ -113,6 +112,12 @@ outcome requires supported coverage of the requested goal, no material unresolve
 identity/version, receipts, and persistence. Host mechanics do not certify semantic support. Without a grounded assessment, only constrained, truthful
 cancellation or execution-failure outcomes are allowed; no current task means no task outcome.
 
+### Adopted QA-chain continuation and source-intent behaviour
+
+A grounded document clarification uses this module's one pending question. A candidate click or Other/free-text answer is a valid `reply`, admitted and reconciled once through the existing send door, even though it continues the same graph run and answer receipt. Bodyless crash resume, display reload, attachment auto-resume and search-mode control do not create user input. The [shared contract](question-task-runtime-contract.md#document-clarification-and-accepted-input-scheduling) selects the exact representation, original-input semantics, duplicate rejection and commit-before-resume recovery.
+
+The source module proposes a versioned corpus/attachment restriction. Runtime alone accepts it against current input/task conditions and commits it with the reconciled envelope in the existing checkpoint. It persists across unscoped new questions and mode/company changes until explicit accepted replacement/clear; no legacy slot reset may silently broaden it. Pending choice details are not long-term memory. Turn receipts account for execution only; they cannot assign a task outcome or replace accepted-input history.
+
 ## Module interface and ownership
 
 The module boundary describes what callers provide and receive: original input, question reply, explicit restore choice, current task/archives,
@@ -146,22 +151,15 @@ task store.
    material gap remains, and host hard gates pass. Partial work and system failure leave an unresolved task active.
 8. Input, permission, dependency, checkpoint, history, cancellation, and execution-limit failures remain distinguishable and truthful. Failed
    operations preserve the last consistent checkpoint and do not become user clarification.
-9. Runtime is independently verified against its mapped the tracked change cases J06/J07 and J11–J20, including J12's applicable variants. This module does
-   not claim full product acceptance. At final four-module integration, the complete H/M/B matrix from issue is required: H for J01–J22; M for the 19 mapped cases, with J12
+9. Runtime is independently verified against its mapped acceptance cases J06/J07 and J11–J20, including J12's applicable variants. This module does
+   not claim full product acceptance. At final four-module integration, the complete H/M/B matrix from the journey acceptance contract
+   is required: H for J01–J22; M for the 19 mapped cases, with J12
    requiring M only when a real responding model owns failure interpretation; B for J01–J21, with J22 browser inspection covered through J08/J21. J17
    and J19 require H+B. No fifth integration spec is added.
 
 ## Open Questions
 
-These are technical choices not selected by the issue map, not unresolved user behavior or permission to add new product choices:
-
-- Archive encoding and compatibility representation within the existing checkpoint.
-- The legacy checkpoint population, recoverable original-input sources, and migration/data inventory. No migration has been validated by this spec.
-- How accepted inputs and decisions are scheduled through the existing graph lock, run control, send/resume paths, and host transport surfaces.
-- How existing execution limits are exposed and enforced. No new numeric budget or service target is selected.
-
-Before implementation, the owner must inventory current behavior and data that affect these choices, then freeze the shared wire/schema contract
-across the four module specifications. That is a downstream technical alignment step, not an implementation plan included here.
+No product decision or shared representation remains open for the adopted scope. The [shared contract](question-task-runtime-contract.md) freezes archive encoding, conservative legacy reads, accepted-input scheduling, document replies and versioned source intent. Existing graph caps remain unchanged; the [server contract](qa-chain-server-runtime.md) owns new operational phase budgets. Concrete scheduling/cleanup implementation follows T1 evidence and the existing execution plans; no runtime enforcement or acceptance is asserted here.
 
 ## Inherits / Changes
 
@@ -174,14 +172,14 @@ The [context map](../docs/context-map.md) places the host-agent context in src/f
 snapshot distinct from task authority.
 
 **Inherits:** the existing AgentState and configured LangGraph checkpointer (ADRs 0002, 0005, 0015); existing thread/run resume and history identity
-(ADR 0026); run-scoped reset behavior; per-thread graph locking and run control; and the approved the tracked change/the tracked change decisions.
+(ADR 0026); run-scoped reset behavior; per-thread graph locking and run control; and the approved runtime decisions.
 
 **Changes:** makes the host task lifecycle, original-input provenance, unified reconciliation order, question/restore behavior, task/turn distinction,
 and module ownership explicit. It introduces no second store, classifier, glossary term, or new ADR.
 
-For question-experience behavior, these approved decisions supersede older requirements in
-[soft-track-judge-route.md](soft-track-judge-route.md) and [search-mode-host.md](search-mode-host.md) that turn operational failures into clarification
-or require the operator to choose a retrieval technique. Internal retrieval capabilities remain available to the model within host constraints.
+For question-experience behavior, these approved decisions supersede historical requirements that turned operational failures into clarification
+or required the operator to choose a retrieval technique. The amended [route spec](soft-track-judge-route.md) now agrees with the failure boundary;
+[search-mode-host.md](search-mode-host.md) remains the internal retrieval-capability contract within host constraints, without a mandatory technique picker.
 
 **Persist list:** empty.
 
@@ -193,6 +191,6 @@ Independent review of all four decision-level specifications on 2026-10-09:
 - **input-contract-tests: N/A.** No concrete API or product code is introduced. Public-entry contracts and tests belong to downstream implementation.
 - **error-handling-enforcer: yes.** Permission, capability, dependency, evidence, checkpoint, and history failures remain distinct.
 - **complexity-anti-drift: yes.** One integration owner and distinct module policies avoid duplicated responsibility; implementation complexity is not measured here.
-- **minimal-change-verifier: yes.** Four decision specs only; the tracked change remains the sole integrated acceptance contract.
+- **minimal-change-verifier: yes.** Four decision specs only; integration acceptance remains in the journey acceptance contract.
 
 **Overall: PASS for architectural decisions only.** This review neither approves an implementation nor establishes product acceptance.

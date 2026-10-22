@@ -50,8 +50,8 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host.compile import compile_for_runtime
-from fin.host.evidence_contract import CONTRACT_REFUSAL_CODES
-from fin.host.evidence_session_registry import (
+from fin.host.evidence.evidence_contract import CONTRACT_REFUSAL_CODES
+from fin.host.evidence.evidence_session_registry import (
     EvidenceBindingRefusal,
     EvidenceSessionBinding,
     EvidenceSessionRegistry,
@@ -875,6 +875,7 @@ def test_compile_for_runtime_hands_the_bundle_to_the_graph(
     """
 
     calls: list[dict[str, Any]] = []
+    monkeypatch.setenv("FIN_MODEL", "synthetic-evidence-test-model")
     monkeypatch.setattr(
         "fin.host.compile.compile_graph",
         lambda **kwargs: calls.append(kwargs) or "compiled",

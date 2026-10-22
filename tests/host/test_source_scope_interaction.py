@@ -21,7 +21,7 @@ NOT read off ``fin.host.source_scope`` or the wiring in ``graph.py``:
 What makes this an INTERACTION test, not a unit test: it drives the ACTUAL
 shipped graph through ``compile_graph`` — the same factory the server uses —
 with a ``ScriptedChatModel`` for the plan, behind a REAL
-:class:`~fin.host.attachment_store.InMemoryAttachmentStore` as the store the
+:class:`~fin.host.attachment.attachment_store.InMemoryAttachmentStore` as the store the
 attachment seam is wired to. Nothing about the gate, the store, or the tools
 is stubbed: the object under test is the enforcement path exactly as wired,
 and the assertions are on the observable end-of-run channels — the
@@ -43,10 +43,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import Locator
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_retrieval import AttachmentChunk, AttachmentLocator
-from fin.host.attachment_source_read import AttachmentSourceReader
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_retrieval import AttachmentChunk, AttachmentLocator
+from fin.host.attachment.attachment_source_read import AttachmentSourceReader
+from fin.host.attachment.attachment_store import (
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
 )

@@ -3,7 +3,7 @@
 The Fake is the pytest injection, NOT the product classifier: default
 ``uv run pytest -q`` asserts closed-set routing with it, while the
 product path requires a live Jev round-trip. It duck-types
-:meth:`fin.host.jev_choice.JevChoiceClient.choose` so callers swap it
+:meth:`fin.host.question.jev_choice.JevChoiceClient.choose` so callers swap it
 in without branching, and records every call's kwargs so zero-call and
 argument assertions stay possible.
 """
@@ -14,7 +14,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from fin.host.jev_choice import JevChoice, JevChoiceError
+from fin.host.question.jev_choice import JevChoice, JevChoiceError
 
 
 class FakeJevChoice:

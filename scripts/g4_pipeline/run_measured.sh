@@ -109,7 +109,7 @@ env = os.environ
 
 def as_int(value):
     # Only ASCII digits are a number. The module this harness measures
-    # (fin.host.attachment_budgets) rejects a full-width digit as a confusable,
+    # (fin.host.attachment.attachment_budgets) rejects a full-width digit as a confusable,
     # and text handed over by the shell is the same kind of input.
     text = (value or "").strip()
     digits = text[1:] if text.startswith("-") else text

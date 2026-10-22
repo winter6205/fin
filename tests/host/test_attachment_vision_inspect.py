@@ -27,13 +27,13 @@ from typing import Any
 
 import pytest
 
-from fin.host.attachment_budgets import (
+from fin.host.attachment.attachment_budgets import (
     ATTACHMENT_VISION_BUDGET_EXCEEDED,
     AttachmentBudgets,
     AttachmentVisionBudgetExceeded,
     VisionCallLedger,
 )
-from fin.host.attachment_observations import (
+from fin.host.attachment.attachment_observations import (
     COVERAGE_SCHEMA_VERSION,
     CoveredDetail,
     DetailKey,
@@ -41,7 +41,7 @@ from fin.host.attachment_observations import (
     ObservationEnvelope,
     plotted_value_key,
 )
-from fin.host.attachment_vision import (
+from fin.host.attachment.attachment_vision import (
     DEFAULT_MEDIA_TYPE,
     VISION_CALL_FAILED,
     VisionCallFailedError,
@@ -53,7 +53,7 @@ from fin.host.attachment_vision import (
     VisionTarget,
     VisionUsage,
 )
-from fin.host.attachment_vision_inspect import (
+from fin.host.attachment.attachment_vision_inspect import (
     InspectionOutcome,
     PageIdentity,
     inspect_for_details,

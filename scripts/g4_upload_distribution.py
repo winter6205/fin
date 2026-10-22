@@ -223,26 +223,30 @@ def read_deployed_attachment_cap() -> dict[str, Any]:
     product stopped enforcing, and a template that lost the key blocks the
     run instead of inventing one.
     """
-    from fin.host.attachment_budgets import (
+    from fin.host.attachment.attachment_budgets import (
         AttachmentBudgetConfigError,
         from_environ,
     )
-    from fin.host.operator_env import parse_env_file
+    from fin.host.operator_settings import (
+        OperatorSettingsConfigError,
+        shipped_attachment_bounds,
+    )
 
-    deployed = parse_env_file((REPO_ROOT / ".env.example").read_text())
-    if DEPLOYED_CAP_ENV_KEY not in deployed:
+    try:
+        deployed = shipped_attachment_bounds(repo_root=REPO_ROOT)
+    except OperatorSettingsConfigError as exc:
         raise MeasurementBlockedError(
-            f".env.example does not configure {DEPLOYED_CAP_ENV_KEY}"
-        )
+            f"settings.example.yaml does not configure {DEPLOYED_CAP_ENV_KEY}: {exc}"
+        ) from exc
     try:
         budgets = from_environ(environ=deployed)
     except AttachmentBudgetConfigError as exc:
         raise MeasurementBlockedError(
-            f".env.example configures {DEPLOYED_CAP_ENV_KEY} unusably: {exc}"
+            f"settings.example.yaml configures {DEPLOYED_CAP_ENV_KEY} unusably: {exc}"
         ) from exc
     return {
         "constant_bytes": budgets.max_upload_bytes,
-        "source": f".env.example:{DEPLOYED_CAP_ENV_KEY}",
+        "source": "settings.example.yaml:attachment.maxBytes",
     }
 
 

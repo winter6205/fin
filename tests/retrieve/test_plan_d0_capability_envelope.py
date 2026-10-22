@@ -104,7 +104,7 @@ def test_undeliverable_degraded_is_named_failure_not_silent_chunks() -> None:
     """
     # Mirror the product EXIT shape from mcp_adapter's
     # RetrieveDegradedFailureError.error_dict.
-    error_payload = {"error": "retrieve_degraded_failure"}
+    error_payload = {"error": "retrieve_degraded"}
     signal = DegradationSignal(
         degraded=True,
         degraded_reasons=("vector:arm_down",),
@@ -112,7 +112,7 @@ def test_undeliverable_degraded_is_named_failure_not_silent_chunks() -> None:
     error_payload.update(signal.as_envelope_fields())
 
     assert "chunks" not in error_payload
-    assert error_payload["error"] == "retrieve_degraded_failure"
+    assert error_payload["error"] == "retrieve_degraded"
     assert error_payload[DEGRADED_FIELD] is True
 
 

@@ -8,8 +8,9 @@ Contract under test (specs/search-mode-host.md :47, SC2 "call-scoped
 copy", ADR 0061):
 
 * when the turn's cascade ASSIGNED a 档 (rules / llm / inherit /
-  operator_pick), the usage copy rides the model-facing payload at
-  model-call time — injected EXACTLY ONCE per call, in near context.
+  operator_pick / the recorded ``fallback`` default), the usage copy rides
+  the model-facing payload at model-call time — injected EXACTLY ONCE per
+  call, in near context.
 * checkpointed ``messages`` never store the copy: history is never
   rewritten when the mode changes, and a second turn with a different
   档 leaves the first turn's checkpointed messages byte-identical.
@@ -17,9 +18,8 @@ copy", ADR 0061):
   NEXT model call still carries the current turn's 档 copy — the
   call-scoped shape satisfies re-injection by construction; this suite
   locks that behaviour.
-* unassigned turns (dialogue track, clarify awaiting a pick; the
-  typed-fail class has no producer since the tracked change T7 emptied the refusal
-  table) inject NOTHING.
+* unassigned turns (dialogue track, and a grounded turn whose EXPLICIT
+  selection was rejected — it keeps its named rejection) inject NOTHING.
 """
 
 from __future__ import annotations
@@ -45,8 +45,8 @@ from fin.host.agent_instructions import (
 )
 from fin.host.graph import compile_graph
 from fin.host.scripted_model import ScriptedChatModel
-from fin.host.search_mode_decision import MODE_LABELS
-from fin.host.session_compaction import session_token_budget
+from fin.host.grounded.search_mode_decision import MODE_LABELS
+from fin.host.session.session_compaction import session_token_budget
 from fin.host.state import reset_input_state
 
 pytestmark = [pytest.mark.soft_track]
@@ -56,9 +56,9 @@ AAPL_2022Q3 = "AAPL-2022Q3"
 AAPL_2022Q3_VERSION = (
     "a7a0d8261a0923404fc45446afd71b9965bd2b4064772df0287e761bb68ba9f2"
 )
-# Same small override the compaction-gate suite uses so a scripted
-# fixture crosses the 90% trigger without a 230k-char history.
-TEST_BUDGET = 1_600
+# Keep enough floor capacity for the measured host prompt and tool
+# schemas while retaining a compact, deterministic trigger fixture.
+TEST_BUDGET = 24_000
 
 
 def _cfg(thread_id: str) -> dict:
@@ -109,6 +109,14 @@ def _compile(model: Any, **kwargs: Any) -> Any:
     )
 
 
+def _copy_text(content: str) -> str:
+    """The copy block's own text: the head SystemMessage from its marker on.
+
+    The copy rides inside the head message after the track prompt, so the
+    message is not the copy — this is the copy."""
+    return content[content.index(SEARCH_MODE_INSTRUCTIONS_MARKER) :]
+
+
 def _mode_blocks(messages: list[BaseMessage]) -> list[BaseMessage]:
     return [m for m in messages if SEARCH_MODE_INSTRUCTIONS_MARKER in str(m.content)]
 
@@ -126,7 +134,7 @@ def _invoke(g: Any, text: str, thread_id: str) -> dict:
 
 # ----- seeded fat history (compaction trigger) -----
 
-_TOOL_PAYLOAD = "p" * 12_000
+_TOOL_PAYLOAD = "p" * 30_000  # 7,500 estimated tokens per big ToolMessage
 
 
 def _tool_pair(ai_text: str, tool_body: str, call_id: str) -> list[BaseMessage]:
@@ -153,8 +161,9 @@ def _tool_pair(ai_text: str, tool_body: str, call_id: str) -> list[BaseMessage]:
 
 
 def _seed_messages() -> list[BaseMessage]:
-    """A fat history far above 90% of the 1_600-token test budget
-    (same shape as ``test_session_compaction_gate._seed_messages``)."""
+    """A fat history above 90% of the 24_000-token budget including
+    measured host overhead, with room to preserve the newest tool pair
+    under the 40% total floor."""
     messages: list[BaseMessage] = []
     for index in range(3):
         messages += _tool_pair(
@@ -198,8 +207,10 @@ def test_messages_for_model_injects_mode_copy_once() -> None:
     assert blocks[0] is out[0]
     assert isinstance(out[0], SystemMessage)
     assert str(out[0].content).count(SEARCH_MODE_INSTRUCTIONS_MARKER) == 1
-    assert MODE_LABELS["graph"] in str(out[0].content)
-    assert str(out[0].content).count(MODE_LABELS["graph"]) == 1
+    # The copy names no mode: the host assigns it and the model cannot
+    # send one, so a named mode in the prompt is a vocabulary leak.
+    assert _copy_text(str(out[0].content)) == SEARCH_MODE_USAGE_COPY["graph"]
+    assert MODE_LABELS["graph"] not in str(out[0].content)
 
 
 def test_messages_for_model_injection_is_idempotent() -> None:
@@ -227,21 +238,24 @@ def test_unassigned_or_unknown_mode_injects_nothing() -> None:
         assert not _mode_blocks(out)
 
 
-def test_each_mode_copy_names_only_its_tier() -> None:
-    """Every 档 carries its own usage copy naming exactly its label —
-    查找 / 知识问答 / 综述 / 真数据库 (CONTEXT 检索档). The copy-key /
-    retired-spelling superset is pinned once in
-    ``test_search_mode_usage_copy_keys.py``, not re-derived here."""
-    for mode, label in MODE_LABELS.items():
+def test_each_mode_copy_is_its_own_and_names_no_mode() -> None:
+    """Every 档 carries its own usage copy, and the copy names no 档 at all.
+
+    The host assigns the 档 and the model cannot send one (spec search-mode
+    SC2), so a copy that named a mode taught the model a vocabulary it
+    must not use — and the model then narrated the mode in its own
+    reasoning, which the page renders. The copy-key / retired-spelling
+    superset is pinned once in ``test_search_mode_usage_copy_keys.py``, not
+    re-derived here."""
+    for mode in MODE_LABELS:
         content = str(
             messages_for_model(
                 [HumanMessage(content="q")], track="grounded", search_mode=mode
             )[0].content
         )
-        assert label in content
-        for other in MODE_LABELS.values():
-            if other != label:
-                assert other not in content
+        assert _copy_text(content) == SEARCH_MODE_USAGE_COPY[mode]
+        for label in MODE_LABELS.values():
+            assert label not in content, (mode, label)
 
 
 def test_track_prompt_stays_first_with_mode_copy() -> None:
@@ -346,8 +360,8 @@ def test_second_turn_new_mode_leaves_first_history_unedited() -> None:
     block = str(_mode_blocks(last_call)[0].content)
     # The second turn's copy names only its own 档 — the first turn's
     # 查找 copy is gone from the fresh payload, not stacked onto it.
-    assert "检索档 graph" in block
-    assert "检索档 lexical" not in block
+    assert _copy_text(block) == SEARCH_MODE_USAGE_COPY["graph"]
+    assert _copy_text(block) != SEARCH_MODE_USAGE_COPY["lexical"]
 
 
 def test_dialogue_turn_injects_no_copy() -> None:
@@ -363,29 +377,57 @@ def test_dialogue_turn_injects_no_copy() -> None:
         assert not _mode_blocks(call)
 
 
-def test_clarify_grounded_turn_injects_no_copy() -> None:
-    """An unassigned grounded turn injects NOTHING: the tracked change T7 (6e8ed97)
-    emptied the routing-time refusal table, so the residual that leaves
-    ``search_mode=None`` is now the clarify turn (no 档 named, no judge
-    client) — the same "nothing assigned, nothing injected" contract the
-    old typed-fail case carried (that case rode ``sql``, first as the
-    unopened ``global``, and is now impossible for a closed-set naming;
-    the positive flip is pinned by
-    :func:`test_assigned_sql_turn_injects_its_copy_once`)."""
+def test_fallback_grounded_turn_injects_the_graph_copy_once() -> None:
+    """The residual is an ASSIGNMENT now: a grounded turn the cascade
+    could not decide takes the recorded default (``graph``) at the
+    ``fallback`` tier, so the leaf call carries the 知识问答 usage copy
+    exactly once — the same call-scoped shape every other assigned 档 has.
+
+    The 0.0 confidence is POLICY uncertainty, not a judge verdict, and it
+    does not change what the model is told to do: it runs the 知识问答 档.
+    """
     model = _RecordingScriptedModel(
         script=[AIMessage(content="Net sales grew.")]
     )
     g = _compile(model)
-    out = _invoke(g, "what was AAPL net sales in 2023 Q3?", "smcp-clarify")
+    out = _invoke(g, "what was AAPL net sales in 2023 Q3?", "smcp-fallback")
     assert out["track"] == "grounded"
-    assert out["search_mode_decision"]["decision_tier"] == "clarify"
-    assert out["search_mode_decision"]["search_mode"] is None
+    audit = out["search_mode_decision"]
+    assert audit["decision_tier"] == "fallback"
+    assert audit["search_mode"] == "graph"
+    assert audit["confidence"] == 0.0
+    assert model.captured
+    for call in model.captured:
+        blocks = _mode_blocks(call)
+        assert len(blocks) == 1
+        assert _copy_text(str(blocks[0].content)) == SEARCH_MODE_USAGE_COPY["graph"]
+
+
+def test_unassigned_grounded_turn_injects_no_copy() -> None:
+    """A genuinely UNASSIGNED grounded turn injects NOTHING: an explicit
+    selection that was rejected keeps its named rejection, so no 档 is
+    named and no usage copy rides the call. (The routing residual is no
+    longer such a turn — it is assigned; see
+    :func:`test_fallback_grounded_turn_injects_the_graph_copy_once`.)"""
+    model = _RecordingScriptedModel(
+        script=[AIMessage(content="Net sales grew.")]
+    )
+    g = _compile(model)
+    out = g.invoke(
+        {**reset_input_state("what was AAPL net sales in 2023 Q3?"), "evidence": []},
+        config={"configurable": {"thread_id": "smcp-unassigned", "pinned_search_mode": "E"}},
+    )
+    assert out["track"] == "grounded"
+    audit = out["search_mode_decision"]
+    assert audit["decision_tier"] == "typed_fail"
+    assert audit["search_mode"] is None
+    assert audit["failure_code"] == "invalid_search_mode"
     for call in model.captured:
         assert not _mode_blocks(call)
 
 
 def test_assigned_sql_turn_injects_its_copy_once() -> None:
-    """The the tracked change T7 flip of the old typed-fail pin, equal half 2: naming
+    """The T7 flip of the old typed-fail pin, equal half 2: naming
     the now-open 真数据库 assigns it, so the grounded model call carries
     the ``sql`` usage copy exactly once — 综述 and 真数据库 both moved
     from "no copy, refusal" to "own copy, routed" and neither is the
@@ -403,8 +445,7 @@ def test_assigned_sql_turn_injects_its_copy_once() -> None:
     call = model.captured[-1]
     blocks = _mode_blocks(call)
     assert len(blocks) == 1
-    assert "检索档 sql" in str(blocks[0].content)
-    assert SEARCH_MODE_USAGE_COPY["sql"] in str(blocks[0].content)
+    assert _copy_text(str(blocks[0].content)) == SEARCH_MODE_USAGE_COPY["sql"]
 
 
 def test_copy_reinjected_after_compaction() -> None:
@@ -430,6 +471,9 @@ def test_copy_reinjected_after_compaction() -> None:
         ],
     )
     with session_token_budget(TEST_BUDGET):
+        before = g.occupancy(tid)
+        assert before is not None
+        assert before["ratio"] > 0.90
         out = g.invoke(
             {
                 **reset_input_state("and 2022 Q3?"),
@@ -437,6 +481,9 @@ def test_copy_reinjected_after_compaction() -> None:
             },
             config=_cfg(tid),
         )
+        after = g.occupancy(tid)
+        assert after is not None
+        assert after["ratio"] <= 0.40
     assert out["search_mode_decision"]["decision_tier"] == "inherit"
     assert out["search_mode_decision"]["search_mode"] == "graph"
     assert model.captured
@@ -451,6 +498,6 @@ def test_copy_reinjected_after_compaction() -> None:
     blocks = _mode_blocks(call)
     assert len(blocks) == 1
     assert blocks[0] is call[0]
-    assert "检索档 graph" in str(blocks[0].content)
+    assert _copy_text(str(blocks[0].content)) == SEARCH_MODE_USAGE_COPY["graph"]
     # And the copy itself is still call-scoped after the rebuild.
     assert not _mode_blocks(_checkpoint_messages(g, tid))

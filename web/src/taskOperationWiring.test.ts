@@ -21,7 +21,7 @@ import {
   currentWorkspaceOperation,
   EMPTY_WORKSPACE_OPERATIONS,
 } from "./workspaceOperation";
-import { clarificationRegion } from "./clarificationRegion";
+import { clarificationRegion } from "./capabilities/clarification/clarificationRegion";
 import {
   RESTORE_UNHEARD_COPY,
   restoreDecision,

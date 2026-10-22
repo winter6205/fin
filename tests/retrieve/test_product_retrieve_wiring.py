@@ -111,7 +111,7 @@ def _record_mcp_construction(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
 @pytest.fixture(autouse=True)
 def _clear_retrieve_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
-    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "synthetic-retrieve-test-model")
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
 
 

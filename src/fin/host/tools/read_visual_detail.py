@@ -1,6 +1,6 @@
 """The model-facing result of one visual read (ADR 0089, spec T5).
 
-:func:`fin.host.attachment_visual_read.read_visual_detail` decides what a run
+:func:`fin.host.attachment.attachment_visual_read.read_visual_detail` decides what a run
 earned and hands back provenance tokens only — an observation's prose never
 rides a claim row. This module is the other half of the tool boundary: it
 turns one ``(faces, ask)`` pair into the ONE object the model sees plus the
@@ -21,7 +21,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-from fin.host.visual_evidence import VISUAL_UNAVAILABLE
+from fin.host.evidence.visual_evidence import VISUAL_UNAVAILABLE
 
 
 def _lane() -> Any:
@@ -31,7 +31,7 @@ def _lane() -> Any:
     which imports the host graph back — the same cycle every other
     attachment seam here dodges.
     """
-    return importlib.import_module("fin.host.attachment_visual_read")
+    return importlib.import_module("fin.host.attachment.attachment_visual_read")
 
 
 def visual_read_result(

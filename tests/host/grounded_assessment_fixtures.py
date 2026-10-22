@@ -16,7 +16,7 @@ and ``grounded_assessment_cases`` are.
 
 from __future__ import annotations
 
-from fin.host.grounded_assessment import (
+from fin.host.grounded.grounded_assessment import (
     AssessmentValidation,
     CapabilityState,
     EvidenceKind,

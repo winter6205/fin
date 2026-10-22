@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-support-faq",
+  "title": "ZEUS Support FAQ",
+  "content": "ZEUS Support FAQ · Page 1\nSection 1: Opening a support case\nQ: How do I open a case? A: Use the HELIOS console or call the support number on your order form. Q: When is a Severity 1 case acknowledged? A: Within 30 minutes. Q: What should I include? A: The workspace ID, UTC time of the issue, and one short description. The support terms are summarized in zeus-helios-service-guide, Section 1.\n\nZEUS Support FAQ · Page 2\nSection 2: Case updates\nQ: Can I change a case severity? A: Yes. Add the new impact and affected workspace to the case; the support analyst confirms the classification. Q: How often are active Severity 1 cases updated? A: Every 30 minutes while response work is active. Q: What happens when ZEUS needs more information? A: The support clock pauses until the requested details arrive. Do not include passwords or access tokens in a case.",
+  "chunks": [
+    {
+      "content": "ZEUS Support FAQ · Page 1\nSection 1: Opening a support case\nQ: How do I open a case? A: Use the HELIOS console or call the support number on your order form. Q: When is a Severity 1 case acknowledged? A: Within 30 minutes. Q: What should I include? A: The workspace ID, UTC time of the issue, and one short description. The support terms are summarized in zeus-helios-service-guide, Section 1.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Support FAQ · Page 2\nSection 2: Case updates\nQ: Can I change a case severity? A: Yes. Add the new impact and affected workspace to the case; the support analyst confirms the classification. Q: How often are active Severity 1 cases updated? A: Every 30 minutes while response work is active. Q: What happens when ZEUS needs more information? A: The support clock pauses until the requested details arrive. Do not include passwords or access tokens in a case.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "faq",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "10-Q",
+    "period": "2024 Q3",
+    "filing_date": "2024-09-12"
+  },
+  "valid_from": "2024-09-12T00:00:00Z"
+}

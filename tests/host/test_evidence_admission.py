@@ -15,7 +15,7 @@ three tests pin the gate's existing semantics).
 The module also owns the attachment half of the same seam: an attachment
 hit or slice becomes evidence only while a trusted record answers for
 its id and version, which is one rule for both legs and so lives in
-:func:`fin.host.evidence_admission.attachment_evidence_from_ref`.
+:func:`fin.host.evidence.evidence_admission.attachment_evidence_from_ref`.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import Locator
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.citation_gate import EvidenceItem, verify_citations
-from fin.host.evidence_admission import (
+from fin.host.grounded.citation_gate import EvidenceItem, verify_citations
+from fin.host.evidence.evidence_admission import (
     admit_retrieved_chunks,
     attachment_evidence_from_ref,
 )
@@ -337,7 +337,7 @@ def test_admission_does_not_swallow_malformed_evidence_contract() -> None:
     """Admission filters on the mapping condition only. An empty
     ``unit_text`` is still the gate's malformed-evidence error, with the
     offending index — this seam does not widen or narrow that rule."""
-    from fin.host.citation_gate import MalformedEvidenceError
+    from fin.host.grounded.citation_gate import MalformedEvidenceError
 
     with pytest.raises(MalformedEvidenceError) as excinfo:
         verify_citations(

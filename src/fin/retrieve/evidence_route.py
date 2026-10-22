@@ -70,10 +70,11 @@ EVIDENCE_ENVELOPE_VERSION = 1
 TRUSTED_BINDING_VERSION = "1"
 
 # The members a `read` success envelope must carry, mapped to `None`: required,
-# type unchecked, and exactly as `af60514` left them. #363 asked for a page, and
-# a type table for this arm could not be truthful in the first place, because the
-# grant's own `value` column is `unknown` on the wire and is carried back
-# uninspected. Giving `read` a new refusal is a read ticket's own decision.
+# type unchecked, and exactly as `af60514` left them. The request asked for
+# a page, and a type table for this arm could not be truthful in the first
+# place, because the grant's own `value` column is `unknown` on the wire and
+# is carried back uninspected. Giving `read` a new refusal is a read
+# ticket's own decision.
 _READ_RESULT_FIELDS: Mapping[str, type | tuple[type, ...] | None] = {
     "evidence_ref": None,
     "kind": None,
@@ -116,7 +117,7 @@ _SUPPORT_RESULT_FIELDS: Mapping[str, type | tuple[type, ...] | None] = {
 #: WHY this is stated as a property of the TRANSPORT and not of a running
 #: consumer pair: nothing in this repo yet connects the consumer a binding
 #: forwards to the one the drain reads
-#: (``fin.host.structured_evidence_drain_worker.INVALIDATION_DRAIN_CONSUMER_ID``),
+#: (``fin.host.evidence.structured_evidence_drain_worker.INVALIDATION_DRAIN_CONSUMER_ID``),
 #: and the drain's own transport has no production binder — the backend half of
 #: the invalidations channel lands with P3.  So the two-consumer separation is
 #: available on the wire and is not yet in force end to end; claiming it is
@@ -138,7 +139,7 @@ TRUSTED_BINDING_ENV_VARS: Mapping[str, str] = {
 #: rule rather than each reader spelling it out, because a length accepted on
 #: the transport and refused by the drain is a binding that launches a child
 #: and then cannot drain — and the drain imports this copy, so the two cannot
-#: drift.  It lives here rather than in ``fin.host.evidence_contract`` because
+#: drift.  It lives here rather than in ``fin.host.evidence.evidence_contract`` because
 #: ``fin.host`` cannot be imported from here at all (see the token note above);
 #: the drain reaches it the other way round.
 MAX_BINDING_TOKEN_CHARS: int = 512

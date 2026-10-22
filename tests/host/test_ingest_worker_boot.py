@@ -49,6 +49,7 @@ from fin.corpus.ingest_state import InMemoryIngestStateStore, IngestState
 from fin.corpus.metadata_store import InMemoryMetadataStore
 from fin.corpus.object_store import InMemoryObjectStore, ObjectPointer
 from fin.host import workspace_http
+from fin.host.application.lifetime import RuntimeHandle
 from fin.host.workspace_http import (
     get_index_job_tracker,
     get_ingest_service,
@@ -61,7 +62,6 @@ from fin.retrieve.fake_push_port import FakePushPort
 _MD_BYTES = (
     b"# Heading\n\nA first paragraph with enough body text to chunk.\n"
 )
-JOB = "AAPL-2023Q3"
 WORKER_THREAD_NAME = "fin-ingest-worker"
 
 
@@ -117,6 +117,7 @@ def _fresh_endpoint() -> _Stack:
         object_store=objects,
         metadata_store=InMemoryMetadataStore(),
         state_store=states,
+        corpus_scope_id="ingest-worker-boot",
     )
     # The contract fake index-job port over an in-process ledger: the
     # boot tests pin that the drain performs the submit handoff and the
@@ -170,19 +171,19 @@ def _post(client: TestClient) -> Any:
     )
 
 
-def _status(client: TestClient) -> dict[str, Any]:
-    response = client.get(f"/api/corpus/ingest/{JOB}")
+def _status(client: TestClient, job_id: str) -> dict[str, Any]:
+    response = client.get(f"/api/corpus/ingest/{job_id}")
     assert response.status_code == 200
     return response.json()
 
 
 def _wait_for_state(
-    client: TestClient, wanted: str, timeout: float = 10.0
+    client: TestClient, job_id: str, wanted: str, timeout: float = 10.0
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     body: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        body = _status(client)
+        body = _status(client, job_id)
         if body["state"] == wanted:
             return body
         time.sleep(0.02)
@@ -201,7 +202,7 @@ def test_http_accept_leaves_the_job_pending_with_no_worker_thread(
     response = _post(client)
 
     assert response.status_code == 200
-    body = _status(client)
+    body = _status(client, response.json()["job_id"])
     assert body["state"] == "pending"
     assert [
         thread
@@ -251,7 +252,7 @@ def test_boot_drain_drives_an_http_queued_job_to_ready(
         check_interval_seconds=60.0,
     )
 
-    body = _wait_for_state(client, "ready")
+    body = _wait_for_state(client, submission["job_id"], "ready")
     assert body["job_id"] == submission["job_id"]
     assert body["text_ready"] is True
     # The bytes were fetched through the durable pointer, never
@@ -269,11 +270,11 @@ def test_fresh_worker_resumes_an_interrupted_job_without_reupload(
     http_app: FastAPI, client: TestClient, tmp_path: Path
 ) -> None:
     stack = _install(http_app)
-    _post(client)
+    job_id = _post(client).json()["job_id"]
     # Model the dead process: the job got as far as extracting before
     # the interrupt. Only the durable store survives to the next boot.
-    stack.states.transition(JOB, IngestState.FETCHING)
-    stack.states.transition(JOB, IngestState.EXTRACTING)
+    stack.states.transition(job_id, IngestState.FETCHING)
+    stack.states.transition(job_id, IngestState.EXTRACTING)
 
     _start(
         stack,
@@ -281,7 +282,7 @@ def test_fresh_worker_resumes_an_interrupted_job_without_reupload(
         check_interval_seconds=60.0,
     )
 
-    body = _wait_for_state(client, "ready")
+    body = _wait_for_state(client, job_id, "ready")
     assert body["text_ready"] is True
     assert len(stack.objects.puts) == 1
 
@@ -298,7 +299,7 @@ def test_boot_resume_submits_a_ready_but_untracked_job_without_repush(
     then passes the job state through.
     """
     stack = _install(http_app)
-    _post(client)
+    job_id = _post(client).json()["job_id"]
     untracked = workspace_http.IngestWorker(
         stack.endpoint, journal_dir=tmp_path / "dead-process-journals"
     )
@@ -315,7 +316,7 @@ def test_boot_resume_submits_a_ready_but_untracked_job_without_repush(
         check_interval_seconds=60.0,
     )
 
-    body = _wait_for_state(client, "ready")
+    body = _wait_for_state(client, job_id, "ready")
     assert body["text_ready"] is True
     graph = body["graph"]
     assert graph is not None and graph["jobs"], body
@@ -496,24 +497,52 @@ def test_start_without_injection_takes_the_process_shared_index_job_tracker(
 
 def test_serve_starts_the_drain_before_binding_and_stops_after(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     import fin.corpus.ingest_storage as ingest_storage
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
     import uvicorn
 
     events: list[str] = []
-    monkeypatch.setattr(http_module, "apply_dotenv", lambda: None)
-    monkeypatch.setattr(http_module, "get_attachment_budgets", lambda: None)
+    # The boot refuses an undeclared durable checkpointer before it opens
+    # anything, so this deployment has to state one. The compile itself is
+    # stubbed below, so the URL is a declared placeholder, not a connection.
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    monkeypatch.setattr(composition_module, "apply_operator_settings", lambda: None)
+    monkeypatch.setattr(composition_module, "attachment_budgets", lambda: None)
     monkeypatch.setattr(
         ingest_storage, "preflight_ingest_storage", lambda: None
     )
-    monkeypatch.setattr(http_module, "publish_knowledge_mcp", lambda: None)
-    monkeypatch.setattr(http_module, "compile_for_http", lambda: None)
+    monkeypatch.setattr(composition_module, "publish_knowledge_mcp", lambda: None)
+    # The boot seam is the closeable runtime handle, not the graph-only
+    # compile it delegates to, so that is what has to be stubbed here.
     monkeypatch.setattr(
-        http_module, "start_ingest_worker", lambda: events.append("start")
+        composition_module,
+        "_compile_http_runtime",
+        lambda **_kwargs: RuntimeHandle(None),
     )
     monkeypatch.setattr(
-        http_module, "stop_ingest_worker", lambda: events.append("stop")
+        composition_module, "start_application_ingest_worker", lambda: events.append("start")
+    )
+    monkeypatch.setattr(
+        composition_module, "stop_ingest_worker", lambda: events.append("stop")
+    )
+    # The same declared ``FIN_CHECKPOINT_URL`` also selects the durable
+    # store for the attachment seam, so every seam past the ingest worker
+    # is stubbed too: the subject of this test is the boot ORDER, not
+    # what each step builds.
+    monkeypatch.setattr(composition_module, "default_attachment_service", lambda: None)
+    monkeypatch.setattr(
+        composition_module, "start_application_attachment_prep_worker", lambda service: None
+    )
+    monkeypatch.setattr(composition_module, "default_thread_store", lambda: None)
+    monkeypatch.setattr(composition_module, "get_workspace_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        composition_module, "start_application_attachment_resume_worker", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        composition_module, "start_application_invalidation_drain_worker", lambda *, store: None
     )
     monkeypatch.setattr(
         uvicorn, "run", lambda *a, **k: events.append("serve")

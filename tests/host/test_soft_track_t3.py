@@ -7,7 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.state import reset_input_state
-from fin.host.track_decision import decide_track
+from fin.host.grounded.track_decision import decide_track
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 

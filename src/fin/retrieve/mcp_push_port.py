@@ -53,7 +53,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
@@ -67,6 +66,8 @@ from fin.retrieve.mcp_session import (
     default_mcp_timeout_seconds,
     build_handshake_wire,
     build_tools_call_frame,
+    exchange_oneshot_mcp,
+    launch_oneshot_mcp_process,
     parse_jsonrpc_response_lines,
     validate_initialize_response,
 )
@@ -91,8 +92,6 @@ from fin.retrieve.push_port import (
 _VALID_UNTIL_SENTINEL: str = "9999-12-31T23:59:59.999Z"
 
 _MCP_CLIENT_NAME = "fin-push"
-
-logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -127,44 +126,23 @@ async def _launch_mcp_process(
     command: list[str],
 ) -> asyncio.subprocess.Process:
     """Launch the MCP subprocess and surface a typed spawn failure."""
-    try:
-        return await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except (OSError, FileNotFoundError) as exc:
-        raise OSError(f"failed to launch MCP command: {exc}") from exc
+    return await launch_oneshot_mcp_process(command)
 
 
 async def _exchange_mcp_messages(
     proc: asyncio.subprocess.Process,
     wire_messages: bytes,
     timeout: float,
-) -> tuple[bytes, bytes]:
-    """Send one MCP session and preserve timeout / process-exit semantics."""
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(wire_messages),
-            timeout=timeout,
-        )
-    except (asyncio.TimeoutError, TimeoutError):
-        proc.kill()
-        try:
-            await proc.wait()
-        except Exception:
-            logger.debug(
-                "MCP process cleanup failed after timeout",
-                exc_info=True,
-            )
-        raise
-    if proc.returncode != 0:
-        raise OSError(
-            f"MCP server exited {proc.returncode}: "
-            f"{stderr.decode(errors='replace')!r}"
-        )
-    return stdout, stderr
+) -> bytes:
+    """Send one MCP session and return the two owed response frames.
+
+    A conforming MCP stdio server answers and keeps serving, so the
+    exchange reads the frames the protocol owes rather than waiting for
+    the child to exit. The child is stopped and reaped here.
+    """
+    return await exchange_oneshot_mcp(
+        proc, wire_messages, timeout=timeout
+    )
 
 
 def _parse_mcp_responses(stdout: bytes) -> list[Any]:
@@ -593,7 +571,7 @@ class MCPPushPort:
         wire_messages = build_handshake_wire(
             payload, client_name=_MCP_CLIENT_NAME
         )
-        stdout, _ = await _exchange_mcp_messages(
+        stdout = await _exchange_mcp_messages(
             proc,
             wire_messages,
             self._timeout,

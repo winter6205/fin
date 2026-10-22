@@ -1,5 +1,7 @@
 # Spec: Question grounded answer
 
+> **Adopted QA-chain amendment (2026-10-16):** The operator accepted the routing, retrieval, lifecycle and scoped persistence proposals. This canonical module contract incorporates the relevant behaviour below; the [shared wire contract](question-task-runtime-contract.md) freezes representation. [Routing/grounded](qa-chain-grounded-experience.md), [server/receipts](qa-chain-server-runtime.md), and [catalog/retrieval](qa-chain-corpus-retrieval.md) own their deltas. The journey acceptance contract remains the sole integrated acceptance gate. No implementation or acceptance pass is claimed.
+
 > **Status:** Decision-level module specification; concrete interfaces and implementation choices remain downstream.
 > **Architecture review:** Passed decision-only review; [review record](question-task-runtime.md#architecture-change-review). No implementation approval is implied.
 
@@ -45,8 +47,8 @@ search.
 
 The model returns a conceptual grounded assessment to Runtime: what conclusions are supported and how, which goal portions are covered, what material
 gaps or conflicts remain, and whether to continue, ask an actionable question, deliver a supported result, or report unresolved work. It may also
-propose the resulting task and turn disposition. Concrete fields, wire encoding, and the shared interface are decided at the common contract freeze
-before modules are implemented in parallel.
+propose the resulting task and turn disposition. The [shared contract](question-task-runtime-contract.md) and
+[QA-chain grounded contract](qa-chain-grounded-experience.md) freeze the shared fields, wire encoding and admission rules before parallel implementation.
 
 An assessment uses only the currently committed task/input and source-scope basis. Runtime first reconciles each accepted user input once. Grounded
 assessment begins only after the required task and scope state is committed; the bootstrap or a same-decision proposed transition cannot claim
@@ -82,22 +84,36 @@ The host supplies current permissions and source identity/version, validates evi
 numeric checks, reports truthful capabilities and failures, and enforces execution limits. A failed host check constrains or removes the affected
 assertion under its existing contract. The model cannot verify its own evidence, claim a host check passed, or commit task state.
 
-Existing evidence serialization remains authoritative in [enterprise-evidence-contract.md](enterprise-evidence-contract.md) and issue. Citation verification remains code-only under
-[ADR 0082](../docs/adr/0082-citation-verifier-code-only.md). These checks establish mechanical identity, structure, quote/row, or numeric validity;
-they do not establish semantic support, applicability, complete goal coverage, or task completion. In particular, a quote check passing does not mean
-the evidence answers the asked question.
+Existing evidence serialization remains authoritative in [enterprise-evidence-contract.md](enterprise-evidence-contract.md). Citation verification
+remains code-only under [ADR 0082](../docs/adr/0082-citation-verifier-code-only.md). These checks establish mechanical identity, structure,
+quote/row, or numeric validity; they do not establish semantic support, applicability, complete goal coverage, or task completion. In particular, a
+quote check passing does not mean the evidence answers the asked question.
 
 Source Scope owns the current restriction for corpus-derived text, attachments, XBRL facts, and comparisons. Previously archived assistant text is not
 independent evidence: current claims require available source evidence to be rehydrated and revalidated under the current task and source scope.
 Workspace owns the user's presentation and interaction. A single host integration owner composes this semantic responsibility with the existing model
 flow; this spec selects no prompt-file or function decomposition.
 
+### Adopted QA-chain answer and clarification behaviour
+
+The [routing/grounded contract](qa-chain-grounded-experience.md) adds one decision/synthesis per retrieved evidence set through this existing semantic seam, not a second judge. Multiple documents alone do not establish ambiguity. A supported synthesis may use them together; only a material, actionable interpretation difference produces at most four hit-backed document choices. Operational failure remains distinct from evidence refusal; evidence refusal requires an actual retrieval attempt in the logical turn.
+
+For document ambiguity, return a proposal for Runtime's single pending question. Runtime owns acceptance/reconciliation of the reply and the source snapshot, then continues the same run/receipt. An original question, candidate click and Other reply retain their exact input associations under the [shared contract](question-task-runtime-contract.md#document-clarification-and-accepted-input-scheduling).
+
+Malformed structured output sends its original text through the existing R3 verifier and semantic support boundary. Admitted fallback records `fallback_merge` with verified references; failed admission records `fallback_refuse` with no citations. Deterministic presentation may remove technical labels without adding facts or changing evidence bytes; it must not start a second repair/synthesis model call. Hold unadmitted answer bytes on every stream/history/export/resume path. Mechanical R3 success still cannot establish semantic support or task completion.
+
+### Incremental publication amendment (2026-10-21)
+
+The existing Grounded Answer decision may expose a structured answer incrementally, but it remains one decision/synthesis call per evidence set. For each factual block, the existing decision must make support, applicability, and consistency with earlier admitted blocks available before that closed block can publish. The host continues to enforce current evidence identity/version, reference closure, applicable R3 checks, safe deterministic presentation, and immutable admitted-prefix behavior. Mechanical R3 success remains insufficient for semantic admission.
+
+If the single existing decision cannot make a block and its support/applicability result available until the full response ends, early factual publication remains blocked; a second judge or repair call is prohibited. Exact block encoding and parser limits belong to the publication admission gate in P1, not to a new Grounded Answer module or model loop. See [ordered assistant stream publication](assistant-stream-publication.md) for the host interface and delivery contract. This dated amendment does not alter the earlier integrated acceptance results or claim implementation.
+
 ## Success Criteria
 
-The following outcomes are binary against the independent expected result for each the tracked change journey. H means deterministic host behavior, M means the real
+The following outcomes are binary against the independent expected result for each acceptance journey. H means deterministic host behavior, M means the real
 configured model, and B means the real application journey.
 
-| Criterion | Required decision | the tracked change evidence |
+| Criterion | Required decision | Acceptance evidence |
 | --- | --- | --- |
 | Claim-specific support | Supported claims match their subject and material applicability; unsupported claims are narrowed or withheld. | J01, J08, J22 |
 | Provenance and conditions | J02 reports E1=80 and E2=100 with effective dates and employee scope, labels the 20-unit delta as calculated, and does not infer contractor/department coverage. J06 asks for the missing amount only when it changes the judgment; 1,000 and 1,001 produce their supported approval bands. J13 treats 1,500 as a user condition, not policy evidence. | J02, J06, J13 |
@@ -111,32 +127,32 @@ configured model and at least three clean independent journey starts; controlled
 cases pass deterministically. Required B cases include a complete observed run through the actual application and persistence path. H, M, and B
 evidence are distinct; none substitutes for another. These are future acceptance requirements, not claims that any case has run or passed.
 
-Local module verification later checks the semantic contract against independent examples. Final integrated acceptance remains solely in the the tracked change
+Local module verification later checks the semantic contract against independent examples. Final integrated acceptance remains solely in the journey acceptance
 manifest; this work adds no fifth acceptance spec. No test command or live-model result is selected or asserted here.
 
 ## Open Questions
 
-No product behavior remains open from the tracked change through the tracked change. Concrete evidence-result encoding, provider configuration, execution budgets, and existing H/M/B
-runner selection remain technical choices for the shared-contract freeze and downstream implementation planning. They do not alter these semantic
-decisions.
+No T0 product or shared representation decision remains open. The shared and QA-chain grounded contracts freeze evidence/result encoding;
+the server contract freezes operational budgets. Existing provider configuration is retained. H/M/B runner selection and private implementation
+remain downstream work and do not alter these semantic decisions or replace the integrated acceptance.
 
 ## Inherits / Changes
 
 ### Confirmed inherited assumptions
 
 1. fin remains an enterprise knowledge-QA entry point; finance is the first corpus domain, not the product boundary. **Confirmed by** [ADR
-   0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md) and QE-01, issue.
-2. Representative goals include fact/rule lookup, comparison or synthesis, and judgments with user-specific conditions. **Confirmed by** QE-01, issue, QE-04, issue, and QE-05, issue.
+   0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md) and QE-01.
+2. Representative goals include fact/rule lookup, comparison or synthesis, and judgments with user-specific conditions. **Confirmed by** QE-01,
+   QE-04, and QE-05.
 3. Model semantics and host guarantees are separate: the model judges support, applicability, coverage, and useful next steps; the host enforces
-   permissions, identity/version, mechanical verification, limits, and persistence. **Confirmed by** QE-04, issue and QE-05, issue.
+   permissions, identity/version, mechanical verification, limits, and persistence. **Confirmed by** QE-04 and QE-05.
 4. Runtime owns task/input state and transitions; Source Scope owns current source permission/restriction; Workspace owns presentation and
-   interaction. This module consumes those decisions without a second state or permission authority. **Confirmed by** issue,
-   issue, and issue.
+   interaction. This module consumes those decisions without a second state or permission authority.
 5. Evidence serialization and admission remain under the existing [enterprise evidence contract](enterprise-evidence-contract.md); citation
    verification stays code-only under [ADR 0082](../docs/adr/0082-citation-verifier-code-only.md). A mechanical pass does not decide semantic
-   sufficiency. **Confirmed by** issue, ADR 0082, and
-   QE-04/.
-6. The minimum representative journey set and independent H/M/B boundaries are defined by QE-06, issue. They are requirements, not evidence of implementation success.
+   sufficiency. **Confirmed by** ADR 0082, and QE-04.
+6. The minimum representative journey set and independent H/M/B boundaries are defined by QE-06 and the journey acceptance contract. They
+   are requirements, not evidence of implementation success.
 
 ### Existing vocabulary
 

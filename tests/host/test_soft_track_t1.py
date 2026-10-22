@@ -16,7 +16,7 @@ from fin.host.agent_instructions import (
     HOST_INSTRUCTIONS_MARKER,
     OFF_TOPIC_INSTRUCTIONS_MARKER,
 )
-from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
+from fin.host.grounded.citation_gate import HIDDEN_BOUNCE_MARKER
 from fin.retrieve import FakeRetrievePort
 
 AAPL_2022Q3 = "AAPL-2022Q3"

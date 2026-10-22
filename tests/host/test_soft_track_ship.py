@@ -22,10 +22,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import ExtractedPage, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
-from fin.host.jev_choice import JEV_CHOICE_EXIT_SCHEMA, JevChoiceError
+from fin.host.grounded.citation_gate import HIDDEN_BOUNCE_MARKER
+from fin.host.question.jev_choice import JEV_CHOICE_EXIT_SCHEMA, JevChoiceError
 from fin.host.state import REPAIR_CAP, reset_input_state
-from fin.host.track_decision import decide_track
+from fin.host.grounded.track_decision import decide_track
 from fin.retrieve import FakeRetrievePort
 from jev_fake import FakeJevChoice
 
@@ -231,7 +231,7 @@ def test_must_greeting_boundary_no_durable_dialogue_system() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_must_underspec_clarify_no_tools_done_empty_cites() -> None:
+def test_must_jev_clarify_no_tools_done_empty_cites() -> None:
     model = ScriptedChatModel(
         script=[
             AIMessage(
@@ -245,6 +245,7 @@ def test_must_underspec_clarify_no_tools_done_empty_cites() -> None:
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
         known_document_ids=KNOWN_IDS,
         adapter=_tree_read_adapter(),
     )
@@ -260,7 +261,7 @@ def test_must_underspec_clarify_no_tools_done_empty_cites() -> None:
     _assert_track_decision(out["track_decision"], track="clarify")
 
 
-def test_must_clarify_boundary_metric_only_stays_clarify() -> None:
+def test_must_explicit_jev_clarify_boundary_metric_only() -> None:
     """Boundary: bare metric ask without company/period → clarify."""
     model = ScriptedChatModel(
         script=[AIMessage(content="Need company and period from the frozen 12.")]
@@ -268,6 +269,7 @@ def test_must_clarify_boundary_metric_only_stays_clarify() -> None:
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
         known_document_ids=KNOWN_IDS,
         adapter=_tree_read_adapter(),
     )
@@ -280,11 +282,12 @@ def test_must_clarify_boundary_metric_only_stays_clarify() -> None:
     _empty_cites(out)
 
 
-def test_must_clarify_boundary_never_enters_citation_gate() -> None:
+def test_must_explicit_jev_clarify_never_enters_citation_gate() -> None:
     model = ScriptedChatModel(script=[AIMessage(content="Which filing?")])
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=FakeJevChoice([("clarify", 0.99)]),
         known_document_ids=KNOWN_IDS,
         adapter=_tree_read_adapter(),
     )
@@ -602,22 +605,40 @@ def test_must_inherit_boundary_empty_snapshot_does_not_force_research() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_matrix_empty_blank_underspec_or_empty_snapshot() -> None:
-    """Empty: blank-ish underspec filing ask → clarify; empty snapshot no inherit."""
+def test_missing_slot_metric_retrieves_and_blank_is_dialogue() -> None:
+    """Missing financial slots do not bypass a real retrieval attempt."""
+    adapter = FakeRetrievePort(known_document_ids=KNOWN_IDS)
     model = ScriptedChatModel(
-        script=[AIMessage(content="Which company and period?")]
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "retrieve",
+                        "args": {"query": "revenue"},
+                        "id": "c-missing-slot-retrieve",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="The available material does not answer this question."),
+        ]
     )
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        adapter=_tree_read_adapter(),
+        adapter=adapter,
     )
     out = g.invoke(
         {**reset_input_state("revenue"), "evidence": []},
         config=_cfg("ship-empty"),
     )
-    assert out["track"] == "clarify"
+    assert out["track"] == "grounded"
+    assert out["track_decision"]["decision_tier"] == "jev_fallback"
+    assert out["route_intent"] == "retrieve"
+    assert adapter.calls
+    assert adapter.calls[0]["query"] == "revenue"
     # Empty-snapshot inherit already covered; blank residual → dialogue:
     blank = decide_track([HumanMessage(content="   ")], snapshots=[])
     assert blank.track == "dialogue"
@@ -768,8 +789,9 @@ def test_matrix_concurrent_soft_track_send_409() -> None:
 
 
 def test_matrix_exception_judge_exit_defined_track() -> None:
-    """Exception: a typed judge exit fail-closes to clarify — never a
-    crash, never a silent track (ADR 0080)."""
+    """GE-1: a typed judge exit resolves to a DEFINED track that is
+    ``grounded``/``jev_fallback`` — never a crash, never a silent or
+    unspecified track. The receipt records the typed exit."""
     fake = FakeJevChoice(
         [JevChoiceError("bad schema", exit_code=JEV_CHOICE_EXIT_SCHEMA)]
     )
@@ -777,9 +799,9 @@ def test_matrix_exception_judge_exit_defined_track() -> None:
         [HumanMessage(content="hmm maybe this?")],
         jev_client=fake,
     )
-    assert decision.track == "clarify"
+    assert decision.track == "grounded"
     assert decision.signals.get("jev_exit") == "schema"
-    assert decision.decision_tier == "clarify"
+    assert decision.decision_tier == "jev_fallback"
 
     model = ScriptedChatModel(
         script=[AIMessage(content="Soft reply after judge EXIT.")]
@@ -801,7 +823,9 @@ def test_matrix_exception_judge_exit_defined_track() -> None:
         },
         config=_cfg("ship-exc"),
     )
-    assert out["track"] == "clarify"
+    assert out["track"] == "grounded"
+    assert out["track_decision"]["decision_tier"] == "jev_fallback"
     assert out["track_decision"]["signals"].get("jev_exit") == "schema"
-    assert out["status"] == "done"
-    assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))
+    # No retrieval happened, so the gate bounces the uncited answer.
+    assert out["status"] == "refuse"
+    assert HIDDEN_BOUNCE_MARKER in str(out.get("messages", []))

@@ -15,9 +15,9 @@
 //
 // Credential-free by construction: the server child is started with
 // FIN_SCRIPTED_MODEL=1, which selects the scripted transcript boot in
-// `fin.host.scripted_boot`, and with every provider variable REMOVED
-// from its environment. No network LLM can be reached even on a
-// machine that has FIN_API_KEY exported.
+// `fin.host.scripted_boot`, and with provider credentials/endpoints removed.
+// A synthetic model identity is then supplied for the status surface only;
+// the scripted boot never constructs or calls a provider model.
 //
 // Assertions are not duplicated here: the lane shells out to the T6
 // runner (`scripts/run-stream-checks.mjs`), which owns the checks and
@@ -27,6 +27,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { attachmentBoundsFromExample } from "./lib/attachment-bounds.mjs";
+import { startScriptedSseProxy } from "./lib/scripted-sse-proxy.mjs";
 import {
   REPO_ROOT,
   ensureSpaBuild,
@@ -42,11 +43,13 @@ const RUNNER = path.join(REPO_ROOT, "scripts", "run-stream-checks.mjs");
 
 const EXIT_OK = 0;
 const EXIT_LANE = 2;
+const SCRIPTED_ANSWER_FRAME_DELAY_MS = 225;
+const SCRIPTED_MODEL_IDENTITY = "scripted-test-model";
 
 // Mirrors `fin.host.scripted_boot.SCRIPTED_SCENARIOS`. Validated here
 // too so a typo fails before a server boots rather than as a stack
 // trace in the child's log.
-const SCENARIOS = ["grounded", "bounce"];
+const SCENARIOS = ["grounded", "bounce", "document_choice"];
 
 // Dropped from the server child's environment so the scripted boot
 // cannot be talked out of by a stray provider setting, and so "this
@@ -68,14 +71,28 @@ const PROVIDER_ENV = [
 // naming the key, before a server is booted or a browser is opened.
 const ATTACHMENT_BOUNDS = attachmentBoundsFromExample();
 
+// Which scenario adds which check to the runner's table. Kept as data
+// beside the scenario list rather than as a chain of ternaries at the
+// call site, so the two lists cannot drift: a scenario added to
+// SCENARIOS with no check here would run the whole lane and report
+// nothing about the thing it was built to show.
+const SCENARIO_CHECK_FLAGS = {
+  bounce: ["--expect-bounce"],
+  document_choice: ["--expect-document-choice"],
+};
+
 const USAGE = `Usage: node scripts/run-scripted-e2e.mjs [options]
 
 Options:
   --port=N           serve the workspace here     (default: a free port)
-  --scenario=NAME    scripted transcript: grounded (default) or bounce.
+  --scenario=NAME    scripted transcript: grounded (default), bounce, or
+                     document_choice.
                      \`bounce\` streams an ungrounded draft the citation gate
                      refuses, then the grounded retry, and adds the bounce
                      boundary check to the runner's table.
+                     \`document_choice\` pauses the run on a grounded
+                     document choice and adds the send -> card -> pick ->
+                     resumed-answer check.
   --delta-ms=N       pacing between scripted deltas (env FIN_SCRIPTED_DELTA_MS)
   --poll-count=N     stream poll ticks, 1s each   (forwarded to the runner)
   --browser=NAME     playwright-cli browser       (forwarded to the runner)
@@ -147,6 +164,7 @@ function childEnv(port, deltaMs, scenario) {
   }
   env.FIN_SCRIPTED_MODEL = "1";
   env.FIN_SCRIPTED_SCENARIO = scenario;
+  env.FIN_MODEL = SCRIPTED_MODEL_IDENTITY;
   // `compile_for_scripted_e2e` binds the fake retrieve port, and
   // `GET /api/status` now publishes that BOUND port (`resolve_bound_retrieve_adapter_kind`),
   // so the status payload reads `fake` with or without this variable.
@@ -163,6 +181,48 @@ function childEnv(port, deltaMs, scenario) {
   if (deltaMs !== "") env.FIN_SCRIPTED_DELTA_MS = String(deltaMs);
   env.FIN_E2E_BASE_URL = `http://127.0.0.1:${port}`;
   return { env, dropped };
+}
+
+async function runPacedBrowserChecks(baseUrl, opts) {
+  let sseProxy = null;
+  try {
+    sseProxy = await startScriptedSseProxy({
+      upstreamBaseUrl: baseUrl,
+      answerFrameDelayMs: SCRIPTED_ANSWER_FRAME_DELAY_MS,
+    });
+    log(
+      `browser checks use a test-only proxy that replays completed SSE responses ` +
+        `with ${SCRIPTED_ANSWER_FRAME_DELAY_MS}ms between admitted answer frames`,
+    );
+
+    // Lane defaults first, operator flags after (the runner's last
+    // occurrence wins). The proxy paces only complete, admitted answer
+    // frames after the backend response ends; it does not simulate
+    // provider generation latency or expose an in-flight draft.
+    const checks = await run(
+      process.execPath,
+      [
+        RUNNER,
+        `--base-url=${sseProxy.baseUrl}`,
+        "--poll-interval-ms=200",
+        "--poll-count=250",
+        "--require-stream-growth",
+        ...(SCENARIO_CHECK_FLAGS[opts.scenario] ?? []),
+        ...opts.forwarded,
+      ],
+      { cwd: REPO_ROOT, env: process.env },
+    );
+    if (checks.error) {
+      return fail(`could not start the stream-checks runner: ${checks.error.message}`);
+    }
+    return checks.code ?? EXIT_LANE;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const phase = sseProxy ? "run browser checks" : "start test-only SSE pacing proxy";
+    return fail(`could not ${phase}: ${detail}`);
+  } finally {
+    if (sseProxy) await sseProxy.close();
+  }
 }
 
 async function main(argv) {
@@ -218,37 +278,21 @@ async function main(argv) {
     log("workspace is up — handing the browser checks to run-stream-checks.mjs");
     console.log("");
 
-    // Lane defaults first, operator flags after (the runner's last
-    // occurrence wins). The scripted provider paces its deltas, so
-    // this lane polls fast enough to watch the answer grow and holds
-    // the runner to that stricter contract.
-    const checks = await run(
-      process.execPath,
-      [
-        RUNNER,
-        `--base-url=${baseUrl}`,
-        "--poll-interval-ms=200",
-        "--poll-count=250",
-        "--require-stream-growth",
-        ...(opts.scenario === "bounce" ? ["--expect-bounce"] : []),
-        ...opts.forwarded,
-      ],
-      { cwd: REPO_ROOT, env: process.env },
-    );
-    if (checks.error) {
-      return fail(`could not start the stream-checks runner: ${checks.error.message}`);
-    }
+    const verdict = await runPacedBrowserChecks(baseUrl, opts);
     console.log("");
-    log(`verdict exit code ${checks.code} (server log: ${logPath})`);
-    return checks.code ?? EXIT_LANE;
+    log(`verdict exit code ${verdict} (server log: ${logPath})`);
+    return verdict;
   } finally {
-    if (opts.keepServer) {
-      log(`--keep-server: workspace still serving at ${baseUrl} (pid ${child.pid})`);
-    } else {
-      await stopWorkspace(child);
-      log(`workspace stopped (server log: ${logPath})`);
+    try {
+      if (opts.keepServer) {
+        log(`--keep-server: workspace still serving at ${baseUrl} (pid ${child.pid})`);
+      } else {
+        await stopWorkspace(child);
+        log(`workspace stopped (server log: ${logPath})`);
+      }
+    } finally {
+      await closeLog();
     }
-    await closeLog();
   }
 }
 

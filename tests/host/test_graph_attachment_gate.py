@@ -28,7 +28,7 @@ Contract covered here (spec Boundaries "graph order", plan T2f, ADR 0089):
 Hermetic: ScriptedChatModel + InMemorySaver + a scripted fake service —
 no live store or model transport. The service seam is duck-typed per the
 pinned contract; only the gate's race-catch is type-pinned to
-``fin.host.attachment_prepare``'s not-ready pair.
+``fin.host.attachment.attachment_prepare``'s not-ready pair.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from pydantic import Field
 
 from fin.corpus.extracted import Locator
 from fin.host import EvidenceItem, ScriptedChatModel, compile_graph
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_prepare import (
     AttachmentNotFoundError,
     AttachmentNotReadyError,
 )

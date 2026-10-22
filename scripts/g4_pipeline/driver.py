@@ -873,7 +873,7 @@ def _region_from_box(box: dict[str, object]) -> Any:
 
     The record keeps Docling's bottom-left origin, so ``t`` is the higher edge
     and the product's top-left space is reached by flipping it, the same flip
-    ``src/fin/host/attachment_layout.py`` performs for the same record.
+    ``src/fin/host/attachment/attachment_layout.py`` performs for the same record.
     """
     height = float(box.get("page_height_pt") or 792.0)
     left, right = float(box["l"]), float(box["r"])  # noqa: PLR1702

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from fin.host.task_runtime import (
+from fin.host.task.task_runtime import (
     accept_input,
     archived_task_summaries,
     bounded_input_history,
@@ -21,7 +21,7 @@ from fin.host.task_runtime import (
     is_reconciled,
     reconcile_marker,
 )
-from fin.host.task_runtime_types import (
+from fin.host.task.task_runtime_types import (
     ARCHIVE_LIMIT,
     CHANGE_NECESSARY_CONDITIONS,
     DISPOSITION_AWAIT_REPLY,
@@ -541,6 +541,44 @@ def test_full_state_round_trips_through_its_stored_dict() -> None:
     # promoted back into the listed choices.
     assert stored["pending_question"]["choices"] == ["2022", "2023", OTHER_CHOICE_ID]
     assert TaskRuntimeState.from_state_dict(stored) == full
+
+
+def test_legacy_pending_question_round_trip_is_byte_identical_to_today() -> None:
+    """The document-choice extension adds fields; it must not change what an
+    existing ``task_clarification`` stores.
+
+    Every question this runtime asked before the extension is a
+    ``task_clarification`` with no origin run and no candidate details, so
+    the three new keys must read back as exactly those defaults and the
+    stored dict must stay the pre-extension shape plus those keys — never
+    a fabricated detail or a migrated purpose.
+    """
+    question = PendingQuestion(
+        question_id="q1",
+        task_id="task-9",
+        task_version=3,
+        prompt="Which years?",
+        choices=("2022", "2023"),
+        input_version=4,
+    )
+    stored = question.to_state_dict()
+    assert stored["purpose"] == "task_clarification"
+    assert stored["origin_run_id"] is None
+    assert stored["choice_details"] == []
+    restored = TaskRuntimeState.from_state_dict({"pending_question": stored})
+    # A stored dict WITHOUT the three new keys is the legacy checkpoint the
+    # no-backfill rule names: it must decode to the same question.
+    legacy = TaskRuntimeState.from_state_dict(
+        {
+            "pending_question": {
+                key: value
+                for key, value in stored.items()
+                if key not in {"purpose", "origin_run_id", "choice_details"}
+            }
+        }
+    )
+    assert legacy == restored
+    assert legacy.pending_question == question
 
 
 # ----- the closed failure vocabulary -----

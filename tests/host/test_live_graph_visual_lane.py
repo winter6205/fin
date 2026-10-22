@@ -14,11 +14,11 @@ What is real here
 * ``compile_graph`` — the shipped graph, with ``read_visual_detail`` bound
   exactly as the deployment binds it, and ``_visual_page_raster`` the
   production pypdfium2 renderer drawing the stored original bytes.
-* :class:`~fin.host.attachment_vision.ChatModelVisionAdapter` — the one
+* :class:`~fin.host.attachment.attachment_vision.ChatModelVisionAdapter` — the one
   production vision port, reading ``FIN_MODEL`` / ``FIN_BASE_URL`` /
   ``FIN_API_KEY`` as the deployment does. Every provider call in this module is
   a real request to a real model; there is no fake port anywhere in it.
-* :class:`~fin.host.attachment_store.PostgresAttachmentStore` and
+* :class:`~fin.host.attachment.attachment_store.PostgresAttachmentStore` and
   :class:`~fin.host.thread_store.PostgresThreadStore` on the live
   ``FIN_CHECKPOINT_URL`` — including the T2 ``record_regions`` /
   ``regions`` SQL and its DDL, which no run had executed
@@ -69,21 +69,21 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.parsers._pages import Pypdfium2PageRenderer
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.attachment_budgets import AttachmentBudgets, VisionCallLedger
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_source_read import AttachmentSourceReader
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_budgets import AttachmentBudgets, VisionCallLedger
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_source_read import AttachmentSourceReader
+from fin.host.attachment.attachment_store import (
     ParsedAttachmentUnit,
     PostgresAttachmentStore,
     StoredPageRegion,
 )
-from fin.host.attachment_vision import VisionCallResult
-from fin.host.citation_gate import QUOTABLE_EVIDENCE_KINDS
-from fin.host.evidence_contract import EVIDENCE_SCHEMA_VERSION
+from fin.host.attachment.attachment_vision import VisionCallResult
+from fin.host.grounded.citation_gate import QUOTABLE_EVIDENCE_KINDS
+from fin.host.evidence.evidence_contract import EVIDENCE_SCHEMA_VERSION
 from fin.host.source_scope import SCOPE_ATTACHMENT_NOT_PERMITTED, ScopeRestriction
 from fin.host.state import reset_input_state
 from fin.host.thread_store import PostgresThreadStore
-from fin.host.visual_evidence import (
+from fin.host.evidence.visual_evidence import (
     VISUAL_BUDGET_EXCEEDED,
     VISUAL_CLAIM_FIELDS,
     VISUAL_EVIDENCE_KIND,
@@ -128,22 +128,16 @@ GROUNDED_ASK = "What was AAPL net sales in 2023 Q3?"
 # The provider settings the real deployment reads. The suite-wide hermetic
 # strip in ``tests/conftest.py`` deletes ``FIN_API_KEY`` / ``FIN_MODEL`` /
 # ``FIN_BASE_URL`` from ``os.environ`` at import, BEFORE any test module is
-# imported, so neither this module nor a fixture can read the operator's
-# exported value back out of the environment. The product's own documented
-# key names are therefore resolved here as module constants, and the
-# credential itself is read from a real keyring-free, operator-supplied
-# file that the strip does not touch: ``FIN_LIVE_VISION_ENV_FILE``. A value
-# is never printed, logged, or written to a snapshot — only its presence is
-# reported, and a missing file is blocked evidence, not a fabricated one.
+# imported. This module reads the process snapshot captured before that
+# strip. A value is never printed.
 _VISION_ENV_KEYS = ("FIN_API_KEY", "FIN_MODEL", "FIN_BASE_URL")
 
 
 def _missing_prerequisites() -> list[str]:
     """The real services this module needs, named but never printed.
 
-    Only presence is reported — a value is never echoed, and no ``.env`` file
-    is read here; the operator supplies these through the environment the
-    way the deployment does.
+    Only presence is reported — a value is never echoed. The provider
+    credential is the process variable ``FIN_API_KEY``.
     """
     missing: list[str] = []
     if not (os.environ.get("FIN_CHECKPOINT_URL") or "").strip():
@@ -158,32 +152,18 @@ def _missing_prerequisites() -> list[str]:
     if not (os.environ.get("FIN_OBJECT_STORE_BUCKET") or "").strip():
         missing.append("FIN_OBJECT_STORE_BUCKET")
     if not _vision_settings().get("FIN_API_KEY"):
-        missing.append("the provider credential (see FIN_LIVE_VISION_ENV_FILE)")
+        missing.append("FIN_API_KEY")
     return missing
 
 
 def _vision_settings() -> dict[str, str]:
-    """The real provider settings, from the operator's live-env file.
+    """Provider settings captured before the hermetic strip.
 
-    One ``KEY=value`` per line, the same shape the product's own
-    :func:`~fin.host.operator_env.parse_env_file` reads and the same keys the
-    vision port resolves, so the settings this module uses are the settings
-    the deployment uses. Parsed with the product's parser rather than an ad
-    hoc split, and never echoed: only presence reaches an assertion.
+    Values are never echoed: only presence reaches an assertion.
     """
-    from fin.host.operator_env import parse_env_file
+    from tests.conftest import _PROCESS_SNAPSHOT
 
-    raw = (os.environ.get("FIN_LIVE_VISION_ENV_FILE") or "").strip()
-    if not raw:
-        return {}
-    path = Path(raw)
-    if not path.is_file():
-        return {}
-    return {
-        key: value
-        for key, value in parse_env_file(path.read_text()).items()
-        if key in _VISION_ENV_KEYS
-    }
+    return {key: _PROCESS_SNAPSHOT[key] for key in _VISION_ENV_KEYS if key in _PROCESS_SNAPSHOT}
 
 
 @pytest.fixture(autouse=True)
@@ -224,19 +204,19 @@ def postgres_url() -> str:
 
 @pytest.fixture(scope="module")
 def deployed_bounds() -> dict[str, str]:
-    """The deployed bounds exactly as ``.env.example`` ships them.
+    """The deployed bounds exactly as ``settings.example.yaml`` ships them.
 
-    Read through the product's own parser rather than restated here, so this
-    module can never bless a number the deployment does not carry.
+    Read through the product's settings helper rather than restated here, so
+    this module can never bless a number the deployment does not carry.
     """
-    from fin.host.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
-    from fin.host.operator_env import parse_env_file
+    from fin.host.attachment.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
+    from fin.host.operator_settings import shipped_attachment_bounds
 
-    values = parse_env_file((REPO_ROOT / ".env.example").read_text())
+    values = shipped_attachment_bounds(repo_root=REPO_ROOT)
     # Read the key set from the product's own table, so a fifth bound could
     # not be silently untested here.
     missing = [key for key, _ in _PRODUCT_ENV_BOUNDS if key not in values]
-    assert not missing, f".env.example lost {missing}"
+    assert not missing, f"settings.example.yaml lost {missing}"
     return {key: values[key] for key, _ in _PRODUCT_ENV_BOUNDS}
 
 
@@ -354,7 +334,7 @@ class _LiveService:
         self, store: PostgresAttachmentStore, budgets: AttachmentBudgets
     ) -> None:
         from fin.corpus.object_store import create_object_store
-        from fin.host.attachment_vision import ChatModelVisionAdapter
+        from fin.host.attachment.attachment_vision import ChatModelVisionAdapter
 
         self.store = store
         self.vision = ChatModelVisionAdapter()
@@ -399,7 +379,7 @@ class _RecordingVision:
         reaching into the adapter's private config, so the identity asserted
         here is the one the deployment configures.
         """
-        from fin.host.attachment_vision import resolve_vision_model_config
+        from fin.host.attachment.attachment_vision import resolve_vision_model_config
 
         return resolve_vision_model_config().model_id
 
@@ -445,7 +425,7 @@ class _RecordingRenderer:
 
 
 def _budgets(deployed: dict[str, str]) -> AttachmentBudgets:
-    from fin.host.attachment_budgets import from_environ
+    from fin.host.attachment.attachment_budgets import from_environ
 
     return from_environ(environ=deployed)
 
@@ -538,7 +518,7 @@ class _MintedLedgers:
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import fin.host.attachment_budgets as budgets_module
+        import fin.host.attachment.attachment_budgets as budgets_module
 
         minted: list[VisionCallLedger] = []
         real = budgets_module.VisionCallLedger
@@ -1145,12 +1125,12 @@ def test_a_real_provider_failure_refuses_the_ask_and_charges_the_attempt(
     exception. The lane must refuse with ``vision_call_failed`` and the
     ledger must still show the attempt was spent.
     """
-    from fin.host.attachment_vision import (
+    from fin.host.attachment.attachment_vision import (
         ChatModelVisionAdapter,
         VisionCallFailedError,
         VisionPortError,
     )
-    from fin.host.visual_evidence import VISUAL_PROVIDER_FAILED
+    from fin.host.evidence.visual_evidence import VISUAL_PROVIDER_FAILED
 
     attachment_id = "att-t3-provider"
     _object_key, _payload = _upload(live, attachment_id, "g4-mixed-chart-001.pdf", MIXED_PDF)

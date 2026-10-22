@@ -17,10 +17,9 @@ Contract under test (docs/adr/0044-session-compaction-token-occupancy.md):
 * Eviction writes back through the checkpointer: checkpoint messages
   actually shrink and the checkpoint stays terminal (no resume banner).
 
-Budget override: same trick as ``test_session_compaction_gate.py`` —
-``session_token_budget(1_600)`` so fixtures cross the thresholds
-without 230k-char histories. Verified: the ContextVar propagates
-through starlette's ``TestClient`` into the route handler.
+Budget override: tool schemas and call-scoped host prompts are included,
+so these fixtures use a scaled 12_000-token budget. The ContextVar
+propagates through starlette's ``TestClient`` into the route handler.
 """
 
 from __future__ import annotations
@@ -35,8 +34,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.compaction import _SUMMARY_MARKER
-from fin.host.session_compaction import session_token_budget
+from fin.host.session.compaction import _SUMMARY_MARKER
+from fin.host.session.session_compaction import session_token_budget
 
 
 # Same fixture ids as tests/host/test_workspace_http.py.
@@ -46,7 +45,7 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-TEST_BUDGET = 1_600  # estimated tokens; matches the T1 gate tests
+TEST_BUDGET = 20_000  # leaves room for the bound schemas and a 40% floor
 
 
 # ----- fixtures (mirrors test_workspace_http.py; tests are not a package) -----
@@ -65,13 +64,26 @@ def client(http_app: FastAPI) -> TestClient:
     return TestClient(http_app)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_fin_home(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("FIN_HOME", str(tmp_path / ".fin"))
+
+
 @pytest.fixture
 def fresh_store(http_app: FastAPI):
-    from fin.host.http import get_graph, get_thread_store
+    from fin.corpus.object_store import InMemoryObjectStore
+    from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+    from fin.host.attachment.attachment_store import InMemoryAttachmentStore
+    from fin.host.http import get_attachment_service, get_graph, get_thread_store
     from fin.host.thread_store import InMemoryThreadStore, ThreadStore
 
     store: ThreadStore = InMemoryThreadStore()
+    attachments = AttachmentPreparationService(
+        store=InMemoryAttachmentStore(store),
+        objects=InMemoryObjectStore(),
+    )
     http_app.dependency_overrides[get_thread_store] = lambda: store
+    http_app.dependency_overrides[get_attachment_service] = lambda: attachments
 
     default_graph = compile_graph(
         checkpointer=InMemorySaver(),
@@ -156,12 +168,11 @@ def _fat_history() -> list:
 
 
 def _mid_history() -> list:
-    """~75% occupancy at 1_600 tokens — UNDER the 90% trigger, ABOVE
-    the 40% floor, with an evictable oldest pair."""
-    # pair_old: AI 80 chars (20 tokens) + tool 2_400 chars (600 tokens)
-    old = _tool_pair("old call", "o" * 2_400, "c-old")
-    # pair_new: AI 80 chars (20 tokens) + tool 2_400 chars (600 tokens)
-    new = _tool_pair("new call", "n" * 2_400, "c-new")
+    """A scaled payload under 90% but above the 40% floor with schemas."""
+    # Each pair carries about 2_500 tokens in the tool result. Together
+    # with host overhead, they sit just above the scaled 40% floor.
+    old = _tool_pair("old call", "o" * 10_000, "c-old")
+    new = _tool_pair("new call", "n" * 10_000, "c-new")
     return old + new + [HumanMessage(content="z" * 40)]
 
 
@@ -186,10 +197,16 @@ def _install_compact_graph(
     return g
 
 
-def _seed_checkpoint(g: Any, thread_id: str, messages: list, *, as_node: str = "model") -> None:
+def _seed_checkpoint(
+    g: Any,
+    thread_id: str,
+    messages: list,
+    *,
+    as_node: str = "dialogue",
+) -> None:
     g._graph.update_state(
         {"configurable": {"thread_id": thread_id}},
-        {"messages": messages},
+        {"messages": messages, "track": "grounded"},
         as_node=as_node,
     )
 
@@ -280,6 +297,14 @@ def test_compact_below_trigger_still_compacts_when_gate_produces_update(
     tid = created["id"]
     _seed_checkpoint(g, tid, _mid_history())
     before = _checkpoint_messages(g, tid)
+    state = g._graph.get_state({"configurable": {"thread_id": tid}}).values or {}
+    overhead = g._compaction_overhead_tokens(state)
+    with session_token_budget(TEST_BUDGET):
+        before_occupancy = g._compactor.occupancy(
+            before,
+            overhead_tokens=overhead,
+        )
+    assert 0.40 < before_occupancy < 0.90
 
     status_code, _ct, body = _post_compact(client, tid)
 
@@ -301,6 +326,13 @@ def test_compact_below_trigger_still_compacts_when_gate_produces_update(
         and any(c.get("id") == "c-new" for c in (m.tool_calls or []))
         for m in after
     )
+    state = g._graph.get_state({"configurable": {"thread_id": tid}}).values or {}
+    overhead = g._compaction_overhead_tokens(state)
+    with session_token_budget(TEST_BUDGET):
+        assert g._compactor.occupancy(
+            after,
+            overhead_tokens=overhead,
+        ) <= 0.40
 
 
 def test_compact_trivial_payload_is_noop_receipt(
@@ -354,13 +386,15 @@ def test_compact_summary_failure_is_graceful_receipt_thread_usable(
     # The checkpoint is untouched — no half-written compaction.
     assert _checkpoint_messages(g, tid) == before
 
-    # Thread usable after: an ordinary send still completes.
+    # Thread usable after: an ordinary greeting still completes without
+    # depending on evidence from the previous compacted transcript.
     with session_token_budget(TEST_BUDGET):
         with client.stream(
             "POST",
             f"/api/threads/{tid}/messages",
-            json={"question": "What was AAPL net sales?"},
+            json={"question": "Hi"},
         ) as r:
+            assert r.status_code == 200, r.status_code
             follow_body = "".join(r.iter_text())
     follow_events = _parse_sse_events(follow_body)
     assert any(
@@ -496,6 +530,41 @@ def test_compact_does_not_rewrite_default_title(
 
     detail = client.get(f"/api/threads/{tid}").json()
     assert detail["title"] != "/compact"
+
+
+def test_a_compact_turn_row_has_no_receipt(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """A command is not an accepted answer turn, so it projects no receipt.
+
+    ``/compact`` short-circuits before the send door's receipt begins:
+    it accepts no input, asks no question and runs no model on a turn
+    identity, so its ``fin_run`` row stands alone. The ordinary send
+    beside it DOES get one, which is what keeps this a statement about
+    the command rather than about a receipt that never works.
+    """
+    from fin.host.turn_receipts import default_receipts
+
+    receipts = default_receipts(fresh_store)
+    _install_compact_graph(http_app)
+
+    created = client.post("/api/threads", json={"first_message": ""}).json()
+    tid = created["id"]
+
+    status_code, _ct, body = _post_compact(client, tid)
+    assert status_code == 200
+
+    runs = fresh_store.list_runs(tid)
+    assert [run.question for run in runs] == ["/compact"]
+    compact_run_id = runs[0].id
+    assert receipts.read(tid, compact_run_id) is None
+    assert receipts.store.list_receipts(tid) == ()
+
+    # The send door's own turn, same thread and same store, does project.
+    _post_compact(client, tid, question="研究")
+    answered = fresh_store.list_runs(tid)
+    assert [run.question for run in answered] == ["/compact", "研究"]
+    assert receipts.read(tid, answered[1].id) is not None
 
 
 # ----- the seeded history pairs on the tool the host still exposes -----

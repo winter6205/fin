@@ -5,10 +5,11 @@
 # Prints HTTP status + MiniMax error body but NEVER the key itself.
 # Reads the key from the MINIMAX_TEST_KEY env var (deliberately a
 # distinct name so the script does not silently use the project-owned
-# FIN_API_KEY or anything in your .env).
+# FIN_API_KEY or anything in ~/.fin/settings.yaml).
 #
 # Usage:
 #   MINIMAX_TEST_KEY=sk-... ./scripts/test_minimax_key.sh
+#   MINIMAX_TEST_MODEL=MiniMax-M3.1-Flash ./scripts/test_minimax_key.sh
 #
 # Exit codes:
 #   0  at least one endpoint returned HTTP 200
@@ -27,7 +28,7 @@ fi
 # Local copy in a less-echoed variable. Avoid using $KEY in any
 # command line that ends up in `set -x` output or a transcript.
 K="$MINIMAX_TEST_KEY"
-MODEL="MiniMax-M3"
+MODEL="${MINIMAX_TEST_MODEL:-MiniMax-M3.1-Flash}"
 PROMPT="Reply with one word: ok"
 
 probe() {
@@ -122,7 +123,7 @@ echo "  - 4 OK    → Token Plan 订阅 key on Overseas Anthropic Messages"
 echo
 echo "If ONLY one row returned OK, that is the exact URL+protocol"
 echo "your key is scoped for. Set FIN_BASE_URL to that URL in your"
-echo ".env (without the trailing /chat/completions or /v1/messages)"
+echo "~/.fin/settings.yaml llm.baseUrl (without the trailing /chat/completions or /v1/messages)"
 echo "and fin.host.model_router will pick the right SDK class"
 echo "(ChatOpenAI or ChatAnthropic) automatically."
 echo

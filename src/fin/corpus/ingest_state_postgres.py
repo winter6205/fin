@@ -36,6 +36,7 @@ from fin.corpus.ingest_state_model import (
     coerce_request,
     coerce_state,
     coerce_state_filter,
+    event_audit,
     failure_guard,
     job_created_audit,
     job_superseded_audit,
@@ -342,6 +343,38 @@ class PostgresIngestStateStore:
         except psycopg.Error as exc:
             self._unavailable(document_id, "transitioned", exc)
         return target
+
+    def append_audit(
+        self,
+        document_id: str,
+        action: str,
+        metadata: Mapping[str, Any],
+        *,
+        actor: str | None = None,
+    ) -> IngestAuditRow:
+        """Durably append one state-machine-external event row.
+
+        Same shape as the memory store's: no job column moves, the row
+        is its own committed transaction, and the job must exist — an
+        event about a document no job ever accepted is a bug, and
+        persisting it would let a recovery sweep read a publication
+        history that never had an owner.
+        """
+        validate_document_id(document_id)
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError("action must not be empty")
+        row = event_audit(document_id, action, metadata, actor, utc_now())
+        try:
+            with self._transaction() as connection:
+                # Existence check inside the same transaction: the event
+                # and the proof its job exists commit atomically.
+                self._read_job(connection, document_id)
+                self._insert_audit(connection, row)
+        except psycopg.Error as exc:
+            raise IngestStateStoreUnavailableError(
+                "the ingest audit event could not be appended"
+            ) from exc
+        return row
 
     def supersede_job(
         self,

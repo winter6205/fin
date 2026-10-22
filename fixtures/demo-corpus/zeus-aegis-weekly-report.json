@@ -1,0 +1,20 @@
+{
+  "source_ref": "zeus-aegis-weekly-report",
+  "title": "ZEUS AEGIS Project Weekly Report",
+  "content": "ZEUS AEGIS Project Weekly Report · Page 1\nSection 1: Build and shipment checkpoint\nWeek ending 2024-10-04. The AEGIS pilot build completed 24 gateways against a target of 20. Firmware 4.1.2 passed thermal checks on all 24 units. The logistics team booked the first customer shipment for 2024-10-11. One packaging label correction remains with Operations, due 2024-10-07. Pilot installation follows zeus-aegis-installation, Section 1.",
+  "chunks": [
+    {
+      "content": "ZEUS AEGIS Project Weekly Report · Page 1\nSection 1: Build and shipment checkpoint\nWeek ending 2024-10-04. The AEGIS pilot build completed 24 gateways against a target of 20. Firmware 4.1.2 passed thermal checks on all 24 units. The logistics team booked the first customer shipment for 2024-10-11. One packaging label correction remains with Operations, due 2024-10-07. Pilot installation follows zeus-aegis-installation, Section 1.",
+      "index": 0
+    }
+  ],
+  "metadata": {
+    "document_type": "project_weekly_report",
+    "page_count": 1,
+    "company": "ZEUS",
+    "form": "10-Q",
+    "period": "Week ending 2024-10-04",
+    "filing_date": "2024-10-04"
+  },
+  "valid_from": "2024-10-04T00:00:00Z"
+}

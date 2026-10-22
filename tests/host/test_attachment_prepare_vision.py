@@ -4,10 +4,10 @@ The first preparation of a page document asks the configured vision provider
 exactly one full-page question per physical page — including pages that hold
 no Heron figure box and pages that froze no text unit — charges every
 outbound attempt (failed ones included) against the run's :class:
-`~fin.host.attachment_budgets.VisionCallLedger`, and persists one versioned
+`~fin.host.attachment.attachment_budgets.VisionCallLedger`, and persists one versioned
 observation per page through the attachment store.
 
-The provider is a :class:`~fin.host.attachment_vision.VisionPort` Fake
+The provider is a :class:`~fin.host.attachment.attachment_vision.VisionPort` Fake
 throughout: no network, no credentials, no live model. Expectations come from
 ``plans/thread-attachment-source-read.md`` item 6 (one call per page, the
 80 + 8 + 1 = 89 relationship with the run-wide single retry reserve, the
@@ -41,31 +41,31 @@ from fin.corpus.parsers import (
     Region,
     UnitLocator,
 )
-from fin.host.attachment_budgets import (
+from fin.host.attachment.attachment_budgets import (
     ATTACHMENT_PAGE_LIMIT_EXCEEDED,
     ATTACHMENT_VISION_BUDGET_EXCEEDED,
     AttachmentBudgets,
     VisionCallLedger,
     required_run_calls,
 )
-from fin.host.attachment_observations import (
+from fin.host.attachment.attachment_observations import (
     COVERAGE_SCHEMA_VERSION,
     DetailKey,
     ObservationAttempt,
 )
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_prepare import (
     CHART_PRESENCE_DETAIL,
     AttachmentPreparationError,
     AttachmentPreparationService,
     AttachmentVisionCallFailedError,
     AttachmentVisionEmptyTextError,
 )
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     AttachmentThreadGoneError,
     InMemoryAttachmentStore,
 )
-from fin.host.attachment_vision import (
+from fin.host.attachment.attachment_vision import (
     DEFAULT_MEDIA_TYPE,
     PAGE_SCAN_PROMPT,
     VISION_CALL_FAILED,

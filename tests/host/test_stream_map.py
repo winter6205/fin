@@ -974,7 +974,7 @@ def test_summarize_get_xbrl_fact_non_dict_locator_is_dropped() -> None:
     assert out == "c p = 1"
 
 
-# ----- T1 (#33): token-delta mapping (thinking / answer split) -----
+# ----- T1: token-delta mapping (thinking / answer split) -----
 
 
 def test_reasoning_delta_from_chunk_joins_reasoning_details_texts() -> None:
@@ -1153,7 +1153,7 @@ def test_split_minimax_think_tag_can_span_chunks() -> None:
     assert b.answer == "tail"
 
 
-# ----- T4 (#37): thinking duration clock -----
+# ----- T4: thinking duration clock -----
 
 
 def test_thinking_clock_no_thinking_is_zero() -> None:
@@ -1814,3 +1814,39 @@ def test_inline_block_inside_a_split_channel_run_still_never_leaks() -> None:
     frames = _map_chunks_to_frames(chunks)
     assert _text_of(frames, "thinking") == f"planning. {SECRET}"
     assert _text_of(frames, "answer") == "Net sales rose 8%."
+
+
+def test_provider_refusal_delta_survives_conversion_and_assembly() -> None:
+    model = reasoning_preserving_chat_openai()(
+        model="test-model", api_key="not-a-real-credential"
+    )
+    generated = model._convert_chunk_to_generation_chunk(
+        _raw_chunk({"role": "assistant", "content": "", "refusal": "policy disposition"}),
+        AIMessageChunk,
+        None,
+    )
+    assert generated is not None
+    message = assemble_final_ai_message([generated.message])
+    assert message.additional_kwargs["refusal"] == "policy disposition"
+    assert message.content == ""
+
+
+def test_assembly_preserves_provider_content_filter_disposition() -> None:
+    message = assemble_final_ai_message([
+        AIMessageChunk(content="", response_metadata={"finish_reason": "content_filter"})
+    ])
+    assert message.response_metadata["finish_reason"] == "content_filter"
+
+
+@pytest.mark.parametrize("refusal", [None, "", 0, {}, []])
+def test_converter_does_not_invent_a_refusal(refusal: object) -> None:
+    model = reasoning_preserving_chat_openai()(
+        model="test-model", api_key="not-a-real-credential"
+    )
+    generated = model._convert_chunk_to_generation_chunk(
+        _raw_chunk({"role": "assistant", "content": "ordinary answer", "refusal": refusal}),
+        AIMessageChunk,
+        None,
+    )
+    assert generated is not None
+    assert "refusal" not in generated.message.additional_kwargs

@@ -54,7 +54,7 @@ from fin.corpus.params import (
 )
 from fin.corpus.parsers import PARAMS_TABLE_VERSION, PARSE_RULE_VERSION, parse_document
 from fin.corpus.parsers._common import build_unit
-from fin.host.citation_gate import EvidenceItem, verify_citations
+from fin.host.grounded.citation_gate import EvidenceItem, verify_citations
 from fin.corpus.extracted import Locator
 
 DOCUMENT_ID = "TEST-2023Q1"

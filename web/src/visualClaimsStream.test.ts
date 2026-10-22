@@ -21,9 +21,9 @@ import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToString } from "react-dom/server";
 
-import VisualClaims from "./components/VisualClaims";
+import VisualClaims from "./capabilities/evidence/components/VisualClaims";
 import { useWorkspaceStore } from "./store";
-import { turnVisualClaims } from "./visualClaims";
+import { turnVisualClaims } from "./capabilities/evidence/visualClaims";
 import { mergeReconciledTurn } from "./turnStream";
 import type { Citation, ThreadDetail, Turn, VisualClaim } from "./types";
 

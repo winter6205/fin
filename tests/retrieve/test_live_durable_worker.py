@@ -91,9 +91,10 @@ _FIXTURE = (
 )
 
 _RUN = uuid.uuid4().hex[:10]
-# Per-run unique document id: every source_ref this case pushes is then
-# unaddressable by any other live driver sharing this cluster.
-_DOCUMENT_ID = f"T3-DUR-{_RUN.upper()}"
+# Per-run unique trusted scope: the content-derived document id (and
+# every source_ref this case pushes) is then unaddressable by any other
+# live driver sharing this cluster.
+_SCOPE = f"fin-t3dur-{_RUN}"
 _CHUNK_INDEX = f"fin_t3dur_chunks_{_RUN}"
 _ENTITY_INDEX = f"fin_t3dur_entities_{_RUN}"
 _PG_SCHEMA = f"fin_t3dur_pg_{_RUN}"
@@ -111,6 +112,15 @@ def _dsn() -> str:
     return (
         os.environ.get(_STATE_DSN_ENV) or os.environ.get(_POSTGRES_URL_ENV) or ""
     ).strip()
+
+
+def _document_id(scope: str, data: bytes) -> str:
+    """The public upload's content-derived id, written out longhand."""
+    digest = hashlib.sha256(data).digest()
+    preimage = (
+        b"fin-corpus-document-v1\x00" + scope.encode("utf-8") + b"\x00" + digest
+    )
+    return "doc_" + hashlib.sha256(preimage).hexdigest()
 
 
 def _object_store_pair() -> tuple[str, str]:
@@ -216,7 +226,8 @@ def test_durable_accept_and_worker_push_reaches_ready_on_the_real_service(
     dsn = durable_env
     payload = _FIXTURE.read_bytes()
     version = hashlib.sha256(payload).hexdigest()
-    object_key = f"filings/{_DOCUMENT_ID}/{version}"
+    document_id = _document_id(_SCOPE, payload)
+    object_key = f"filings/{document_id}/{version}"
 
     objects = create_object_store()
     # The real adapter, not a process-local stand-in (same witness as the
@@ -228,12 +239,12 @@ def test_durable_accept_and_worker_push_reaches_ready_on_the_real_service(
         object_store=objects,
         metadata_store=PostgresMetadataStore(dsn),
         state_store=PostgresIngestStateStore(dsn),
+        corpus_scope_id=_SCOPE,
     )
     states = PostgresIngestStateStore(dsn)
     try:
-        submission = endpoint.submit_durable(
-            payload, declared_format="md", document_id=_DOCUMENT_ID
-        )
+        submission = endpoint.submit_durable(payload, declared_format="md")
+        assert submission.document_id == document_id, submission
         assert submission.state is IngestState.PENDING, submission
         assert submission.version == version, submission
         # The accept's byte work is done and ONLY the accept's: one
@@ -241,7 +252,7 @@ def test_durable_accept_and_worker_push_reaches_ready_on_the_real_service(
         assert objects.get(object_key) == payload
 
         worker = IngestWorker(endpoint, journal_dir=tmp_path / "journal")
-        outcome = worker.run_job(_DOCUMENT_ID)
+        outcome = worker.run_job(document_id)
         assert outcome.ran is True, outcome
         assert outcome.busy is False, outcome
         assert outcome.state is IngestState.READY, outcome
@@ -253,12 +264,12 @@ def test_durable_accept_and_worker_push_reaches_ready_on_the_real_service(
         # No re-upload: the run consumed the one accepted object; the key
         # still holds exactly the accepted bytes.
         assert objects.get(object_key) == payload
-        assert states.get_job(_DOCUMENT_ID).state is IngestState.READY
+        assert states.get_job(document_id).state is IngestState.READY
 
         # (3) the persisted authority: content_identities on the
         # cataloging -> ready edge, keyed by the pushed source_refs, each
         # the producing side's formula over the WHOLE envelope body.
-        audit = states.list_audit(_DOCUMENT_ID)
+        audit = states.list_audit(document_id)
         ready_rows = [
             row
             for row in audit
@@ -302,7 +313,7 @@ def test_durable_accept_and_worker_push_reaches_ready_on_the_real_service(
         )
 
         # (5) a second sweep of the ready generation joins, never re-runs.
-        again = worker.run_job(_DOCUMENT_ID)
+        again = worker.run_job(document_id)
         assert again.ran is False and again.state is IngestState.READY, again
     finally:
         states.close()

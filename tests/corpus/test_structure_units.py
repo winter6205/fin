@@ -192,6 +192,8 @@ def test_unknown_form_filter_remains_empty_catalog_result(
                 "version": "a" * 64,
                 "page_count": 1,
                 "form": "10-Q",
+                "title": "Test filing",
+                "doc_type": "narrative",
             }
         ],
         catalog_path=catalog_path,

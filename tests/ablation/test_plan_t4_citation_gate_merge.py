@@ -375,7 +375,7 @@ def test_sc10_citation_gate_still_fills_only_verified_spans_on_done_result() -> 
     gate synthetic ``EvidenceItem`` objects built directly off the
     same locator so the assertion is hermetic and deterministic.
     """
-    from fin.host.citation_gate import (
+    from fin.host.grounded.citation_gate import (
         BounceResult,
         DoneResult,
         EvidenceItem,

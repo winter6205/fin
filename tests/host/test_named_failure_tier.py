@@ -2,7 +2,7 @@
 
 SC9 原始形态是 "``global`` and ``sql`` remain unused: if invoked, named
 未开/未接, no fake SQL retrieve." fin task 4 把 ``global`` 综述开成了真实的
-综述报告 arm; the tracked change T7 (commit 6e8ed97) 把 ``sql`` 真数据库也开成了真实 arm,
+综述报告 arm; T7 (commit 6e8ed97) 把 ``sql`` 真数据库也开成了真实 arm,
 路由期 400 表 (``TIER_UNAVAILABLE_CODE``) 至此清零。不变量随之位移:
 
 * 路由期具名 400 一个都不剩: 点名任何 closed 档 (含 ``sql``) 都启动 run,
@@ -22,7 +22,7 @@ new 409 token would be reported to the operator as 「还有一轮在运行」,
 a false claim (``web/src/api.ts`` sendConflictError).
 
 ``tier_not_open`` 仍是公开 token (closed vocabulary + 具名失败 distinctness
-guard 保留它), 但自 the tracked change T7 起它 NO LONGER has a routing-time producer: the
+guard 保留它), 但自 T7 起它 NO LONGER has a routing-time producer: the
 send door looks the code up in ``TIER_UNAVAILABLE_CODE`` (EMPTY since the
 sql 档 opened), so no closed-set pin can ever yield it again.
 
@@ -48,7 +48,7 @@ from fin.host.named_failures import (
     TIER_UNAVAILABLE_CODE,
     unavailable_tier,
 )
-from fin.host.search_mode_decision import normalize_search_mode
+from fin.host.grounded.search_mode_decision import normalize_search_mode
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.port import resolve_search_mode
 from search_mode_pins import RETIRED_LETTERS
@@ -119,7 +119,7 @@ def test_a_requested_review_tier_is_no_longer_refused() -> None:
 
 
 def test_a_requested_real_db_tier_is_no_longer_refused() -> None:
-    """the tracked change T7 (commit 6e8ed97) flipped this pin: ``sql`` ran its first
+    """T7 (commit 6e8ed97) flipped this pin: ``sql`` ran its first
     real arm, so its row LEFT ``TIER_UNAVAILABLE_CODE`` — naming 真数据库
     at the door routes like graph/lexical/global. The old pin was
     ``unavailable_tier(["sql"]) == "sql"``; the helper now names NOTHING
@@ -208,7 +208,7 @@ def test_community_summary_index_failure_is_not_tier_not_open() -> None:
 
     assert COMMUNITY_SUMMARY_INDEX_FAILURE != TIER_NOT_OPEN
     # It is a runtime not-ready fact, not a routing table entry: the
-    # 档-unavailable map is EMPTY since the tracked change T7 opened sql (the mechanism
+    # 档-unavailable map is EMPTY since T7 opened sql (the mechanism
     # stays for the next plan slot), and the 综述 runtime token is never
     # one of them.
     assert COMMUNITY_SUMMARY_INDEX_FAILURE not in TIER_UNAVAILABLE_CODE
@@ -351,7 +351,7 @@ def test_naming_tier_global_starts_a_run_not_a_refusal(
 def test_naming_tier_sql_starts_a_run_not_a_refusal(
     client: TestClient, store, graph
 ) -> None:
-    """Flipped by the tracked change T7 (commit 6e8ed97): the old pin was a named 400
+    """Flipped by T7 (commit 6e8ed97): the old pin was a named 400
     ``{"error": "real_db_not_wired"}`` fired before the run existed. The
     sql 档 now runs a real arm, so a ``sql`` pin routes exactly like
     global/graph/lexical — 200, SSE, a turn row, and the audit carries
@@ -460,7 +460,7 @@ def test_no_closed_set_pin_is_refused_before_a_run_starts(
 def test_naming_an_open_tier_does_not_refuse(
     tier: str, client: TestClient, store, graph
 ) -> None:
-    """查找、知识问答、综述 and — since the tracked change T7 — 真数据库 ride the ordinary
+    """查找、知识问答、综述 and — since T7 — 真数据库 ride the ordinary
     send path (the run, not a refusal): an open lasting token is never
     档未开."""
     thread_id = _new_thread(client)

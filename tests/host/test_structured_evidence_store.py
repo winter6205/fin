@@ -16,8 +16,8 @@ import uuid
 
 import pytest
 
-from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
-from fin.host.structured_evidence import (
+from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+from fin.host.evidence.structured_evidence import (
     build_stored_record,
     project_stored_structured_evidence,
     structured_snapshots_of,
@@ -27,7 +27,7 @@ from fin.host.thread_store import (
     RunRecord,
     _outgoing_evidence_error,
 )
-from fin.host.structured_snapshot import structured_snapshot_digest
+from fin.host.evidence.structured_snapshot import structured_snapshot_digest
 
 _BASE = {
     "schema": "iknow.structured_result",

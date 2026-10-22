@@ -4,7 +4,7 @@ The four normalization categories (whitespace, Unicode compatibility,
 hyphens, soft line breaks) must all be produced by one outlet —
 ``fin.corpus.normalization.normalize_frozen_text`` — and frozen-unit
 text and chunk text must share it. The citation gate
-(``fin.host.citation_gate``) matches spans verbatim (plain ``in``
+(``fin.host.grounded.citation_gate``) matches spans verbatim (plain ``in``
 substring search, no normalization of its own), so the outlet is the
 compatibility surface: any ≥32-char span a model could quote from a
 chunk must remain a contiguous substring of the frozen unit text with
@@ -21,7 +21,7 @@ from fin.corpus.normalization import (
     NORMALIZATION_RULE_VERSION,
     normalize_frozen_text,
 )
-from fin.host.citation_gate import (
+from fin.host.grounded.citation_gate import (
     DoneResult,
     EvidenceItem,
     verify_citations,

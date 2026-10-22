@@ -17,21 +17,21 @@ live and missing credentials block.
 Same shape as ``tests/host/test_live_jev_track.py``, one tier further
 down the cascade: the closed set is the four LASTING 档 tokens
 (``fin.host.named_failures.LASTING_RETRIEVE_TIERS``) and the seam is
-:func:`fin.host.search_mode_decision.decide_search_mode`.
+:func:`fin.host.grounded.search_mode_decision.decide_search_mode`.
 
 A live judge is not deterministic, so the CONTRACT cases here stay
 value-free: they assert membership of the closed set, a finite confidence
 in [0, 1], the shipped ``question_id`` / ``instructions`` request shape and,
 where the judge does not decide, the fail-closed SHAPE. A judge EXIT
-can only land on **clarify** (it and ``inherit`` are mutually exclusive —
-inherit is peeked before the call), and the residual opens nothing; 具名
-失败 is the other legal outcome, when the judge confidently names an
-unopened 档.
+can only land on the recorded default (**fallback** — it and ``inherit``
+are mutually exclusive: inherit is peeked before the call), and the
+fallback opens nothing; 具名失败 is the other legal outcome, when the judge
+confidently names an unopened 档.
 
 One case is deliberately NOT value-free: the opened-档 leg. What makes it
 assertable despite a non-deterministic judge is the OPENED set plus the
 confidence floor, never a preferred 档 — and that leg is what turns the
-per-档 glosses in :data:`fin.host.search_mode_decision._JEV_MODE_INSTRUCTIONS`
+per-档 glosses in :data:`fin.host.grounded.search_mode_decision._JEV_MODE_INSTRUCTIONS`
 into an asserted product property rather than prompt tuning.
 
 Four live calls total: one raw Choice, then three through the product seam
@@ -54,8 +54,8 @@ from typing import Any
 import pytest
 from langchain_core.messages import HumanMessage
 
-import fin.host.search_mode_decision as smd
-from fin.host.jev_choice import (
+import fin.host.grounded.search_mode_decision as smd
+from fin.host.question.jev_choice import (
     JEV_CHOICE_EXIT_INVALID_LABEL,
     JEV_CHOICE_EXIT_INVALID_SEARCH_MODE,
     JEV_CHOICE_EXIT_LOW_CONFIDENCE,
@@ -66,7 +66,7 @@ from fin.host.jev_choice import (
     JevChoiceClient,
 )
 from fin.host.named_failures import LASTING_RETRIEVE_TIERS, TIER_UNAVAILABLE_CODE
-from fin.host.search_mode_decision import decide_search_mode
+from fin.host.grounded.search_mode_decision import decide_search_mode
 
 # The full EXIT family the 档 cascade records when the judge does not
 # decide, assembled from the exported names so a rename cannot drift this
@@ -186,6 +186,27 @@ def _assert_named_by_judge(decision: Any, *, via: str) -> None:
         assert signals["requested_mode"] == label
         assert decision.failure_code == TIER_UNAVAILABLE_CODE[label]
         assert signals["named_failure"] == decision.failure_code
+    elif tier == "fallback":
+        # The recorded default (ADR 0104): the cascade could not decide, so
+        # it assigned the policy default at 0.0 confidence and opened
+        # NOTHING. The judge's own answer, when it had one, stays on the
+        # audit beside it.
+        assert decision.search_mode == "graph"
+        assert decision.confidence == 0.0
+        assert decision.options == []
+        assert label is None or label in LASTING_RETRIEVE_TIERS
+        # The fallback's own 0.0 is POLICY uncertainty — it never claims to
+        # be the judge's probability, so the judge's number (when it has
+        # one) is what gets recorded, and NaN stands for "no number". A
+        # number that IS there is a real confidence and is validated like
+        # any other: the fallback case is exactly where the judge
+        # answered BELOW the floor, so its number must not pass unproven.
+        if confidence is not None:
+            assert math.isfinite(confidence)
+            assert 0.0 <= confidence <= 1.0
+        recorded = confidence if isinstance(confidence, (int, float)) else math.nan
+        _record(str(label), recorded, tier=str(tier), via=via)
+        return
     else:
         pytest.fail(
             f"unexpected_search_mode_tier: {tier!r} with no recorded exit",
@@ -247,14 +268,18 @@ def _assert_decision_shape(decision: Any, *, via: str) -> None:
         return
 
     # The judge did not decide (unreachable, bad schema, out-of-set or
-    # sub-floor). Then no 档 may be carried: the ban is on a SILENT
-    # global, so the residual opens nothing. A judge EXIT and ``inherit``
-    # cannot co-occur — inherit is peeked before the call and the peek
-    # gets its own copy of the signals — so when the EXIT fired the
-    # cascade had already ruled inherit out: the residual is clarify.
+    # sub-floor). Then the cascade takes the RECORDED DEFAULT (ADR 0104):
+    # the ban is on a SILENT assignment, and the fallback says so on the
+    # audit (tier ``fallback``, the policy default, 0.0 confidence, no
+    # options). A judge EXIT and ``inherit`` cannot co-occur — inherit is
+    # peeked before the call and the peek gets its own copy of the
+    # signals — so when the EXIT fired the cascade had already ruled
+    # inherit out.
     assert exit_code in FAIL_CLOSED_EXITS
-    assert decision.decision_tier == "clarify"
-    assert decision.search_mode is None
+    assert decision.decision_tier == "fallback"
+    assert decision.search_mode == "graph"
+    assert decision.confidence == 0.0
+    assert decision.options == []
     label = signals.get("mode_jev_label")
     if label is not None:
         assert label in LASTING_RETRIEVE_TIERS
@@ -294,15 +319,15 @@ def test_live_second_grounding_utterance_via_product_seam(
     _assert_decision_shape(decision, via="decide_search_mode#2")
 
 
-# The 档 a filing-figure ask may legally land on: the OPENED ones, derived
+# The 档 a document-figure ask may legally land on: the OPENED ones, derived
 # from the availability SSOT (``TIER_UNAVAILABLE_CODE``) rather than spelled
 # out, so this set and the one in
 # ``tests/retrieve/test_live_jev_tier_reaches_wire.py`` cannot drift apart.
 # The derivation is also the warning: once ``global`` or ``D`` opens this set
 # widens HERE, and it then has to be re-examined rather than waved through —
-# the glosses must still keep a figure that lives only in a filing off the
+# the glosses must still keep a figure that lives only in a document off the
 # 真数据库 and off a corpus-wide synthesis.
-_FILING_FIGURE_TIERS = frozenset(
+_OPENED_TIERS = frozenset(
     tier for tier in LASTING_RETRIEVE_TIERS if tier not in TIER_UNAVAILABLE_CODE
 )
 
@@ -310,9 +335,9 @@ _FILING_FIGURE_TIERS = frozenset(
 def test_live_judge_binds_an_opened_tier(jev_live_client: JevChoiceClient) -> None:
     """The required opened-档 leg: the real judge decides this ask.
 
-    Not a shape contract. A ``clarify`` (low confidence / EXIT) or a
+    Not a shape contract. A recorded default (low confidence / EXIT) or a
     ``typed_fail`` on an unopened 档 means the discriminator in the shipped
-    instructions stopped separating a figure that lives only in a filing
+    instructions stopped separating a figure that lives only in a document
     from one that needs a live database, which is exactly the regression the
     bare-label prompt had. Either opened 档 satisfies it — pinning WHICH one
     would be the flaky landmine the rest of this file avoids.
@@ -327,14 +352,14 @@ def test_live_judge_binds_an_opened_tier(jev_live_client: JevChoiceClient) -> No
     confidence = signals.get("mode_jev_confidence")
     decided_an_opened_tier = (
         decision.decision_tier == "jev"
-        and decision.search_mode in _FILING_FIGURE_TIERS
+        and decision.search_mode in _OPENED_TIERS
         and isinstance(confidence, (int, float))
         and confidence >= smd._MIN_JEV_CONFIDENCE
     )
     if not decided_an_opened_tier:
         pytest.fail(
             "jev_live_tier_discriminator_regressed: the real judge must "
-            f"bind an OPENED 档 (one of {sorted(_FILING_FIGURE_TIERS)}) at "
+            f"bind an OPENED 档 (one of {sorted(_OPENED_TIERS)}) at "
             f"or above the floor {smd._MIN_JEV_CONFIDENCE} for "
             f"{GROUNDING_UTTERANCE!r}; observed decision_tier="
             f"{decision.decision_tier!r} label={label!r} "

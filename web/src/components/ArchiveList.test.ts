@@ -33,7 +33,7 @@ import {
   type RestoreDecision,
 } from "../archiveRestore";
 import type { ArchivedTaskSummary } from "../types";
-import { TASK_RUNTIME_REFUSAL_COPY } from "../taskRuntime";
+import { TASK_RUNTIME_REFUSAL_COPY } from "../capabilities/task/taskRuntime";
 
 const THREAD_A = "11111111-1111-4111-8111-111111111111";
 const THREAD_B = "22222222-2222-4222-8222-222222222222";

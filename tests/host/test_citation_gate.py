@@ -37,8 +37,8 @@ from pathlib import Path
 import pytest
 
 from fin.corpus.extracted import Locator
-from fin.host.attachment_observations import PLOTTED_VALUE_KIND
-from fin.host.citation_gate import (
+from fin.host.attachment.attachment_observations import PLOTTED_VALUE_KIND
+from fin.host.grounded.citation_gate import (
     BounceResult,
     COMPANY_KIND,
     Citation,
@@ -1145,6 +1145,7 @@ def test_citation_gate_module_does_not_import_pdfplumber() -> None:
         / "src"
         / "fin"
         / "host"
+        / "grounded"
         / "citation_gate.py"
     )
     _assert_no_pdfplumber(gate_path)

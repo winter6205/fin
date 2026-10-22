@@ -4,7 +4,7 @@ Contract basis: ``specs/thread-attachment-source-read.md`` Boundaries items
 (ready-hit locator, host-validated thread ownership, shared
 ``unknown_locator`` reveal-nothing answer, typed position/locator exits) and
 Success Criteria 4/7/9. Hermetic against
-:class:`fin.host.attachment_store.InMemoryAttachmentStore`, seeded through
+:class:`fin.host.attachment.attachment_store.InMemoryAttachmentStore`, seeded through
 the same doors the preparation tests use (``create`` → ``record_units`` →
 ``put_index`` → ``mark_ready``).
 
@@ -24,15 +24,15 @@ from typing import Any
 
 import pytest
 
-from fin.host.attachment_source_read import (
+from fin.host.attachment.attachment_source_read import (
     ATTACHMENT_KIND,
     AttachmentLocatorError,
     AttachmentSourceLocator,
     AttachmentSourceReader,
     parse_attachment_source_locator,
 )
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     AttachmentStoreError,
     AttachmentThreadGoneError,

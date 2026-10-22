@@ -39,6 +39,7 @@ from fin.retrieve import (
     RetrievePort,
     retrieve,
 )
+from fin.retrieve.port import DocumentScopeEntry, UNSUPPORTED_SOURCE_SCOPE_CODE
 
 
 # ---------- helpers ----------
@@ -764,6 +765,73 @@ def test_small_tree_document_id_filter_restricts_hits(
     )
     assert all(c.source_ref.document_id == "DOC-2023Q1" for c in only_q1["chunks"])
     assert all(c.source_ref.document_id == "DOC-2023Q2" for c in only_q2["chunks"])
+
+
+def test_small_tree_document_scope_filters_by_id_and_version_before_limit(
+    small_tree: tuple[Path, Path],
+) -> None:
+    manifest_path, extracted_root = small_tree
+    tree = load_extracted_tree(
+        manifest_path=manifest_path,
+        extracted_root=extracted_root,
+    )
+    adapter = BM25Adapter(tree)
+
+    result = adapter.retrieve(
+        "revenue",
+        document_scope=(
+            DocumentScopeEntry("DOC-2023Q2", "v2-" + "b" * 60),
+        ),
+        limit=1,
+    )
+
+    assert len(result["chunks"]) == 1
+    assert result["chunks"][0].source_ref.document_id == "DOC-2023Q2"
+    assert result["chunks"][0].source_ref.version == "v2-" + "b" * 60
+
+
+def test_document_scope_and_explicit_id_intersect_without_widening(
+    small_tree: tuple[Path, Path],
+) -> None:
+    manifest_path, extracted_root = small_tree
+    tree = load_extracted_tree(
+        manifest_path=manifest_path,
+        extracted_root=extracted_root,
+    )
+    adapter = BM25Adapter(tree)
+
+    result = adapter.retrieve(
+        "revenue",
+        document_id="DOC-2023Q1",
+        document_scope=(
+            DocumentScopeEntry("DOC-2023Q2", "v2-" + "b" * 60),
+        ),
+    )
+
+    assert result == {"error": UNSUPPORTED_SOURCE_SCOPE_CODE}
+
+
+@pytest.mark.parametrize("search_mode", ["global", "sql"])
+def test_bm25_refuses_modes_that_cannot_enforce_document_scope(
+    small_tree: tuple[Path, Path], search_mode: str
+) -> None:
+    manifest_path, extracted_root = small_tree
+    tree = load_extracted_tree(
+        manifest_path=manifest_path,
+        extracted_root=extracted_root,
+    )
+
+    result = BM25Adapter(tree).retrieve(
+        "revenue",
+        search_mode=search_mode,
+        document_scope=(
+            DocumentScopeEntry("DOC-2023Q1", "v1-" + "a" * 60),
+        ),
+        sql_window_start="2026-01-01",
+        sql_window_end="2026-03-31",
+    )
+
+    assert result == {"error": UNSUPPORTED_SOURCE_SCOPE_CODE}
 
 
 def test_small_tree_index_is_built_once_and_reusable(tmp_path: Path) -> None:

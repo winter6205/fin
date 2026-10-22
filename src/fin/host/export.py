@@ -1,4 +1,4 @@
-"""Thread export: a comparison or citation bundle as a file (T4, the tracked change).
+"""Thread export: a comparison or citation bundle as a file (T4).
 
 Spec Focus 3 / SC6: "one authenticated-to-local GET or POST from the
 thread returns a file body for citations or comparison; missing run ->
@@ -46,18 +46,19 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
 
-from fin.host.citation_gate import (
+from fin.host.grounded.citation_gate import (
     COMPANY_KIND,
     DATABASE_ROW_KIND,
     DATABASE_ROW_SNAPSHOT_KEY,
     QUOTABLE_EVIDENCE_KINDS,
     format_database_row_source_id,
 )
-from fin.host.evidence_contract import _is_integer_value
+from fin.host.evidence.evidence_contract import _is_integer_value
 from fin.host.tools.compare_facts import (
     COMPARISON_SCHEMA,
     COMPARISON_SCHEMA_VERSION,
 )
+from fin.retrieve.mcp_adapter import retrieval_window_of
 from fin.retrieve.source_read import ATTACHMENT_KIND
 
 
@@ -572,20 +573,35 @@ def _bound_citations(
     return list(payload)
 
 
+def _retrieval_window(raw: Any) -> dict[str, str]:
+    """The three window strings copied onto a JSON export, or ``{}``.
+
+    ``{}`` means no window strings. A non-mapping is not that case.
+    A missing attribute never reaches here: the caller defaults it to ``{}``.
+    """
+    if isinstance(raw, Mapping):
+        return retrieval_window_of(raw)
+    raise ExportError(
+        f"retrieval_window must be a mapping, got {type(raw).__name__}"
+    )
+
+
 def _json_body(
     *,
     thread_id: str,
     run_id: Any,
     kind: str,
     payload: Sequence[dict[str, Any]],
+    retrieval_window: Any,
 ) -> str:
-    """The JSON export document: the envelopes under a kind-named key."""
+    """The JSON export document: envelopes plus the run's retrieval window."""
     return json.dumps(
         {
             "thread_id": thread_id,
             "run_id": run_id,
             "kind": kind,
             ("comparisons" if kind == "comparison" else "citations"): payload,
+            "retrieval_window": _retrieval_window(retrieval_window),
         },
         ensure_ascii=False,
         indent=2,
@@ -629,7 +645,11 @@ def build_export(
             filename=f"{stem}.json",
             media_type=_JSON_MEDIA_TYPE,
             body=_json_body(
-                thread_id=thread_id, run_id=run.id, kind=kind, payload=payload
+                thread_id=thread_id,
+                run_id=run.id,
+                kind=kind,
+                payload=payload,
+                retrieval_window=getattr(run, "retrieval_window", {}),
             ),
             run_id=run.id,
         )

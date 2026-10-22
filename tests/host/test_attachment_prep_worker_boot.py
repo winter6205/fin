@@ -25,10 +25,10 @@ from typing import Any
 import pytest
 
 from fin.corpus.object_store import InMemoryObjectStore
-from fin.host.attachment_job_store import InMemoryThreadAttachmentJobStore
-from fin.host.attachment_prepare import AttachmentPreparationService
-from fin.host.attachment_store import InMemoryAttachmentStore
-from fin.host.attachment_prep_worker import (
+from fin.host.attachment.attachment_job_store import InMemoryThreadAttachmentJobStore
+from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+from fin.host.attachment.attachment_store import InMemoryAttachmentStore
+from fin.host.attachment.attachment_prep_worker import (
     ATTACHMENT_PREP_WORKER_THREAD_NAME,
     AttachmentPrepWorker,
     AttachmentPrepWorkerStoppingError,
@@ -189,7 +189,7 @@ def test_failed_drain_is_logged_and_the_loop_keeps_running(
         target=_drain_attachment_queue,
         args=(_FlakyService(), stop, 0.01),
     )
-    with caplog.at_level(logging.ERROR, logger="fin.host.attachment_prep_worker"):
+    with caplog.at_level(logging.ERROR, logger="fin.host.attachment.attachment_prep_worker"):
         thread.start()
         thread.join(timeout=10.0)
 
@@ -198,7 +198,7 @@ def test_failed_drain_is_logged_and_the_loop_keeps_running(
     failure_records = [
         record
         for record in caplog.records
-        if record.name == "fin.host.attachment_prep_worker" and record.exc_info
+        if record.name == "fin.host.attachment.attachment_prep_worker" and record.exc_info
     ]
     assert failure_records
     assert isinstance(failure_records[0].exc_info[1], RuntimeError)

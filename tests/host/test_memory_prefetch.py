@@ -17,7 +17,7 @@ Boundary classes exercised here:
 * exception — bad inputs to the public API raise typed errors.
 
 Coverage is paired with the integration assertion against
-:class:`~fin.host.session_compaction.OccupancyCompactor` so SC24
+:class:`~fin.host.session.session_compaction.OccupancyCompactor` so SC24
 ("prefetch increases the ledger") stays pinned at the unit seam
 without dragging the host graph in (T5 owns host wiring).
 """
@@ -36,7 +36,7 @@ from fin.host.memory_prefetch import (
     select_prefetch,
 )
 from fin.host.memory_store import HOOK_MAX_CHARS, MemoryRow
-from fin.host.session_compaction import OccupancyCompactor, session_token_budget
+from fin.host.session.session_compaction import OccupancyCompactor, session_token_budget
 
 
 def _now() -> datetime:

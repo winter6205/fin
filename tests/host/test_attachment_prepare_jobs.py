@@ -37,14 +37,14 @@ import pytest
 
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.corpus.object_store_errors import UnknownObjectKeyError
-from fin.host.attachment_job_store import InMemoryThreadAttachmentJobStore
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_job_store import InMemoryThreadAttachmentJobStore
+from fin.host.attachment.attachment_prepare import (
     ATTACHMENT_INDEX_UNAVAILABLE,
     ATTACHMENT_NOT_TEXT,
     UNKNOWN_LOCATOR,
     AttachmentPreparationService,
 )
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     InMemoryAttachmentStore,
     PostgresAttachmentStore,
 )
@@ -306,6 +306,86 @@ def test_drain_honours_the_limit() -> None:
     assert len(stack.jobs.incomplete()) == 1
 
 
+# ----- the unresolved-publication count a turn receipt reports -----
+
+
+def test_every_queued_or_failed_publication_counts_once_per_document() -> None:
+    """Documents, not attempts: a retry of one document counts once.
+
+    The receipt's warning count answers "how many of this thread's
+    documents are still not searchable", so a document whose job is
+    queued, running or failed counts, and one that published does not.
+    A second enqueue of the same content joins the SAME job row rather
+    than minting another, which is what keeps a retried document from
+    inflating the count.
+    """
+    stack = _stack()
+    queued = _upload(stack)
+    stack.service.request_preparation(stack.thread_id, queued)
+    failed = _upload(stack, payload=NOT_TEXT_BYTES, filename="binary.bin")
+    stack.service.request_preparation(stack.thread_id, failed)
+    published = _upload(stack, filename="ready.txt")
+    stack.service.prepare(published)
+
+    # Re-asking the same content joins the same job: one document, one row.
+    stack.service.request_preparation(stack.thread_id, queued)
+
+    assert stack.service.drain_attachment_jobs() == 2
+    assert stack.service.unresolved_publication_count(stack.thread_id) == 1
+
+
+def test_a_document_with_no_publication_work_is_not_a_warning() -> None:
+    """An uploaded document nobody has asked to prepare yet is settled.
+
+    The count is about publications that are unresolved, and nothing was
+    asked: a zero here says there is nothing outstanding, not that a
+    measurement was skipped.
+    """
+    stack = _stack()
+    _upload(stack)
+
+    assert stack.service.unresolved_publication_count(stack.thread_id) == 0
+
+
+def test_another_thread_s_unresolved_publication_is_not_this_turn_s() -> None:
+    stack = _stack()
+    mine = _upload(stack)
+    stack.service.request_preparation(stack.thread_id, mine)
+    other = stack.threads.create_thread(title="other")
+    theirs = stack.service.accept(
+        thread_id=other.id, filename="theirs.txt", payload=REVENUE_TEXT
+    ).attachment_id
+    stack.service.request_preparation(other.id, theirs)
+
+    assert stack.service.unresolved_publication_count(stack.thread_id) == 1
+    assert stack.service.unresolved_publication_count(other.id) == 1
+
+
+def test_a_deleted_documents_unresolved_publication_stops_counting() -> None:
+    """A removed document is not a warning about this turn's evidence.
+
+    The row is tombstoned, so its queued job will void on the next drain
+    rather than publish. Counting it would warn the operator about a
+    document the thread no longer has.
+    """
+    stack = _stack()
+    attachment_id = _upload(stack)
+    stack.service.request_preparation(stack.thread_id, attachment_id)
+
+    stack.service.delete_attachment(
+        thread_id=stack.thread_id, attachment_id=attachment_id
+    )
+
+    assert stack.service.unresolved_publication_count(stack.thread_id) == 0
+
+
+def test_a_thread_with_nothing_left_has_no_unresolved_publication() -> None:
+    stack = _stack()
+    other = stack.threads.create_thread(title="empty")
+
+    assert stack.service.unresolved_publication_count(other.id) == 0
+
+
 def test_a_typed_failure_lands_on_row_and_job_not_an_empty_success() -> None:
     stack = _stack()
     attachment_id = _upload(stack, payload=NOT_TEXT_BYTES)
@@ -355,8 +435,8 @@ def test_a_crashed_job_logs_the_originating_exception(caplog: pytest.LogCaptureF
     ``_run_job``'s blanket ``except Exception`` names a typed failure the
     door can still say, but the row's reason is only a code: without the
     exception log, an operator reading ``source_unavailable`` cannot tell
-    a crashed preparation from a storage outage (the exact gap the that pull request
-    live door hit). The record must therefore carry the traceback.
+    a crashed preparation from a storage outage (the exact gap the live
+    door hit). The record must therefore carry the traceback.
     """
     stack = _stack()
     attachment_id = _upload(stack)
@@ -368,7 +448,7 @@ def test_a_crashed_job_logs_the_originating_exception(caplog: pytest.LogCaptureF
     original = stack.service.prepare
     try:
         stack.service.prepare = boom  # type: ignore[method-assign]
-        with caplog.at_level("ERROR", logger="fin.host.attachment_prepare"):
+        with caplog.at_level("ERROR", logger="fin.host.attachment.attachment_prepare"):
             assert stack.service.drain_attachment_jobs() == 1
     finally:
         stack.service.prepare = original  # type: ignore[method-assign]
@@ -376,7 +456,7 @@ def test_a_crashed_job_logs_the_originating_exception(caplog: pytest.LogCaptureF
     crash_records = [
         r
         for r in caplog.records
-        if r.name == "fin.host.attachment_prepare"
+        if r.name == "fin.host.attachment.attachment_prepare"
         and r.exc_info is not None
         and r.exc_info[0] is RuntimeError
     ]
@@ -396,7 +476,7 @@ def test_unreadable_bytes_log_the_store_exception_with_a_traceback(
     The reason is deliberately coarse — a missing key, a dead endpoint,
     and a credentials refusal all publish it — so the store exception is
     the only thing that distinguishes them. This is the leg the live
-    that pull request door hit: a second process with a different bucket claimed
+    the live door hit: a second process with a different bucket claimed
     the job, and the row read as an unexplained storage outage.
     """
     stack = _stack()
@@ -409,7 +489,7 @@ def test_unreadable_bytes_log_the_store_exception_with_a_traceback(
     original = stack.service.objects.get
     try:
         stack.service.objects.get = refuse  # type: ignore[method-assign]
-        with caplog.at_level("ERROR", logger="fin.host.attachment_prepare"):
+        with caplog.at_level("ERROR", logger="fin.host.attachment.attachment_prepare"):
             prepared = stack.service.prepare(attachment_id)
     finally:
         stack.service.objects.get = original  # type: ignore[method-assign]
@@ -419,7 +499,7 @@ def test_unreadable_bytes_log_the_store_exception_with_a_traceback(
     store_records = [
         r
         for r in caplog.records
-        if r.name == "fin.host.attachment_prepare" and r.exc_info is not None
+        if r.name == "fin.host.attachment.attachment_prepare" and r.exc_info is not None
     ]
     assert store_records, [(r.name, r.getMessage()) for r in caplog.records]
     assert any(

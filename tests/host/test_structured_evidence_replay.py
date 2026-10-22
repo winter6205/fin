@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from fin.host.evidence_contract import (
+from fin.host.evidence.evidence_contract import (
     ACCESS_DENIED,
     CONTRACT_REFUSAL_CODES,
     EVIDENCE_EXPIRED,
@@ -32,9 +32,9 @@ from fin.host.evidence_contract import (
     MALFORMED_EVIDENCE_CONTRACT,
     RETRIEVE_UNAVAILABLE,
 )
-from fin.host.structured_evidence import build_stored_record
-from fin.host.structured_evidence_admission import admit_structured_evidence
-from fin.host.structured_evidence_replay import (
+from fin.host.evidence.structured_evidence import build_stored_record
+from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
+from fin.host.evidence.structured_evidence_replay import (
     GRANT_IDENTITY_CONTEXT_TOKENS,
     EvidenceReadPort,
     ReplayedEvidence,
@@ -233,7 +233,7 @@ def test_the_module_imports_no_retrieve_query_port() -> None:
 
     import inspect
 
-    import fin.host.structured_evidence_replay as replay_module
+    import fin.host.evidence.structured_evidence_replay as replay_module
 
     source = inspect.getsource(replay_module)
     imported: set[str] = set()

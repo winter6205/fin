@@ -12,7 +12,7 @@ from typing import Any, Iterable, Sequence
 
 from fin.corpus.extracted import Locator
 from fin.corpus.push import PushRecord
-from fin.host.citation_gate import (
+from fin.host.grounded.citation_gate import (
     DoneResult,
     EvidenceItem,
     RefuseResult,
@@ -245,7 +245,7 @@ def citation_gate_dimension_report() -> dict[str, Any]:
         duplicate_submission=(1, 0, 0),
     )
     report["dimension"] = "citation-gate"
-    report["citation_gate"]["source"] = "fin.host.citation_gate.verify_citations"
+    report["citation_gate"]["source"] = "fin.host.grounded.citation_gate.verify_citations"
     return report
 
 
@@ -281,7 +281,7 @@ def refusal_rate_dimension_report() -> dict[str, Any]:
         duplicate_submission=(1, 0, 0),
     )
     report["dimension"] = "refusal-rate"
-    report["refusal_rate"]["source"] = "fin.host.citation_gate.verify_citations"
+    report["refusal_rate"]["source"] = "fin.host.grounded.citation_gate.verify_citations"
     return report
 
 

@@ -17,7 +17,7 @@
 // structural rather than a promise.
 
 import { parseChoiceWindow } from "./choiceWindow";
-import { parseVisualClaim } from "./visualClaims";
+import { parseVisualClaim } from "./capabilities/evidence/visualClaims";
 import {
   comparisonShapeRefusal,
   hasComparisonEnvelopeKeys,
@@ -159,6 +159,9 @@ const CITATION_KEY_NAMES: readonly string[] = [
   "quote",
   "page",
   "database_row",
+  // Host-minted display metadata on active citations only; persisted
+  // citation rows keep their frozen shape without this field.
+  "section",
 ];
 
 const SNAPSHOT_V0_KEYS: readonly string[] = [
@@ -620,6 +623,26 @@ function rowRefusal(index: number, code: EvidenceRefusalCode): CitationRowDecode
   return { status: "refusal", refusal: refusal(index, code) };
 }
 
+function readDisplaySection(
+  value: Record<string, unknown>,
+  mode: SnapshotReadMode,
+): string | null | undefined {
+  if (!("section" in value)) return undefined;
+  const section = value.section;
+  if (
+    mode !== "emission" ||
+    !isString(section) ||
+    section.trim().length === 0 ||
+    codePoints(section) > 128
+  ) return null;
+  return section;
+}
+
+function citationSectionField(section: string | undefined): { section?: string } {
+  if (section === undefined) return {};
+  return { section };
+}
+
 /** Narrow one wire row to a ``Citation``, or name the refusal.
  *
  * Two generations decode (spec §7), each through its own path: the current
@@ -643,6 +666,8 @@ export function decodeCitationRow(
   mode: SnapshotReadMode = "emission",
 ): CitationRowDecode {
   if (!isRecord(value)) return rowRefusal(index, "malformed_evidence_contract");
+  const section = readDisplaySection(value, mode);
+  if (section === null) return rowRefusal(index, "malformed_evidence_contract");
   for (const key of Object.keys(value)) {
     if (!CITATION_KEY_NAMES.includes(key))
       return rowRefusal(index, "malformed_evidence_contract");
@@ -650,8 +675,8 @@ export function decodeCitationRow(
   const fullShaped =
     CITATION_FULL_KEYS.every((key) => key in value) && !("page" in value);
   return fullShaped
-    ? decodeFullCitationShape(value, index, mode)
-    : decodeV0CitationShape(value, index, mode);
+    ? decodeFullCitationShape(value, index, mode, section)
+    : decodeV0CitationShape(value, index, mode, section);
 }
 
 // The eight keys a current emission states — no defaults are legal here.
@@ -683,6 +708,7 @@ interface CitationSlots {
   display: SourceDisplay;
   filename: string;
   quote: string;
+  section?: string;
   snapshot?: unknown;
 }
 
@@ -701,6 +727,7 @@ function decodeFullCitationShape(
   value: Record<string, unknown>,
   index: number,
   mode: SnapshotReadMode,
+  section: string | undefined,
 ): CitationRowDecode {
   if (!isString(value.kind) || !CITATION_KINDS.includes(value.kind as CitationKind))
     return rowRefusal(index, "unsupported_evidence_contract");
@@ -726,6 +753,7 @@ function decodeFullCitationShape(
       display: value.display as SourceDisplay,
       filename: value.filename as string,
       quote: value.quote as string,
+      ...citationSectionField(section),
       ...(hasMarker ? { snapshot: value.database_row } : {}),
     },
     index,
@@ -737,6 +765,7 @@ function decodeV0CitationShape(
   value: Record<string, unknown>,
   index: number,
   mode: SnapshotReadMode,
+  section: string | undefined,
 ): CitationRowDecode {
   const hasMarker = "database_row" in value;
   let kind: CitationKind;
@@ -799,6 +828,7 @@ function decodeV0CitationShape(
       display: withDefaults.display as SourceDisplay,
       filename: withDefaults.filename as string,
       quote: withDefaults.quote as string,
+      ...citationSectionField(section),
       ...(hasMarker ? { snapshot: value.database_row } : {}),
     },
     index,
@@ -822,7 +852,7 @@ function finishCitation(
   if (kind === "database-row") {
     // The frozen placeholders (§4.4): a record has no page, no ordinal
     // meaning, and no filing behind it.
-    if (display !== "record" || unit !== 1 || document_id !== "" || attachment_id !== "")
+    if (hasInvalidDatabaseRowCitation(slots))
       return rowRefusal(index, "malformed_evidence_contract");
     const snapshot = decodeDatabaseRowSnapshot(slots.snapshot, mode);
     if (snapshot.status === "refusal") {
@@ -850,6 +880,7 @@ function finishCitation(
         display,
         filename,
         quote,
+        ...citationSectionField(slots.section),
         database_row: snapshot.snapshot,
       },
     };
@@ -875,8 +906,28 @@ function finishCitation(
     return rowRefusal(index, "citation_overflow");
   return {
     status: "ok",
-    citation: { kind, document_id, attachment_id, version, unit, display, filename, quote },
+    citation: {
+      kind,
+      document_id,
+      attachment_id,
+      version,
+      unit,
+      display,
+      filename,
+      quote,
+      ...citationSectionField(slots.section),
+    },
   };
+}
+
+function hasInvalidDatabaseRowCitation(slots: CitationSlots): boolean {
+  return (
+    slots.display !== "record" ||
+    slots.unit !== 1 ||
+    slots.document_id !== "" ||
+    slots.attachment_id !== "" ||
+    slots.section !== undefined
+  );
 }
 
 export interface CitationsDecode {
@@ -1101,31 +1152,171 @@ export function mergeEvidenceRefusals(
   return out;
 }
 
-// ----- presentation helpers (visible named-code policy) -----
+// ----- presentation helpers (default view stays readable) -----
 
-/** The indicator line beside the answer: the §6 code verbatim (it IS
- * the contract's name, and the plan's display policy says a precise
- * failure, not prose) plus the 1-based row the operator counts. */
-export function evidenceRefusalRowText(refusalEntry: EvidenceRefusal): string {
-  return `证据被拒绝：${refusalEntry.error}（第 ${refusalEntry.citation_index + 1} 条出处）`;
+/**
+ * Every §6 refusal code as one honest Chinese sentence.
+ *
+ * WHY this table exists: the codes are the CONTRACT's internal names —
+ * they name wire shapes, tool lanes and deployment gaps ("the vision
+ * lane is not wired here"), none of which a reader can act on. The
+ * default view may show neither a code string nor a tool or engine name
+ * (specs/qa-chain-grounded-experience.md, presentation requirements), so
+ * each code maps to a short sentence saying what happened and what to
+ * try, with no invented facts. The map is TOTAL over
+ * ``EVIDENCE_REFUSAL_CODES``: the type below proves at compile time that
+ * a new code cannot ship without a sentence, and the tests assert the
+ * runtime side (a decoded code is always present here).
+ */
+const REFUSAL_COPY: Readonly<Record<EvidenceRefusalCode, string>> = {
+  malformed_evidence_contract: "这条出处没能读出来，请重新提问一次",
+  unsupported_evidence_contract: "这条出处的格式本产品暂不支持，请重新提问一次",
+  citation_overflow: "这一轮引用的出处过多，部分没有显示",
+  visual_claim_overflow: "这一轮图像出处过多，部分没有显示",
+  database_row_overflow: "这一轮记录内容过多，部分没有显示",
+  business_field_overflow: "这一轮明细内容过多，部分没有显示",
+  comparison_overflow: "这一轮对比表内容过多，部分没有显示",
+  corpus_not_ready: "资料仍在整理中，请稍后再试",
+  insufficient_evidence: "资料中未找到足够依据，请换个问法",
+  sql_no_matching_rows: "资料中没有符合条件的记录，请放宽条件再问",
+  sql_query_denied: "这次查询没有获得授权，请换个范围再问",
+  citation_trust_denied: "这条出处没有通过核实，已略去",
+  visual_claim_trust_denied: "这条图像出处没有通过核实，已略去",
+  business_field_trust_denied: "这条明细没有通过核实，已略去",
+  comparison_source_unverified: "对比表有一侧的出处没有核实，已略去",
+  attachment_unavailable: "这份附件现在看不到了，请重新上传",
+  observation_stale: "这条图像出处已经过期，请重新提问一次",
+  visual_lane_unwired: "这项图像查看功能暂时没有开启",
+  retrieve_unavailable: "暂时取不到资料，请稍后重试",
+  persistence_unavailable: "这一轮暂时没能保存，请稍后重试",
+  tier_not_open: "这项检索范围还没有开启，请换个问法",
+  real_db_not_wired: "这份记录来源暂时没有接入",
+  unknown_locator: "这条出处指不到原文的具体位置，已略去",
+  citation_repair_cap: "这条出处核对后仍无法定位，请换个问法",
+};
+
+/** The indicator line beside the answer. ``developerMode`` restores the
+ * §6 code verbatim beside the sentence: the code IS the contract's name
+ * and an operator debugging a producer bug needs it, but it is internal
+ * accounting (specs/demo-seed.md item 6) and stays out of the default
+ * view. The 1-based row number is always shown, because it is what
+ * points at the refused citation. */
+export function evidenceRefusalRowText(
+  refusalEntry: EvidenceRefusal,
+  developerMode = false,
+): string {
+  const copy = REFUSAL_COPY[refusalEntry.error];
+  const code = developerMode ? `（${refusalEntry.error}）` : "";
+  return `这条出处没有采用：${copy}${code}（第 ${refusalEntry.citation_index + 1} 条出处）`;
 }
 
-/** Snapshot identity line (§4.4): which view, which record — values
- * rendered to text, never re-parsed. Opening this shows the stored
- * snapshot and issues NO query; a refresh is a new query minting a new
- * evidence item, which is out of this change's scope. */
-export function databaseRowIdentityLabel(snapshot: DatabaseRowSnapshot): string {
-  const keyText = Object.keys(snapshot.record_key)
-    .sort()
-    .map((key) => `${key}=${snapshotValueText(snapshot.record_key[key])}`)
-    .join(" ");
-  return `来源 ${snapshot.source} · 记录 ${keyText}`;
+/** Snapshot identity line (§4.4), in ordinary-person wording for the
+ * default view: WHICH record, as the reader may recognize it, plus the
+ * time the values were true. The view name and the ``key=value`` record
+ * key are the internal spelling and stay in developer mode.
+ *
+ * Opening this shows the stored snapshot and issues NO query; a refresh
+ * is a new query minting a new evidence item. */
+export function databaseRowIdentityLabel(
+  snapshot: DatabaseRowSnapshot,
+  developerMode = false,
+): string {
+  if (developerMode) {
+    const keyText = Object.keys(snapshot.record_key)
+      .sort()
+      .map((key) => `${key}=${snapshotValueText(snapshot.record_key[key])}`)
+      .join(" ");
+    return `来源 ${snapshot.source} · 记录 ${keyText}`;
+  }
+  return `一条记录 · 数据截至 ${readableQueriedAt(snapshot.queried_at)}`;
 }
 
-/** The retained values this round returned, one ``key: text`` line per
- * field, keys sorted by name (§4.4: sorted, never nested). */
-export function databaseRowFieldLines(snapshot: DatabaseRowSnapshot): string[] {
-  return Object.keys(snapshot.fields)
-    .sort()
-    .map((key) => `${key}: ${snapshotValueText(snapshot.fields[key])}`);
+/** The ledger freshness note, Chinese in the default view. The English
+ * form named a query lifecycle ("a snapshot of that query, not a live
+ * read") that reads as internal accounting; the Chinese keeps the same
+ * honest claim — these are the values as of a moment, not a live read. */
+export function databaseRowFreshnessNote(
+  snapshot: DatabaseRowSnapshot,
+  developerMode = false,
+): string {
+  if (developerMode) {
+    return `as of ${snapshot.queried_at} — a snapshot of that query, not a live read`;
+  }
+  return `数据截至 ${readableQueriedAt(snapshot.queried_at)}，是当时的查询结果，不是实时读取`;
 }
+
+/** ``2026-03-01T09:14:22Z`` as a date an ordinary person reads. A
+ * timestamp the strict decoder could not accept is passed through
+ * verbatim rather than reformatted into a wrong-looking valid date. */
+function readableQueriedAt(queriedAt: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):\d{2}Z$/.exec(queriedAt);
+  return match === null ? queriedAt : `${match[1]}年${match[2]}月${match[3]}日`;
+}
+
+/** The retained values this round returned, one line per field, keys
+ * sorted by name (§4.4: sorted, never nested).
+ *
+ * WHY the default view drops the snake_case column names: a raw
+ * ``contract_id: C-2291`` names an internal schema column, not something
+ * a reader knows. The VALUES are the evidence and stay — a reader can
+ * still check ``C-2291`` against the answer — so this is a label change,
+ * not a removal of what the row proves. Developer mode keeps the column
+ * names so an operator can map a field back to the table it came from. */
+export function databaseRowFieldLines(
+  snapshot: DatabaseRowSnapshot,
+  developerMode = false,
+): string[] {
+  const keys = Object.keys(snapshot.fields).sort();
+  if (developerMode) {
+    return keys.map(
+      (key) => `${key}: ${snapshotValueText(snapshot.fields[key])}`,
+    );
+  }
+  return keys.map((key) => snapshotValueText(snapshot.fields[key]));
+}
+
+// ----- the default-view forbidden-label guard -----
+
+/** Literal fragments that must never reach the default view. Each one is
+ * an internal name a reader cannot act on: a wire field name, a tool
+ * name, a filing format, or the internal component name the sources-list
+ * note used to print. */
+export const FORBIDDEN_DEFAULT_LABELS: readonly string[] = [
+  "document_id",
+  "list_files",
+  "10-Q",
+  "XBRL",
+  "citation gate",
+];
+
+/** A 32-or-more-character run of hex — the shape of a ``version`` digest
+ * (a 64-hex content id, a 64-hex page-image hash). Long enough that no
+ * Chinese copy, filename or ordinary value can match it. */
+const LONG_HEX_RUN = /[0-9a-fA-F]{32,}/;
+
+/** A ``key=value`` or ``key: value`` pair whose key is a snake_case
+ * identifier — the raw record-key / column spelling the wire carries.
+ * A Chinese phrase contains no underscore, so this cannot fire on
+ * ordinary copy. */
+const SNAKE_RECORD_KEY = /\b[a-z][a-z0-9]*(_[a-z0-9]+)+\s*[=:]/;
+
+/** The visible strings one rendering produced. A caller passes every
+ * string a reader could see — labels, refusals, notes — and gets back
+ * the fragments it must not contain.
+ *
+ * WHY a guard rather than a review: the default view is assembled from
+ * several surfaces (source labels, ledger details, refusal notices), and
+ * a leak is only detectable where all of them are looked at together. */
+export function forbiddenDefaultLabels(texts: readonly string[]): string[] {
+  const found: string[] = [];
+  for (const text of texts) {
+    for (const fragment of FORBIDDEN_DEFAULT_LABELS) {
+      if (text.includes(fragment)) found.push(fragment);
+    }
+    const hex = LONG_HEX_RUN.exec(text);
+    if (hex !== null) found.push(hex[0]);
+    if (SNAKE_RECORD_KEY.test(text)) found.push(SNAKE_RECORD_KEY.exec(text)![0]);
+  }
+  return found;
+}
+

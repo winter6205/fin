@@ -79,6 +79,18 @@ OBJECT_STORE_URL_ENV = "FIN_OBJECT_STORE_URL"
 OBJECT_STORE_ENDPOINT_ENV = "FIN_OBJECT_STORE_ENDPOINT"
 OBJECT_STORE_BUCKET_ENV = "FIN_OBJECT_STORE_BUCKET"
 DOC = "0000320193-24-000006"
+# The trusted scope every public accept in this module uses. The
+# document id is derived from it plus the content digest.
+SCOPE = "fin-durable-restart"
+
+
+def _document_id(scope: str, data: bytes) -> str:
+    """The public upload's content-derived id, written out longhand."""
+    digest = hashlib.sha256(data).digest()
+    preimage = (
+        b"fin-corpus-document-v1\x00" + scope.encode("utf-8") + b"\x00" + digest
+    )
+    return "doc_" + hashlib.sha256(preimage).hexdigest()
 
 # Two committed renderings of one accession: real filing bytes, different
 # content, therefore two distinct ``(document_id, version)`` generations.
@@ -92,10 +104,9 @@ V2_SOURCE = _MD_DIR / "0000320193-24-000006__narrative__md__md.md"
 # gold payload the thread-attachment door reads back) and the 57,547-byte
 # table-dense Markdown rendering of a real 10-K.
 _GOLD_PDF = REPO_ROOT / "data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf"
-GOLD_PDF_DOC = "g4-mixed-chart-001"
-BYTE_CASES: tuple[tuple[Path, str, str, str], ...] = (
-    (_GOLD_PDF, "pdf", GOLD_PDF_DOC, "application/pdf"),
-    (V1_SOURCE, "md", DOC, "text/markdown"),
+BYTE_CASES: tuple[tuple[Path, str, str], ...] = (
+    (_GOLD_PDF, "pdf", "application/pdf"),
+    (V1_SOURCE, "md", "text/markdown"),
 )
 # Named by what makes each case evidence, not by an arbitrary index.
 BYTE_CASE_IDS = ("binary-pdf-35324-bytes", "real-filing-markdown-57547-bytes")
@@ -115,17 +126,17 @@ from fin.retrieve.fake_push_port import FakePushPort
 
 dsn = os.environ["FIN_RESTART_DSN"]
 data = Path(sys.argv[1]).read_bytes()
-doc = sys.argv[2]
+scope = sys.argv[2]
 states = PostgresIngestStateStore(dsn)
 endpoint = IngestEndpoint(
     push_port=FakePushPort(),
     object_store=InMemoryObjectStore(),
     metadata_store=PostgresMetadataStore(dsn),
     state_store=states,
+    corpus_scope_id=scope,
 )
-submission = endpoint.submit_durable(
-    data, declared_format="md", document_id=doc
-)
+submission = endpoint.submit_durable(data, declared_format="md")
+doc = submission.document_id
 for state in ("fetching", "extracting", "cataloging", "ready"):
     states.transition(doc, state, actor="child-worker")
 print(json.dumps({
@@ -215,7 +226,7 @@ from fin.retrieve.fake_push_port import FakePushPort
 
 dsn = os.environ["FIN_RESTART_DSN"]
 data = Path(sys.argv[1]).read_bytes()
-doc, fmt = sys.argv[2], sys.argv[3]
+scope, fmt = sys.argv[2], sys.argv[3]
 # The product's own selector: with no endpoint or bucket configured this
 # raises ObjectStoreNotConfiguredError instead of quietly degrading, so the
 # case cannot be satisfied by a process-local store.
@@ -227,8 +238,9 @@ submission = IngestEndpoint(
     object_store=objects,
     metadata_store=pointers,
     state_store=states,
-).submit_durable(data, declared_format=fmt, document_id=doc)
-pointer = pointers.get_pointer(doc).object
+    corpus_scope_id=scope,
+).submit_durable(data, declared_format=fmt)
+pointer = pointers.get_pointer(submission.document_id).object
 print(json.dumps({
     "pid": os.getpid(),
     "adapter": type(objects).__name__,
@@ -429,7 +441,7 @@ def _run_child(program: str, *args: str, dsn: str) -> dict[str, Any]:
         pytest.fail(f"child printed no JSON: {_redact(completed.stdout)!r}")
 
 
-def _reader(dsn: str, document_id: str = DOC) -> dict[str, Any]:
+def _reader(dsn: str, document_id: str) -> dict[str, Any]:
     """A fresh process reading the persisted ingest state back."""
     report = _run_child(_READBACK_CHILD, document_id, dsn=dsn)
     assert int(report["pid"]) != os.getpid(), report
@@ -443,13 +455,14 @@ def _parent_service(url: str) -> IngestEndpoint:
         object_store=InMemoryObjectStore(),
         metadata_store=PostgresMetadataStore(url),
         state_store=PostgresIngestStateStore(url),
+        corpus_scope_id=SCOPE,
     )
 
 
-def _pointer_expectation(payload: bytes) -> dict[str, Any]:
+def _pointer_expectation(document_id: str, payload: bytes) -> dict[str, Any]:
     version = hashlib.sha256(payload).hexdigest()
     return {
-        "object_key": f"filings/{DOC}/{version}",
+        "object_key": f"filings/{document_id}/{version}",
         "sha256": version,
         "size_bytes": len(payload),
         "content_type": "text/markdown",
@@ -468,31 +481,36 @@ def test_a_job_accepted_here_is_read_by_a_fresh_process(
     stores from the DSN and reads the row, the pointer and the status door.
     """
     payload = V1_SOURCE.read_bytes()
+    document_id = _document_id(SCOPE, payload)
     submission = _parent_service(clean_tables).submit_durable(
-        payload, declared_format="md", document_id=DOC
+        payload, declared_format="md"
     )
+    assert submission.document_id == document_id
     assert submission.state is IngestState.PENDING
 
-    report = _reader(clean_tables)
+    report = _reader(clean_tables, document_id)
 
     assert report["job"] == {
-        "document_id": DOC,
+        "document_id": document_id,
         "state": "pending",
         "error_type": None,
         "error_message": None,
     }, report
-    assert report["pointer"] == _pointer_expectation(payload), report
+    assert report["pointer"] == _pointer_expectation(document_id, payload), report
     # The poller's own door, in the second process, names the accepted
     # version rather than a constant.
     assert report["status"] == {
-        "job_id": DOC,
-        "document_id": DOC,
+        "job_id": document_id,
+        "document_id": document_id,
         "version": submission.version,
         "state": "pending",
         "text_ready": False,
     }, report
-    assert report["job_documents"] == [DOC], report
-    assert [row["action"] for row in report["audit"]] == ["job_created"], report
+    assert report["job_documents"] == [document_id], report
+    assert [row["action"] for row in report["audit"]] == [
+        "job_created",
+        "upload_metadata_accepted",
+    ], report
 
 
 def test_a_ready_generation_written_by_another_process_is_readable_here(
@@ -506,23 +524,27 @@ def test_a_ready_generation_written_by_another_process_is_readable_here(
     generation that reached readiness.
     """
     payload = V1_SOURCE.read_bytes()
-    written = _run_child(_ACCEPT_TO_READY_CHILD, str(V1_SOURCE), DOC, dsn=clean_tables)
+    document_id = _document_id(SCOPE, payload)
+    written = _run_child(
+        _ACCEPT_TO_READY_CHILD, str(V1_SOURCE), SCOPE, dsn=clean_tables
+    )
     assert int(written["pid"]) != os.getpid(), written
+    assert written["document_id"] == document_id, written
     assert written["accepted_state"] == "pending", written
     assert written["state"] == "ready", written
     assert written["version"] == written["sha256"] == hashlib.sha256(
         payload
     ).hexdigest(), written
 
-    report = _reader(clean_tables)
+    report = _reader(clean_tables, document_id)
 
     assert report["job"] == {
-        "document_id": DOC,
+        "document_id": document_id,
         "state": "ready",
         "error_type": None,
         "error_message": None,
     }, report
-    assert report["pointer"] == _pointer_expectation(payload), report
+    assert report["pointer"] == _pointer_expectation(document_id, payload), report
     assert report["status"]["version"] == written["version"], report
     assert report["status"]["text_ready"] is True, report
     # The row that opened this generation was written by the exited child,
@@ -534,6 +556,7 @@ def test_a_ready_generation_written_by_another_process_is_readable_here(
         for row in report["audit"]
     ] == [
         ("job_created", None, "pending"),
+        ("upload_metadata_accepted", None, None),
         ("transition", "pending", "fetching"),
         ("transition", "fetching", "extracting"),
         ("transition", "extracting", "cataloging"),
@@ -544,81 +567,94 @@ def test_a_ready_generation_written_by_another_process_is_readable_here(
 # ----- replacement of a ready source, seen by the second reader -------
 
 
-def test_a_replacement_of_a_ready_source_reopens_pending_for_a_fresh_reader(
+def test_changed_bytes_are_a_separate_document_not_a_replacement(
     clean_tables: str,
 ) -> None:
-    """Spec ``:113`` + ``:150``: a new ``pending`` generation, the prior one
-    still recorded as terminal ``ready``, and never two live versions.
+    """A changed file is another public document.
 
-    Generation 1 is written and readied by a child process, the replacement
-    accept is made here through the product door, and a third process reads
-    the whole story back.
+    The same trusted scope plus different bytes is a different identity,
+    so the ready generation keeps its job and pointer while the second
+    upload opens its own ``pending`` job. ``ready`` therefore stays
+    terminal for both; nothing is superseded. Generation one is written
+    and readied by a child process and a third process reads both
+    documents back.
     """
     first_payload = V1_SOURCE.read_bytes()
+    first_document_id = _document_id(SCOPE, first_payload)
     first_version = hashlib.sha256(first_payload).hexdigest()
     first = _run_child(
-        _ACCEPT_TO_READY_CHILD, str(V1_SOURCE), DOC, dsn=clean_tables
+        _ACCEPT_TO_READY_CHILD, str(V1_SOURCE), SCOPE, dsn=clean_tables
     )
+    assert first["document_id"] == first_document_id, first
     assert first["state"] == "ready", first
 
     # ``ready`` is terminal: no lifecycle edge leaves it. Asserted before the
-    # replacement, from a store instance the writer never touched.
+    # second upload, from a store instance the writer never touched.
     states = PostgresIngestStateStore(clean_tables)
     with pytest.raises(IllegalTransitionError):
-        states.transition(DOC, IngestState.FETCHING)
+        states.transition(first_document_id, IngestState.FETCHING)
 
     second_payload = V2_SOURCE.read_bytes()
+    second_document_id = _document_id(SCOPE, second_payload)
     second_version = hashlib.sha256(second_payload).hexdigest()
+    assert second_document_id != first_document_id
     assert second_version != first_version
     submission = _parent_service(clean_tables).submit_durable(
-        second_payload, declared_format="md", document_id=DOC
+        second_payload, declared_format="md"
     )
+    assert submission.document_id == second_document_id
     assert submission.state is IngestState.PENDING
     assert submission.version == second_version
     states.close()
 
-    report = _reader(clean_tables)
+    report = _reader(clean_tables, second_document_id)
 
-    # The reopened generation, as a fresh reader sees it.
+    # The new document's own pending generation, as a fresh reader sees it.
     assert report["job"]["state"] == "pending", report
-    assert report["job"]["document_id"] == DOC, report
-    assert report["pointer"] == _pointer_expectation(second_payload), report
+    assert report["job"]["document_id"] == second_document_id, report
+    assert report["pointer"] == _pointer_expectation(
+        second_document_id, second_payload
+    ), report
     assert report["status"] == {
-        "job_id": DOC,
-        "document_id": DOC,
+        "job_id": second_document_id,
+        "document_id": second_document_id,
         "version": second_version,
         "state": "pending",
         "text_ready": False,
     }, report
-    # One document, one live job row: replacement created no second logical
-    # version coexisting with the first.
-    assert report["job_documents"] == [DOC], report
+    # Two documents, each with one live job row: the second accept did
+    # not reopen or supersede the first.
+    assert report["job_documents"] == sorted(
+        [first_document_id, second_document_id]
+    ), report
 
-    rows = report["audit"]
-    # The prior generation remains recorded as having reached ``ready``, and
-    # it left that state through no transition — only the settled replacement
-    # event, which names the version it superseded.
-    assert [
-        (row["action"], row["from_state"], row["to_state"])
-        for row in rows[-3:]
-    ] == [
-        ("transition", "cataloging", "ready"),
-        ("transition_rejected", "ready", "fetching"),
-        ("job_superseded", "ready", "pending"),
-    ], rows[-3:]
-    supersede = rows[-1]
-    assert supersede["metadata"] == {"superseded_version": first_version}, rows
+    # The prior generation is untouched by the second accept.
+    prior = _reader(clean_tables, first_document_id)
+    assert prior["job"]["state"] == "ready", prior
+    assert prior["pointer"] == _pointer_expectation(
+        first_document_id, first_payload
+    ), prior
+    assert prior["status"]["version"] == first_version, prior
     assert not [
-        row
-        for row in rows
-        if row["action"] == "transition" and row["from_state"] == "ready"
-    ], rows
-    # Each audit row names the process that wrote it: generation one belongs
-    # to the child that accepted it, the reopened generation to this one.
-    assert rows[0]["action"] == "job_created", rows
-    assert rows[0]["actor"].endswith(f"pid={first['pid']}"), rows
-    assert f"pid={os.getpid()}" not in rows[0]["actor"], rows
-    assert supersede["actor"].endswith(f"pid={os.getpid()}"), rows
+        row for row in prior["audit"] if row["action"] == "job_superseded"
+    ], prior["audit"]
+    # The row that opened generation one belongs to the exited child, not
+    # to this reader or to the second accept.
+    assert prior["audit"][0]["action"] == "job_created", prior["audit"]
+    assert prior["audit"][0]["actor"].endswith(f"pid={first['pid']}"), prior
+    assert f"pid={os.getpid()}" not in prior["audit"][0]["actor"], prior
+    transitions = [
+        row for row in prior["audit"] if row["action"] == "transition"
+    ]
+    assert transitions[-1]["to_state"] == "ready", prior["audit"]
+    # The only audit row after readiness is the refused escape above, which
+    # the durable store records under its own action.
+    rejected = [
+        row for row in prior["audit"] if row["action"] == "transition_rejected"
+    ]
+    assert [(row["from_state"], row["to_state"]) for row in rejected] == [
+        ("ready", "fetching")
+    ], prior["audit"]
 
 
 def test_the_pinned_vocabulary_makes_ready_terminal() -> None:
@@ -686,7 +722,7 @@ def test_the_durable_store_reopens_a_ready_generation_as_pending(
 
 
 @pytest.mark.parametrize(
-    "source, declared_format, document_id, content_type",
+    "source, declared_format, content_type",
     BYTE_CASES,
     ids=list(BYTE_CASE_IDS),
 )
@@ -695,7 +731,6 @@ def test_original_bytes_are_read_by_a_fresh_process_from_the_configured_store(
     configured_object_store: str,
     source: Path,
     declared_format: str,
-    document_id: str,
     content_type: str,
 ) -> None:
     """The leg the job-row cases above deliberately could not claim.
@@ -722,6 +757,7 @@ def test_original_bytes_are_read_by_a_fresh_process_from_the_configured_store(
     """
     payload = source.read_bytes()
     version = hashlib.sha256(payload).hexdigest()
+    document_id = _document_id(SCOPE, payload)
     # Derived before any write: the key is identity-based, so the case can name
     # the only object it owns (and delete it) even if the accept dies halfway.
     object_key = f"filings/{document_id}/{version}"
@@ -735,7 +771,7 @@ def test_original_bytes_are_read_by_a_fresh_process_from_the_configured_store(
         written = _run_child(
             _ACCEPT_ON_REAL_BYTES_CHILD,
             str(source),
-            document_id,
+            SCOPE,
             declared_format,
             dsn=clean_tables,
         )

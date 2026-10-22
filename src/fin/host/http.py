@@ -1,11 +1,11 @@
-"""The v1 host HTTP surface (T9 + workspace T1, #28).
+"""The v1 host HTTP surface (T9 + workspace T1).
 
 A thin FastAPI app on top of the SAME compiled graph object the CLI
 uses (ADR 0013 / spec success criteria item 8). Two route families
 sit on this app:
 
 * ``POST /ask`` — sync invoke, JSON in / JSON out. v1 eval surface.
-* ``/api/threads/...`` — workspace surface (T1, #28): thread CRUD,
+* ``/api/threads/...`` — workspace surface (T1): thread CRUD,
   message send, corpus list. See ``fin.host.workspace_http``.
 
 Both route families share the SAME compiled graph proxy (the v1
@@ -13,7 +13,7 @@ durable graph object) and the SAME thread-store implementation.
 
 Sync ``invoke`` only — never ``ainvoke`` (ADR 0015 / spec). The
 prod runtime composer (``compile_for_runtime``) is T8's
-responsibility; this module lazy-imports it inside
+responsibility; the application boundary lazy-imports it inside
 ``compile_for_http`` so it is not a module-load dependency.
 
 No auth, no streaming on ``/ask`` (workspace routes stream per ADR
@@ -24,11 +24,12 @@ server over the shared graph.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import uuid
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -36,16 +37,32 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field, model_serializer
 
 from fin.corpus.errors import IngestMissingError
-from fin.host.attachment_budgets import AttachmentBudgets, from_environ
-from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
-from fin.host.graph import ConcurrentRunError, KnowledgeMCPFaultError, compile_graph
+# The application boundary owns the composition. The transport reaches it
+# through the module (so the owner is what runs) and re-exports the
+# public names other callers already import from here.
+from fin.host.application import composition
+from fin.host.application.composition import (
+    attachment_budgets,
+    compile_for_http,
+    http_runtime_handle,
+    startup_steps,
+)
+from fin.host.application.lifetime import (
+    ApplicationResources,
+    StartupSteps,
+)
+from fin.host.attachment.attachment_budgets import AttachmentBudgets
+from fin.host.grounded.citation_gate import HIDDEN_BOUNCE_MARKER
+from fin.host.graph import ConcurrentRunError, KnowledgeMCPFaultError
 from fin.host.knowledge_mcp import (
     KNOWLEDGE_MCP_FAULT_ERROR,
     KNOWLEDGE_MCP_FAULT_MESSAGE,
-    publish_knowledge_mcp,
 )
-from fin.host.operator_env import apply_dotenv
-from fin.host.run_payload import _run_to_response_payload
+from fin.host.run_control import RunAdmissionError, RunControl
+from fin.host.run_payload import (
+    _run_to_response_payload,
+    citation_sections_from_evidence,
+)
 from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.thread_store import default_thread_store
 from fin.host.filing_monitor import default_filing_monitor
@@ -59,7 +76,7 @@ logger = logging.getLogger(__name__)
 # Hidden bounce marker the gate stamps on internal SystemMessages
 # (T6 / ADR 0021). Defensive: HTTP serialization must NEVER leak
 # this string into the response body. The literal lives in
-# ``fin.host.citation_gate`` (SSOT) — imported here so a rename
+# ``fin.host.grounded.citation_gate`` (SSOT) — imported here so a rename
 # touches one file.
 _HIDDEN_BOUNCE_MARKER = HIDDEN_BOUNCE_MARKER
 
@@ -109,6 +126,10 @@ class CitationSchema(BaseModel):
     display: str
     filename: str = ""
     quote: str
+    # A display-only label derived by the host from the matched
+    # EvidenceItem's trusted full unit text. It is never accepted from a
+    # model citation claim and is omitted when unavailable.
+    section: str | None = None
     # The retained snapshot a ledger citation opens; ``None`` for the two
     # document kinds.
     database_row: dict[str, Any] | None = None
@@ -124,8 +145,11 @@ class CitationSchema(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler: Any) -> Any:
         out = handler(self)
-        if isinstance(out, dict) and out.get("database_row") is None:
-            out.pop("database_row", None)
+        if isinstance(out, dict):
+            if out.get("database_row") is None:
+                out.pop("database_row", None)
+            if out.get("section") is None:
+                out.pop("section", None)
         return out
 
 
@@ -155,110 +179,33 @@ class AskResponse(BaseModel):
 # ----- factory -----
 
 
-# Module-level singleton cache for the prod runtime composer (T8).
-# Test calls into ``compile_for_http`` with explicit ``checkpointer``
-# + ``model`` bypass this cache entirely and rely on
-# ``compile_graph``'s built-in idempotence (T6 LRU keyed on
-# ``id(checkpointer) + id(model) + ...``).
-_http_graph_singleton: Any | None = None
-_http_singleton_lock = threading.Lock()
-
 # The memory port owns a Postgres pool when memory is ON, so it is built
 # once per process too (see ``get_memory_port``).
 _http_memory_singleton: Any | None = None
 _http_memory_lock = threading.Lock()
 
-# The deployed attachment bounds are read once per process: they are
-# deployment configuration, which cannot change under a running server,
-# and reading them at boot is what makes an unusable bound abort the
-# startup instead of the first upload (see ``get_attachment_budgets``).
-_http_attachment_budgets_singleton: AttachmentBudgets | None = None
-_http_attachment_budgets_lock = threading.Lock()
-
-
-def compile_for_http(
-    *,
-    checkpointer: Any | None = None,
-    model: Any | None = None,
-    **kwargs: Any,
-) -> Any:
-    """Build / return the v1 HTTP compiled graph.
-
-    See ``compile_graph`` for the underlying factory. The HTTP-side
-    helper exists so the prod runtime composer (T8) can be cached
-    at module level when the CLI / HTTP process boots once.
-
-    Production path (``checkpointer=None``, ``model=None``)
-    lazy-imports T8's ``compile_for_runtime`` and caches the
-    resulting graph. A missing ``FIN_CHECKPOINT_URL`` raises
-    ``MissingCheckpointURLError`` — there is no InMemorySaver
-    fallback (ADR 0015). Tests pass explicit ``checkpointer`` +
-    ``model`` args and bypass this path entirely.
-
-    ``FIN_SCRIPTED_MODEL`` (T7) selects the scripted-provider boot
-    for the browser e2e lane instead. It is an explicit operator
-    opt-in checked BEFORE the provider path — never a fallback
-    reached by a missing credential or an absent checkpoint URL.
-    """
-    if checkpointer is None and model is None:
-        global _http_graph_singleton
-        with _http_singleton_lock:
-            if _http_graph_singleton is None:
-                from fin.host.compile import compile_for_runtime
-                from fin.host import scripted_boot
-
-                if scripted_boot.scripted_boot_requested():
-                    _http_graph_singleton = (
-                        scripted_boot.compile_for_scripted_e2e()
-                    )
-                    return _http_graph_singleton
-                # T2f durable graph gate: the production boot wires the
-                # process's attachment service so the grounded route
-                # gains the preparation interrupt. The RESOLVER is
-                # passed, not the built service: construction waits
-                # until the compile actually happens, so a boot that
-                # raises on a missing URL or a patched factory never
-                # pays an attachment-store or database construction.
-                _http_graph_singleton = compile_for_runtime(
-                    attachment_service=default_attachment_service,
-                    # Forwarded, and only on this branch, because this is the
-                    # PRODUCT path: without it ``serve()``'s configured Evidence
-                    # identity would reach a factory that drops it and the
-                    # retrieve leg would silently stay unbound. ``None`` when no
-                    # identity was configured, which is this call unchanged.
-                    evidence=kwargs.get("evidence"),
-                )
-            return _http_graph_singleton
-    return compile_graph(
-        checkpointer=checkpointer,
-        model=model,
-        **kwargs,
-    )
-
 
 # ----- app + dependency -----
 
 
-app = FastAPI(
-    title="fin v1 host agent",
-    version="0.1.0",
-    description=(
-        "Thin POST /ask + workspace routes over the v1 host graph "
-        "(ADR 0013, ADR 0026)."
-    ),
-)
-
-
-def get_graph() -> Any:
+def get_graph(request: Request = cast(Request, None)) -> Any:
     """FastAPI dependency that returns the compiled graph.
 
     Tests override this via ``app.dependency_overrides[get_graph]``
     to inject a graph built with ``InMemorySaver`` +
     ``ScriptedChatModel`` (no live LLM, no Postgres). Production
-    boots the runtime composer once and reuses the singleton
-    via ``compile_for_http``.
+    returns the graph owned by the serving application's lifespan. A
+    direct legacy call without a request still uses ``compile_for_http``.
     """
-    return compile_for_http()
+    if request is not None:
+        resources = getattr(request.app.state, "fin_resources", None)
+        graph = None if resources is None else resources.graph
+        if graph is not None:
+            return graph
+    # EXIT: direct legacy calls and consumers before a live app lifespan
+    # retain the historical process compiler fallback. The application
+    # boundary owns that compile, so the call goes through it.
+    return composition.compile_for_http()
 
 
 def get_thread_store() -> Any:
@@ -285,21 +232,21 @@ def get_attachment_budgets() -> AttachmentBudgets:
     """FastAPI dependency that returns the deployed attachment bounds.
 
     One instance per process, read through
-    :func:`fin.host.attachment_budgets.from_environ` — the module that
+    :func:`fin.host.attachment.attachment_budgets.from_environ` — the module that
     owns the four bounds and their validation. Missing, non-positive, or
     unbounded values raise ``AttachmentBudgetConfigError`` here, so a
     server that cannot state its own upload cap fails at boot rather
     than serving an unbounded door.
 
+    The instance belongs to the application boundary
+    (:func:`fin.host.application.composition.attachment_budgets`), so
+    the boot seam and this dependency share one answer.
+
     Tests override this via
     ``app.dependency_overrides[get_attachment_budgets]`` to re-deploy a
     smaller cap without shipping megabytes through the test process.
     """
-    global _http_attachment_budgets_singleton
-    with _http_attachment_budgets_lock:
-        if _http_attachment_budgets_singleton is None:
-            _http_attachment_budgets_singleton = from_environ(environ=os.environ)
-        return _http_attachment_budgets_singleton
+    return composition.attachment_budgets()
 
 
 def get_memory_port() -> Any:
@@ -326,7 +273,7 @@ def get_memory_port() -> Any:
 def get_watchlist_store() -> Any:
     """FastAPI dependency that returns the watchlist / notice store.
 
-    T4 workflow (the tracked change). Location comes from ``FIN_WATCHLIST_PATH``
+    T4 workflow. Location comes from ``FIN_WATCHLIST_PATH``
     (default ``data/workspace/watchlist.json``); tests override this
     to point at a tmp path. Separate from the thread store because a
     watchlist is operator preference, not turn presentation state.
@@ -377,27 +324,15 @@ def get_observability_collector() -> ObservabilityCollector:
     return default_collector()
 
 
-# Mount the workspace routes (T1, #28) on the same FastAPI app.
-# Done at module load so ``uvicorn fin.host.http:app`` exposes the
-# workspace surface out of the box (spec / ADR 0013 / ADR 0024).
+# The workspace routes (T1), the health door and the demo
+# controls are mounted by ``create_app`` below, which every application
+# — the deployed one and any second instance in one process — goes
+# through, so no mount can exist without the ownership that goes with
+# it.
 # Wave A (spec SC8 / ADR 0049): ``get_workspace_root`` is re-exported
 # under its own name so tests can override the seam in one place
 # (``app.dependency_overrides[get_workspace_root]``) for both the
 # ``/ask`` route and the workspace send / resume routes.
-
-# The operator's structured-evidence identity (P2-I2). Imported at module load
-# like the workspace block below it: it adds nothing to this module's import
-# surface (``fin.host.graph`` already pulls the evidence session machinery), and
-# ``serve()`` must be able to name the loader when it reads the boot config.
-from fin.host.evidence_session_registry import (  # noqa: E402
-    EvidenceSessionBinding,
-    EvidenceSessionRegistry,
-)
-from fin.host.structured_evidence_identity import (  # noqa: E402
-    StructuredEvidenceIdentity,
-    StructuredEvidenceIdentityConfigError,
-    load_structured_evidence_identity,
-)
 from fin.host.workspace_http import (  # noqa: E402
     _visual_claims_wire_payload,
     default_attachment_service,
@@ -405,47 +340,38 @@ from fin.host.workspace_http import (  # noqa: E402
     mount as _mount_workspace_routes,
     start_attachment_prep_worker,
     start_attachment_resume_worker,
-    start_invalidation_drain_worker,
     start_ingest_worker,
-    stop_attachment_prep_worker,
-    stop_attachment_resume_worker,
-    stop_invalidation_drain_worker,
-    stop_ingest_worker,
+    start_invalidation_drain_worker,
 )
 
-_get_workspace_root = get_workspace_root
-
-_mount_workspace_routes(
-    app,
-    get_graph=get_graph,
-    get_thread_store=get_thread_store,
-    get_attachment_service=get_attachment_service,
-    get_attachment_budgets=get_attachment_budgets,
-    get_watchlist_store=get_watchlist_store,
-    get_memory_port=get_memory_port,
-    get_filing_monitor=get_filing_monitor,
-    get_feedback_store=get_feedback_store,
-    get_observability_collector=get_observability_collector,
-    get_workspace_root=_get_workspace_root,
-)
-
-# ``GET /health`` (the tracked change, SC9): checkpoint reachability, separate from
+# ``GET /health`` (SC9): checkpoint reachability, separate from
 # the boot-scoped ``GET /api/status`` (ADR 0033). Mounted before
 # ``mount_spa`` below so the SPA catch-all cannot shadow it.
 from fin.host.health import mount as _mount_health_route  # noqa: E402
 
-_mount_health_route(app)
+# ``GET /api/threads/{id}/turns/{id}/receipt``: the developer view of one
+# turn's operational receipt. Its own route, mounted before ``mount_spa``
+# below so the SPA catch-all cannot shadow it, and built over the same
+# ``get_thread_store`` dependency so a test's override redirects it.
+from fin.host.receipts_http import mount as _mount_receipt_routes  # noqa: E402
 
-# Mount the built SPA (``web/dist``) if it exists - see the
-# ``mount_spa(app)`` call below (after the function is defined).
-# Same-origin per spec; a missing dist leaves the API routes
-# untouched so tests and API-only boots are unaffected.
+# ``GET /api/threads/{id}/turns/{id}/spans``: the developer trace view of
+# one turn. It reports the exporter selection this boot RESOLVED (the same
+# value the export worker starts from) and answers a normal 200 with no
+# spans when tracing was never on. Mounted before ``mount_spa`` for the
+# same reason as the receipt view.
+from fin.host.trace_spans_http import mount as _mount_trace_span_routes  # noqa: E402
+
+# Demo controls are registered after the product API routes and before the
+# SPA catch-all, so the static fallback cannot hide their JSON responses.
+from fin.host.demo_http import mount as _mount_demo_routes  # noqa: E402
+
+_get_workspace_root = get_workspace_root
 
 
 # ----- exception handlers -----
 
 
-@app.exception_handler(ConcurrentRunError)
 async def concurrent_run_handler(request: Request, exc: ConcurrentRunError) -> JSONResponse:
     """Map ``ConcurrentRunError`` → 409 with
     ``{"error": "concurrent_run"}``.
@@ -461,7 +387,6 @@ async def concurrent_run_handler(request: Request, exc: ConcurrentRunError) -> J
     return JSONResponse(status_code=409, content={"error": "concurrent_run"})
 
 
-@app.exception_handler(KnowledgeMCPFaultError)
 async def knowledge_mcp_fault_handler(
     request: Request, exc: KnowledgeMCPFaultError
 ) -> JSONResponse:
@@ -482,7 +407,6 @@ async def knowledge_mcp_fault_handler(
     )
 
 
-@app.exception_handler(IngestMissingError)
 async def ingest_missing_handler(request: Request, exc: IngestMissingError) -> JSONResponse:
     """Map ``IngestMissingError`` → 503 with
     ``{"error": "ingest_missing"}``.
@@ -500,7 +424,6 @@ async def ingest_missing_handler(request: Request, exc: IngestMissingError) -> J
 # ----- the route -----
 
 
-@app.post("/ask", response_model=AskResponse)
 def ask(
     body: AskRequest,
     graph: Any = Depends(get_graph),
@@ -520,7 +443,7 @@ def ask(
     * ``refuse`` → empty ``answer`` + empty ``citations``;
       ``reason`` = ``status_reason``. The vocabulary is not
       re-listed here: ``fin.host.named_failures`` owns the 具名失败
-      codes and ``fin.host.citation_gate`` owns its own verdicts.
+      codes and ``fin.host.grounded.citation_gate`` owns its own verdicts.
     * ``step_cap`` → empty ``answer`` + empty ``citations``;
       ``reason`` = ``"step_cap"``.
 
@@ -575,7 +498,23 @@ def ask(
         status=payload["status"],
         answer=payload["answer"],
         citations=[
-            CitationSchema(**cit) for cit in payload["citations"]
+            CitationSchema(
+                **{
+                    **citation,
+                    **(
+                        {"section": section}
+                        if section is not None
+                        else {}
+                    ),
+                }
+            )
+            for citation, section in zip(
+                payload["citations"],
+                citation_sections_from_evidence(
+                    payload["citations"], raw.get("evidence")
+                ),
+                strict=True,
+            )
         ],
         thread_id=thread_id,
         reason=payload["reason"] or None,
@@ -586,12 +525,12 @@ def ask(
 # ----- SPA mount + uvicorn runner -----
 
 
-# Module-level guard so the SPA is mounted at most once even
-# when both the import-time call and ``serve()`` would otherwise
-# try to register the catch-all twice (Starlette raises
-# ``AssertionError: Prefix must not end with ...`` on a duplicate
-# path). Set inside ``mount_spa``; checked before mounting.
-_spa_mounted: bool = False
+# The idempotence guard lives on the APP, not on this module: two
+# applications in one process are two servers, and a process-global
+# guard silently left the second one with neither ``/assets`` nor the
+# catch-all — and no warning, because the early return came before the
+# missing-dist check.
+_SPA_MOUNTED = "fin_spa_mounted"
 
 
 def mount_spa(app: FastAPI, dist_path: str | None = None) -> None:
@@ -605,9 +544,10 @@ def mount_spa(app: FastAPI, dist_path: str | None = None) -> None:
     hundred KB) and FastAPI's StaticFiles is sufficient. No auth
     or caching headers — the operator runs this server locally.
 
-    Mounting is idempotent: a second ``mount_spa`` call on the
-    same app is a no-op (the module-level ``_spa_mounted`` flag
-    short-circuits before Starlette sees a duplicate path).
+    Mounting is idempotent PER APP: a second ``mount_spa`` call on the
+    same app is a no-op (the app's own flag short-circuits before
+    Starlette sees a duplicate path, which it rejects), while a second
+    app in the same process mounts its own.
 
     Missing dist: the API surface still serves, but the operator
     MUST see a WARNING — silent API-only mode on a server that
@@ -626,8 +566,7 @@ def mount_spa(app: FastAPI, dist_path: str | None = None) -> None:
 
     from fastapi.staticfiles import StaticFiles
 
-    global _spa_mounted
-    if _spa_mounted:
+    if app.state.__dict__.get(_SPA_MOUNTED):
         return
 
     if dist_path is None:
@@ -652,7 +591,7 @@ def mount_spa(app: FastAPI, dist_path: str | None = None) -> None:
         )
         return  # SPA not built yet — API routes still serve.
 
-    _spa_mounted = True
+    setattr(app.state, _SPA_MOUNTED, True)
     resolved_dist = dist.resolve()
 
     app.mount("/assets", StaticFiles(directory=str(dist / "assets")), name="assets")
@@ -693,9 +632,105 @@ def mount_spa(app: FastAPI, dist_path: str | None = None) -> None:
         return FileResponse(dist / "index.html")
 
 
-# Register the SPA catch-all AFTER every API route so ``/api/*``
-# and ``/ask`` win on path conflicts.
-mount_spa(app)
+
+# ----- application construction -----
+
+
+def create_app(
+    *,
+    steps: Callable[[], StartupSteps] | None = None,
+    process_count: int | None = None,
+    run_control: RunControl | None = None,
+) -> FastAPI:
+    """Build one fin server: routes, mounts, and the resources it owns.
+
+    Construction acquires nothing. It wires the same dependency functions
+    every caller already overrides — ``get_graph``, ``get_thread_store``
+    and the rest keep their identity, so ``app.dependency_overrides``
+    keeps working — and hands the app a lifespan that owns composition,
+    worker supervision and shutdown (``ApplicationResources``). That
+    ordering is why importing this module starts no worker and opens no
+    connection.
+
+    The ``RunControl`` created here is the ONE registry the mounted
+    workspace routes answer Stop against and the one the attachment
+    auto-resumer registers its runs in; a background run the operator
+    cannot stop is not a background run they can be told about.
+
+    ``steps`` replaces the deployed boot seams — a complete set already
+    permits a real lifespan with no model, database or operator
+    settings — and ``process_count`` states the server-process count a
+    caller already knows. Nothing else is injectable: production passes
+    neither, and a seam that only a test can set is not a seam. The
+    owned resources are published as ``app.state.fin_resources``.
+
+    Construction never refuses a deployment: a count other than one is
+    refused at BOOT, as the first thing the lifespan does, so importing
+    this module from a request path cannot raise.
+    """
+    resources = ApplicationResources(
+        build_steps=(
+            steps
+            if steps is not None
+            else partial(
+                composition.startup_steps, declared_process_count=process_count
+            )
+        ),
+        run_control=run_control,
+    )
+    app = FastAPI(
+        title="fin v1 host agent",
+        version="0.1.0",
+        description=(
+            "Thin POST /ask + workspace routes over the v1 host graph "
+            "(ADR 0013, ADR 0026)."
+        ),
+        lifespan=resources.lifespan,
+    )
+    app.state.fin_resources = resources
+    app.exception_handler(ConcurrentRunError)(concurrent_run_handler)
+    # An admission refusal and a lost lock race are the same operator
+    # fact — this thread already has a run — so they answer the same 409
+    # rather than teaching the SPA a second code for one condition.
+    app.exception_handler(RunAdmissionError)(concurrent_run_handler)
+    app.exception_handler(KnowledgeMCPFaultError)(knowledge_mcp_fault_handler)
+    app.exception_handler(IngestMissingError)(ingest_missing_handler)
+    app.post("/ask", response_model=AskResponse)(ask)
+    _mount_workspace_routes(
+        app,
+        get_graph=get_graph,
+        get_thread_store=get_thread_store,
+        get_attachment_service=get_attachment_service,
+        get_attachment_budgets=get_attachment_budgets,
+        get_watchlist_store=get_watchlist_store,
+        get_memory_port=get_memory_port,
+        get_filing_monitor=get_filing_monitor,
+        get_feedback_store=get_feedback_store,
+        get_observability_collector=get_observability_collector,
+        get_workspace_root=_get_workspace_root,
+        run_control=resources.run_control,
+    )
+    _mount_health_route(app)
+    # The developer receipt and trace views read stores the workspace
+    # routes write to, and are mounted before the SPA catch-all for the
+    # same reason health is.
+    _mount_receipt_routes(app, get_thread_store=get_thread_store)
+    _mount_trace_span_routes(app)
+    _mount_demo_routes(app)
+    # LAST: the SPA catch-all matches every remaining path, so it has to
+    # be registered after ``/ask``, the workspace API, health and the
+    # demo controls or it would shadow them.
+    mount_spa(app)
+    return app
+
+
+# The deployed server. ``uvicorn fin.host.http:app`` and ``fin-serve``
+# both resolve here; the module-level object starts nothing until its
+# lifespan runs.
+app = create_app()
+
+
+# ----- uvicorn runner -----
 
 
 def serve() -> None:
@@ -706,122 +741,29 @@ def serve() -> None:
     module stays importable in environments without the runtime
     (tests, --help, etc.).
 
-    NOTE: the SPA is mounted at module import time, NOT here.
-    Re-calling ``mount_spa`` from ``serve`` was previously
-    guarded only by the dist-existence check, which is a
-    false idempotent (a second call would re-register the
-    catch-all). The module-level ``_spa_mounted`` flag
-    short-circuits the second call correctly.
+    Thin on purpose: the boot order, the rollback and the shutdown order
+    live in the app's lifespan, and this only starts it, binds, and stops
+    it again. Starting it HERE rather than letting the bind do it keeps
+    the failure posture: operator settings, the attachment bounds, the
+    ingest-storage preflight, the knowledge-MCP probe, the compile and
+    the four workers all run before the socket exists, so a deployment
+    with no ``FIN_CHECKPOINT_URL`` — or with a bound it cannot state —
+    refuses the boot instead of the first request.
 
-    ``apply_dotenv`` runs first so ``FIN_*`` from a local ``.env``
-    are in ``os.environ`` before compile. Explicit process env
-    still wins.
-
-    The attachment bounds are read next, BEFORE anything is published,
-    compiled, or bound: the upload door takes its cap from them, so a
-    boot that cannot name a finite, positive byte budget fails here
-    rather than serving a door with no bound.
-
-    The retrieve preflight runs on the assembled env, before
-    uvicorn binds. The host graph compiles at this same moment:
-    a missing ``FIN_CHECKPOINT_URL`` must fail boot, not the
-    first ``/ask``.
+    The app object is passed rather than the ``"fin.host.http:app"``
+    import string: this function has already started that very
+    lifespan, and an import string would resolve a second, separately
+    constructed module. No reload or worker mode is used, so the two
+    spellings differ only in when the module is imported.
     """
-    apply_dotenv()
-    get_attachment_budgets()
-    # The corpus ingest door answers ``accepted`` only for bytes, pointers and
-    # job rows that outlive this process, so its storage is resolved here,
-    # before anything is published, compiled, or bound: a deployment that
-    # configured neither a durable store nor an explicit
-    # ``FIN_CORPUS_INGEST_STORE=memory`` is refused instead of serving a door
-    # that forgets uploads on restart.
-    # Lazy so the ingest storage modules (and their database drivers) stay
-    # off this module's import surface for tests and ``--help``.
-    from fin.corpus.ingest_storage import preflight_ingest_storage
-
-    preflight_ingest_storage()
-    # T1 (workbench retrieve seam): probe the knowledge MCP with a real
-    # ``initialize`` + ``tools/list`` handshake and publish 缺 / 坏 / 可达
-    # into the in-process snapshot the status route and the conversation
-    # gate share. A missing / unhealthy MCP is a WARNING (logged inside
-    # ``publish_knowledge_mcp``) — never a boot failure.
-    publish_knowledge_mcp()
-    # P2-I2: the Evidence identity is operator configuration, read here — after
-    # ``apply_dotenv``, so a ``.env`` is part of the boot — and INJECTED into the
-    # compile rather than defaulted inside it (ADR B1: no process-level fallback,
-    # no default scope). An unconfigured host keeps the pre-P2-I2 graph: the bare
-    # call below is the only answer that host ever takes, so nothing about its
-    # behaviour, its logging, or its zero-argument ``compile_for_http`` shape
-    # changes. A configured one gets a session registry plus the resolver that
-    # hands out that identity, which is the pair ``compile_graph`` demands.
-    #
-    # A MISCONFIGURED identity is reported and the host still boots. Refusing to
-    # start would mean a half-filled .env takes fin down entirely to fix an
-    # optional subsystem, and ``load_jev_config`` — the precedent this module
-    # follows — never raises for a value it is willing to default. Serving without
-    # the identity leaves structured evidence unavailable, which is a degradation
-    # the operator is told about, not a stale-read hazard.
-    try:
-        identity: StructuredEvidenceIdentity | None = load_structured_evidence_identity()
-    except StructuredEvidenceIdentityConfigError as exc:
-        logger.warning("structured evidence identity is misconfigured; serving without it: %s", exc)
-        identity = None
-    if identity is None:
-        graph = compile_for_http()
-    else:
-        # Lazy for the same reason ``preflight_ingest_storage`` is: the launch
-        # command is ``fin.host.compile``'s, and this module does not import it
-        # at load time. It is the same iknow server every other MCP adapter in
-        # this repo spawns, so the Evidence read rides the corpus the retrieve
-        # leg is already talking to.
-        from fin.host.compile import DEFAULT_MCP_COMMAND
-
-        graph = compile_for_http(
-            evidence=EvidenceSessionBinding(
-                sessions=EvidenceSessionRegistry(
-                    DEFAULT_MCP_COMMAND,
-                    transport_env=identity.child_storage_env(),
-                ),
-                resolve=identity.resolver(),
-            )
-        )
-    # The durable ingest queue's execution side starts here, once per
-    # process: the drain does a startup sweep (queued/failed/interrupted
-    # jobs resume from durable state, no re-upload) and then re-checks
-    # on a bounded interval. Lazy by construction — importing this
-    # module for tests or ``--help`` never acquires the thread.
-    start_ingest_worker()
-    # T2f durable graph gate, boot side: the prep drain runs the
-    # preparation jobs the graph gate queues, and the auto-resumer
-    # drives the runs those gates paused — its startup sweep is what
-    # resumes waiting runs after a restart without an operator resend.
-    # Same posture as the ingest drain above: singletons, daemon
-    # threads, started before binding, stopped in ``finally`` (in
-    # reverse: no new resume is driven once the prep drain is gone).
-    attachment_service = default_attachment_service()
-    start_attachment_prep_worker(attachment_service)
-    start_attachment_resume_worker(
-        graph=graph,
-        store=default_thread_store(),
-        service=attachment_service,
-        workspace_root=get_workspace_root(),
-    )
-    # The evidence invalidation drain's cadence (spec: "drains at least once
-    # per minute while online"). Started last and stopped first, the
-    # reverse-order posture the workers above establish: every other writer
-    # is already running when its first sweep goes out, and no drain begins
-    # once the store it scrubs is going away. A no-op until P3's producer
-    # binds the transport.
-    start_invalidation_drain_worker(store=default_thread_store())
+    resources: ApplicationResources = app.state.fin_resources
+    resources.startup()
     import uvicorn
 
     try:
-        uvicorn.run("fin.host.http:app", host="0.0.0.0", port=8000, log_level="info")
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
     finally:
-        stop_invalidation_drain_worker()
-        stop_attachment_resume_worker()
-        stop_attachment_prep_worker()
-        stop_ingest_worker()
+        resources.shutdown()
 
 
 __all__ = [
@@ -830,6 +772,7 @@ __all__ = [
     "CitationSchema",
     "app",
     "compile_for_http",
+    "create_app",
     "get_attachment_budgets",
     "get_attachment_service",
     "get_feedback_store",
@@ -838,6 +781,8 @@ __all__ = [
     "get_observability_collector",
     "get_thread_store",
     "get_watchlist_store",
+    "http_runtime_handle",
     "mount_spa",
     "serve",
+    "startup_steps",
 ]

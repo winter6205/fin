@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import os
 import threading
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
@@ -84,6 +85,14 @@ DEGRADATION_STAGES: Final[frozenset[str]] = frozenset(
 # Operator-set path for the persisted record. Unset (or blank) keeps the
 # ledger in memory, which is the default test suite's shape.
 DEGRADATION_LOG_ENV: Final[str] = "FIN_DEGRADATION_LOG"
+
+# The wire bounds on one degradation envelope (spec
+# qa-chain-corpus-retrieval §"Result, error, readiness, and degradation
+# wire"): one to sixteen reason strings, each at most 256 UTF-8 bytes
+# without control characters. A violation is a malformed envelope — the
+# named protocol failure, never an undegraded result.
+DEGRADED_REASON_MAX_BYTES: Final[int] = 256
+DEGRADED_REASON_MAX_COUNT: Final[int] = 16
 
 
 # ----- named failures -----
@@ -229,7 +238,14 @@ def read_degradation_signal(envelope: Any) -> DegradationSignal:
 
 
 def _read_reasons(raw_reasons: Any) -> tuple[str, ...]:
-    """The reason list behind a true flag, or a named failure."""
+    """The reason list behind a true flag, or a named failure.
+
+    The list carries one to sixteen strings, each at most 256 UTF-8
+    bytes without Unicode ``Cc`` control characters (spec
+    qa-chain-corpus-retrieval). A violation is a malformed envelope and
+    raises the named invalid-envelope failure — never a silent trim,
+    which would re-author the producer's own reasons.
+    """
     if isinstance(raw_reasons, str) or not isinstance(raw_reasons, Sequence):
         raise DegradedEnvelopeInvalidError(
             f"{DEGRADED_REASONS_FIELD!r} is "
@@ -243,13 +259,33 @@ def _read_reasons(raw_reasons: Any) -> tuple[str, ...]:
             f"{DEGRADED_REASONS_FIELD!r}: a degradation fin cannot name "
             "cannot be recorded or shown"
         )
+    if len(reasons) > DEGRADED_REASON_MAX_COUNT:
+        raise DegradedEnvelopeInvalidError(
+            f"{DEGRADED_REASONS_FIELD!r} carries {len(reasons)} reasons, "
+            f"above the {DEGRADED_REASON_MAX_COUNT} bound"
+        )
     for reason in reasons:
         if not isinstance(reason, str) or not reason.strip():
             raise DegradedEnvelopeInvalidError(
                 f"{DEGRADED_REASONS_FIELD!r} holds {reason!r}, expected a "
                 "non-blank reason string naming the capability item"
             )
-    return tuple(str(reason) for reason in reasons)
+        encoded = reason.encode("utf-8")
+        if len(encoded) > DEGRADED_REASON_MAX_BYTES:
+            raise DegradedEnvelopeInvalidError(
+                f"{DEGRADED_REASONS_FIELD!r} holds a "
+                f"{len(encoded)}-byte reason, above the "
+                f"{DEGRADED_REASON_MAX_BYTES} bound"
+            )
+        if any(
+            unicodedata.category(character) == "Cc"
+            for character in reason
+        ):
+            raise DegradedEnvelopeInvalidError(
+                f"{DEGRADED_REASONS_FIELD!r} holds a reason with a "
+                "control character"
+            )
+    return reasons
 
 
 def degraded_reasons_for_display(envelope: Any) -> tuple[str, ...]:
@@ -469,6 +505,8 @@ __all__ = [
     "DEGRADATION_STAGE_RETRIEVE",
     "DEGRADATION_STAGE_USER_NOTICE",
     "DEGRADED_FIELD",
+    "DEGRADED_REASON_MAX_BYTES",
+    "DEGRADED_REASON_MAX_COUNT",
     "DEGRADED_REASONS_FIELD",
     "FORBIDDEN_DEGRADED_ALIASES",
     "NOT_DEGRADED",

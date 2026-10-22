@@ -40,6 +40,7 @@ import {
   useWorkspaceStore,
 } from "./store";
 import { describeGraphReadiness } from "./pages/HomePage";
+import { CATALOG_WARNING_COPY } from "./catalogOverview";
 import type {
   GraphIndexReport,
   JobStatus,
@@ -61,6 +62,9 @@ const INGEST_OK = {
 } as const;
 
 const STATUS_URL = "/api/corpus/ingest/AAPL-2022Q3";
+/** The GENERIC catalog surface (T6) — separate from the frozen
+ * financial ``GET /api/corpus`` projection. */
+const OVERVIEW_URL = "/api/corpus/overview";
 
 /** One polled job status; ``overrides`` selects the state under test. */
 function jobStatus(overrides: Partial<JobStatus> = {}): JobStatus {
@@ -293,6 +297,8 @@ function seedThread(detailOverrides: Partial<ThreadDetail> = {}): void {
     threads: [],
     corpus: [],
     corpusLoaded: false,
+    catalogOverview: null,
+    catalogOverviewLoaded: false,
     sendingQuestion: false,
     resumingThreadId: null,
     attachments: [],
@@ -349,6 +355,8 @@ describe("ingest door (store.ingestFile)", () => {
     expect((sent as File).name).toBe("aapl-10q.md");
     expect(form.get("company")).toBe("aapl");
     expect(form.get("period")).toBe("2022q3");
+    // One upload flow: no mode flag rides the wire.
+    expect(form.has("generic")).toBe(false);
     expect(useWorkspaceStore.getState().ingestJobId).toBe("AAPL-2022Q3");
     expect(useWorkspaceStore.getState().ingestAccepted).toEqual(INGEST_OK);
     // An accept is not a completion: the catalog row does not exist yet,
@@ -356,7 +364,7 @@ describe("ingest door (store.ingestFile)", () => {
     expect(calls.some((c) => c.url === "/api/corpus")).toBe(false);
   });
 
-  it("sends the optional format / document_id / doc_type only when supplied", async () => {
+  it("sends the optional format / doc_type only when supplied", async () => {
     seedThread();
     const { calls } = stubFetch((url) =>
       url === "/api/corpus/ingest" ? jsonResponse(INGEST_OK) : jsonResponse({}, 404),
@@ -368,14 +376,14 @@ describe("ingest door (store.ingestFile)", () => {
         company: "aapl",
         period: "2022q3",
         format: "md",
-        document_id: "0000320193-23-000123",
         doc_type: "financial_statement",
       },
     );
     const form = calls[0].body as FormData;
     expect(form.get("format")).toBe("md");
-    expect(form.get("document_id")).toBe("0000320193-23-000123");
     expect(form.get("doc_type")).toBe("financial_statement");
+    // The caller can never choose the identity.
+    expect(form.has("document_id")).toBe(false);
 
     await useWorkspaceStore
       .getState()
@@ -620,6 +628,185 @@ describe("ingest job status (store.loadIngestJob)", () => {
     const job = useWorkspaceStore.getState().ingestJob;
     expect(job?.job_id).toBe("MSFT-2022Q1");
     expect(job?.state).toBe("extracting");
+  });
+});
+
+describe("catalog publication warning (T6: durable, polled, typed)", () => {
+  it("a failed publication keeps the job cataloging and carries the typed warning", async () => {
+    seedThread();
+    stubFetch((url) => {
+      if (url === STATUS_URL) {
+        return jsonResponse(
+          jobStatus({
+            state: "cataloging",
+            catalog_warning: {
+              code: "catalog_publication_failed",
+              attempts: 2,
+              failure_code: "catalog_unavailable",
+              failure_stage: "lock",
+            },
+            catalog_warning_count: 1,
+          }),
+        );
+      }
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+
+    const job = useWorkspaceStore.getState().ingestJob;
+    // The job is NOT ready: the push landed but the row is not catalogued.
+    expect(job?.state).toBe("cataloging");
+    expect(job?.text_ready).toBe(false);
+    expect(job?.catalog_warning?.code).toBe("catalog_publication_failed");
+    expect(job?.catalog_warning?.failure_code).toBe("catalog_unavailable");
+    expect(job?.catalog_warning_count).toBe(1);
+  });
+
+  it("a pending publication reads as recovery, not as a failure", async () => {
+    seedThread();
+    stubFetch((url) =>
+      url === STATUS_URL
+        ? jsonResponse(
+            jobStatus({
+              state: "cataloging",
+              catalog_warning: {
+                code: "catalog_publication_pending",
+                attempts: 1,
+                stage: "recovery",
+              },
+              catalog_warning_count: 1,
+            }),
+          )
+        : jsonResponse({}, 404),
+    );
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+
+    const warning = useWorkspaceStore.getState().ingestJob?.catalog_warning;
+    expect(warning?.code).toBe("catalog_publication_pending");
+    expect(warning?.failure_code).toBeUndefined();
+    expect(warning?.stage).toBe("recovery");
+  });
+
+  it("a recorded success clears the warning and the count", async () => {
+    seedThread();
+    stubFetch((url) =>
+      url === STATUS_URL
+        ? jsonResponse(
+            jobStatus({
+              state: "ready",
+              text_ready: true,
+              catalog_warning: null,
+              catalog_warning_count: 0,
+            }),
+          )
+        : jsonResponse({ filings: [] }),
+    );
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+
+    const job = useWorkspaceStore.getState().ingestJob;
+    expect(job?.catalog_warning).toBeNull();
+    expect(job?.catalog_warning_count).toBe(0);
+  });
+
+  it("the warning copy never echoes a server string", () => {
+    // The safe-copy table is closed: the wire carries only codes, so a
+    // persisted exception message has no path to the screen.
+    for (const code of ["catalog_publication_pending", "catalog_publication_failed"] as const) {
+      expect(CATALOG_WARNING_COPY[code]).not.toMatch(/[/\\]|\.py|Exception|Traceback/);
+    }
+  });
+});
+
+describe("catalog overview read (T6: the generic surface)", () => {
+  it("refreshes the overview exactly when the catalog row exists", async () => {
+    seedThread();
+    const { calls } = stubFetch((url) => {
+      if (url === STATUS_URL) return jsonResponse(jobStatus({ state: "cataloging" }));
+      if (url === "/api/corpus") return jsonResponse({ filings: [] });
+      if (url === OVERVIEW_URL) return jsonResponse({ documents: [], dimensions: [], flat_titles: [] });
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+    // Not catalogued yet: the operator must not see the row as visible.
+    expect(calls.some((c) => c.url === OVERVIEW_URL)).toBe(false);
+
+    stubFetch((url) => {
+      if (url === STATUS_URL) return jsonResponse(jobStatus({ state: "ready", text_ready: true }));
+      if (url === "/api/corpus") return jsonResponse({ filings: [] });
+      if (url === OVERVIEW_URL) {
+        return jsonResponse({
+          documents: [
+            {
+              document_id: "doc_a",
+              version: "v1",
+              title: "Team Handbook",
+              doc_type: "narrative",
+              page_count: 2,
+            },
+          ],
+          dimensions: [],
+          flat_titles: ["Team Handbook"],
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const overview = useWorkspaceStore.getState().catalogOverview;
+    expect(overview?.documents).toHaveLength(1);
+    expect(overview?.documents[0].title).toBe("Team Handbook");
+    expect(useWorkspaceStore.getState().catalogOverviewLoaded).toBe(true);
+  });
+
+  it("a metadata-free document decodes with its company absent, not null", async () => {
+    seedThread();
+    stubFetch((url) =>
+      url === OVERVIEW_URL
+        ? jsonResponse({
+            documents: [
+              {
+                document_id: "doc_a",
+                version: "v1",
+                title: "Handbook",
+                doc_type: "narrative",
+                page_count: 1,
+              },
+            ],
+            dimensions: [],
+            flat_titles: ["Handbook"],
+          })
+        : jsonResponse({}, 404),
+    );
+
+    await useWorkspaceStore.getState().loadCatalogOverview();
+
+    const document = useWorkspaceStore.getState().catalogOverview?.documents[0];
+    expect(document?.company).toBeUndefined();
+    expect(document?.period).toBeUndefined();
+  });
+
+  it("a malformed overview is an empty overview, not a thrown parse", async () => {
+    seedThread();
+    stubFetch((url) =>
+      url === OVERVIEW_URL
+        ? jsonResponse({ documents: [{ document_id: "", version: "v" }] })
+        : jsonResponse({}, 404),
+    );
+
+    await useWorkspaceStore.getState().loadCatalogOverview();
+
+    // Empty rather than half-decoded: a surface must not render a
+    // document whose identity it could not validate.
+    expect(useWorkspaceStore.getState().catalogOverview).toEqual({
+      documents: [],
+      dimensions: [],
+      flat_titles: [],
+    });
+    expect(useWorkspaceStore.getState().catalogOverviewLoaded).toBe(true);
   });
 });
 

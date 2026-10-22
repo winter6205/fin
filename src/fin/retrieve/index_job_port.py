@@ -21,6 +21,8 @@ Contract highlights fin must honor:
   every poll answer as a field separate from the per-source job
   status, and fin passes it through verbatim — it is never derived
   from job status and never collapsed with per-source text readiness.
+  An explicit ``null`` there means the C singleton has never been
+  written and stays an absent claim, not a readiness one.
 
 Failures are typed and carry a stable ``code`` read off the wire's
 JSON body — never matched against prose (mirroring the push seam's
@@ -206,10 +208,16 @@ class IndexJobSubmission:
 class IndexJobPoll:
     """The answer to one poll: the job row and, in a separate field,
     the corpus-wide community index state — the two readiness facts
-    never collapse into one."""
+    never collapse into one.
+
+    ``community_index_state`` is ``None`` exactly when the service
+    answered an explicit ``null``, i.e. the corpus-wide C singleton
+    has never been written. That is an absent readiness claim, never a
+    ``ready`` one, and it is never derived from the job's own status.
+    """
 
     record: IndexJobRecord
-    community_index_state: CommunityIndexState
+    community_index_state: CommunityIndexState | None
 
 
 @runtime_checkable

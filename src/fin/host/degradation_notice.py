@@ -18,12 +18,23 @@ answer announces itself where the operator is already looking, without a
 new wire channel. What the notice does NOT do is change the answer's
 standing: a degraded result is 可用但必须可见 (§B2 第 4 条), so the citation
 gate rules on it exactly as it rules on any other evidence.
+
+The reasons stay off the visible line. They name a backend capability
+that failed (``vector:attempt_failed``) and are meaningful only beside the
+access-controlled ledger, so the rendered notice carries the safe sentence
+and the exact reason strings reach the ledger and nothing else. The safe
+sentence is owned by :mod:`fin.host.grounded.readable_projection` — the one module
+that decides what ordinary-person Chinese copy a class of failure gets —
+and is IMPORTED here rather than restated, so the notice and the failure
+class can never drift apart. The dependency therefore points one way:
+the projection owns the copy, this module renders it.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable, Final
 
+from fin.host.grounded.readable_projection import DEGRADATION_SAFE_COPY
 from fin.retrieve.degradation import (
     DEGRADATION_STAGE_RETRIEVE,
     DEGRADATION_STAGE_USER_NOTICE,
@@ -52,15 +63,20 @@ ATTACHMENT_PREPARATION_FAILED: Final[str] = "attachment_preparation_failed"
 def degradation_notice_line(signal: DegradationSignal) -> str:
     """The user-visible one-liner for a degraded response.
 
-    Every reason is named: a notice that says "retrieval was degraded"
-    without saying which capability is a signal the operator cannot act
-    on, and SC39 counts reasons, not notices.
+    Carries the safe sentence and NOTHING ELSE. An undegraded signal has
+    no notice, so this returns ``""`` rather than announcing a signal that
+    was never raised.
+
+    WHY the reasons are absent here and present on the ledger: a reason
+    names the backend capability that failed, which is an operator-
+    UNACTIONABLE detail on a default surface and belongs beside the
+    access-controlled ledger that already records every one of them.
+    SC39 counts recorded-and-signalled reasons, and the ledger half is
+    unchanged by this; only the rendered half loses the raw text.
     """
-    reasons = "; ".join(signal.degraded_reasons)
-    return (
-        f"degraded: {reasons} — this result is partial, "
-        "not a complete answer"
-    )
+    if not signal.degraded:
+        return ""
+    return DEGRADATION_SAFE_COPY
 
 
 def degradation_notice_entry(
@@ -72,6 +88,30 @@ def degradation_notice_entry(
         "summary": degradation_notice_line(signal),
         "tool_call_id": tool_call_id,
     }
+
+
+def run_degraded(tool_summaries: Any) -> bool:
+    """Whether THIS run consumed a degraded retrieval response.
+
+    Read from the run's own ``tool_summaries`` rather than passed down as a
+    flag: the notice row is the host's record that it already consumed the
+    signal, so a caller that re-derived the fact from the raw envelope would
+    be reading a second source of truth for a decision the run has made. It
+    is also the only one available at payload time — the §B3 fields ride the
+    retrieve envelope, not a run-scoped channel.
+
+    Only the BOOLEAN is read. The reasons stay on the access-controlled
+    ledger; a caller that forwards them puts a backend capability name in the
+    default view (T10).
+    """
+    if not isinstance(tool_summaries, (list, tuple)):
+        return False
+    return any(
+        isinstance(row, dict)
+        and row.get("name") == DEGRADATION_NOTICE_TOOL
+        and row.get("summary") == DEGRADATION_SAFE_COPY
+        for row in tool_summaries
+    )
 
 
 def consume_degradation(
@@ -101,8 +141,11 @@ def consume_degradation(
     )
     line = degradation_notice_line(signal)
     expose(signal, line)
+    # The notice-stage record keeps the reason STRING, not the rendered
+    # line: the ledger is the access-controlled surface, so this is the
+    # one place a reason may be stored verbatim.
     ledger.record_signal(
-        signal, stage=DEGRADATION_STAGE_USER_NOTICE, detail=line
+        signal, stage=DEGRADATION_STAGE_USER_NOTICE, detail=detail
     )
     return signal
 
@@ -114,4 +157,5 @@ __all__ = [
     "consume_degradation",
     "degradation_notice_entry",
     "degradation_notice_line",
+    "run_degraded",
 ]

@@ -1,0 +1,96 @@
+# Test files this checkout cannot run at all without the maintainer fixture
+# bundle (FIN_PRIVATE_FIXTURES plus data/corpus/**; README.md, "Corpus and
+# validation"). scripts/ci/pytest-public-lane.sh runs every other test file.
+#
+# Add a file here only when it fails with a fixture-absence cause:
+# PrivateFixtureMissingError / PrivateFixtureInvalidError, a missing
+# data/corpus/** or gitignored scripts/g4_pipeline/ path, the extracted-tree
+# and layout-harness guards those produce, or a result assertion over a
+# catalog that lives under data/corpus. A file that fails for any other
+# reason stays in the lane and turns the gate red.
+#
+# Each entry is measured by running that file on its own. Collection order is
+# not a contract: tests/ablation/test_atomic_report_write.py reaches the vault
+# only through tests/ablation/test_ablation.py importing fin.eval.ablation
+# first, so it collects in a whole-suite run and cannot be collected once that
+# file is excluded.
+#
+# scripts/ci/assert-fixture-lane-fails.sh re-checks the list every run, so a
+# stale entry fails there. It also re-checks every cause against the classes
+# above. A file that collects but errors at setup on absent fixtures is NOT
+# caught there: only collection failures are, and the lane runs it.
+tests/ablation/test_ablation.py
+tests/ablation/test_atomic_report_write.py
+tests/ablation/test_live_eval_set.py
+tests/ablation/test_plan_t4_citation_gate_merge.py
+tests/corpus/test_catalog.py
+tests/corpus/test_catalog_form_types.py
+tests/corpus/test_chunk_and_push.py
+tests/corpus/test_chunking.py
+tests/corpus/test_dataset_build.py
+tests/corpus/test_expand_library.py
+tests/corpus/test_facts.py
+tests/corpus/test_facts_seed_evidence.py
+tests/corpus/test_failure_surface.py
+tests/corpus/test_ingest.py
+tests/corpus/test_ingest_endpoint.py
+tests/corpus/test_ingest_local.py
+tests/corpus/test_ingest_worker.py
+tests/corpus/test_invalidation.py
+tests/corpus/test_live_fetch.py
+tests/corpus/test_normalization.py
+tests/corpus/test_ocr.py
+tests/corpus/test_ocr_branch.py
+tests/corpus/test_ocr_region.py
+tests/corpus/test_ocr_tesseract_gold.py
+tests/corpus/test_page_region_core.py
+tests/corpus/test_parsers.py
+tests/corpus/test_pdf_core_dispatch.py
+tests/corpus/test_rebuild.py
+tests/corpus/test_t1_dataset.py
+tests/eval/test_ablation_matrix.py
+tests/eval/test_chunking_contract.py
+tests/eval/test_concurrency.py
+tests/eval/test_dataset_contract.py
+tests/eval/test_determinism.py
+tests/eval/test_gold.py
+tests/host/test_analysis_in_thread.py
+tests/host/test_attachment_budgets.py
+tests/host/test_attachment_layout.py
+tests/host/test_attachment_layout_harness.py
+tests/host/test_attachment_prepare_door.py
+tests/host/test_attachment_prepare_image.py
+tests/host/test_attachment_prepare_pages.py
+tests/host/test_attachment_prepare_vision.py
+tests/host/test_attachment_send_wait.py
+tests/host/test_attachment_visual_read.py
+tests/host/test_cli.py
+tests/host/test_compare_facts.py
+tests/host/test_compare_in_thread.py
+tests/host/test_compare_persistence.py
+tests/host/test_evidence_locators.py
+tests/host/test_g4_pipeline_declaration_crosscheck.py
+tests/host/test_g4_pipeline_pin_contract.py
+tests/host/test_g4_vision_probe_classification.py
+tests/host/test_graph.py
+tests/host/test_graph_visual_lane.py
+tests/host/test_http.py
+tests/host/test_observability_route.py
+tests/host/test_research_done_with_fact.py
+tests/host/test_scripted_boot.py
+tests/host/test_serve_path_no_tree_ssot.py
+tests/host/test_session_compaction_gate.py
+tests/host/test_soft_track_t1.py
+tests/host/test_source_scope_visual_zero_read.py
+tests/host/test_stream_map.py
+tests/host/test_task_runtime_host.py
+tests/host/test_terminal_copy.py
+tests/host/test_thread_attach.py
+tests/host/test_thread_attachment_durable.py
+tests/host/test_tools.py
+tests/host/test_visual_claims_wire.py
+tests/host/test_workspace_http.py
+tests/host/test_workspace_http_attachment_lane.py
+tests/host/test_workspace_workflow.py
+tests/retrieve/test_bm25.py
+tests/retrieve/test_source_read_alignment.py

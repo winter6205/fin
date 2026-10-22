@@ -1,6 +1,6 @@
 """Validator-rule tests for the pure grounded-assessment contract.
 
-``fin.host.grounded_assessment`` is the host-owned, **mechanical** contract that
+``fin.host.grounded.grounded_assessment`` is the host-owned, **mechanical** contract that
 narrows a model-produced assessment against one ``HostFacts`` carrier: the
 evidence it admitted, the capabilities it reports, the committed basis, the
 goal parts it committed, and the receipts it observed. This module covers
@@ -29,8 +29,8 @@ from typing import cast
 
 import pytest
 
-from fin.host import grounded_assessment as grounded_assessment_module
-from fin.host.grounded_assessment import (
+from fin.host.grounded import grounded_assessment as grounded_assessment_module
+from fin.host.grounded.grounded_assessment import (
     CODE_CLAIM_MISSING_PREMISES,
     CODE_CLAIM_NO_SUPPORT_LOCATOR,
     CODE_CLAIM_UNKNOWN_PREMISE,

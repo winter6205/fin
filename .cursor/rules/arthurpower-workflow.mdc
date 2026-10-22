@@ -5,9 +5,9 @@ alwaysApply: true
 
 # arthurpower workflow (resident)
 
-This rule is the **always-on router**. The flowchart below is the resident procedure. Arthurpower skill files are not part of this repository. Subagent briefs live in `.cursor/agents/`.
+This rule is the **always-on router**. Full procedures live in `.cursor/skills/<name>/SKILL.md` and subagent briefs in `.cursor/agents/`. Vendor pin: `.cursor/vendor/arthurpower/VERSION`.
 
-Do **not** start `skill-authoring`, `self-evolving-rules`, or `setup-arthurpower` unless the operator named them.
+Do **not** start `skill-authoring`, `self-evolving-rules`, or `setup-arthurpower` unless the operator named them. Those are not vendored here.
 
 ## Current slot only
 
@@ -15,7 +15,7 @@ Name the task class, then run **one** skill. Documented sequences are ordered ga
 
 ## Flowchart
 
-The flowchart below is the resident router. It omits meta authoring (`skill-authoring` / `self-evolving-rules` / `setup-arthurpower`).
+SSOT for the full tree is `.cursor/skills/using-agent-skills/references/flowchart.md`. The copy below omits meta authoring (`skill-authoring` / `self-evolving-rules` / `setup-arthurpower`). If they disagree, follow the skill file.
 
 ```
 Task arrives
@@ -63,13 +63,13 @@ Task arrives
 
 `architecture-change-reviewer` blocks on any `no` / `unclear`. `writing-plans` and `spec-driven-development` are user-invoked gates that the router may still open as the **current sequence slot**. `dispatching-parallel-agents` is model-invoked: this agent fans out workers.
 
-## After classify
+## After classify: open the skill file
 
-Use the flowchart in this rule. This repository does not vendor skill procedure files.
+Follow `.cursor/skills/<skill>/SKILL.md` and its `references/`. Do not improvise a shorter procedure.
 
 `code-review`: dispatch `.cursor/agents/standards-reviewer-agent.md` and `.cursor/agents/spec-reviewer-agent.md` in parallel (Standards + Spec). Other S1–S6 / ACR / TDD / boundary-testing agents live in the same directory.
 
-Git commits stay one logical task each, as in the flowchart's commit row.
+Git commit shape: `.cursor/skills/using-agent-skills/references/git-workflow.md` plus `minimal-change-verifier`.
 
 ## Phase map (resident skills)
 

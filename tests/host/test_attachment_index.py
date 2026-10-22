@@ -1,4 +1,4 @@
-"""``fin.host.attachment_index`` — the thread-private derived index.
+"""``fin.host.attachment.attachment_index`` — the thread-private derived index.
 
 The module is a pure function set: no I/O, no store, no lock. These tests
 are therefore written against the spec's behaviour, not against a
@@ -23,7 +23,7 @@ import dataclasses
 
 import pytest
 
-from fin.host.attachment_index import (
+from fin.host.attachment.attachment_index import (
     IndexHit,
     build_postings,
     index_terms,
@@ -31,7 +31,7 @@ from fin.host.attachment_index import (
     query_terms,
     search,
 )
-from fin.host.attachment_store import ParsedAttachmentUnit
+from fin.host.attachment.attachment_store import ParsedAttachmentUnit
 
 
 def _units(*texts: tuple[int, str]) -> list[ParsedAttachmentUnit]:
@@ -307,7 +307,7 @@ def test_an_unpunctuated_cjk_run_stays_one_term() -> None:
     """The pinned tokenizer limit, asserted so it is a known boundary
     rather than a surprise: this index has no CJK segmenter, so a query
     word inside a longer run misses. Swapping in a real engine changes
-    :func:`fin.host.attachment_index.index_terms` only, and this test is
+    :func:`fin.host.attachment.attachment_index.index_terms` only, and this test is
     the one that moves with it.
     """
     postings = build_postings(_units((1, "本季度营收增长")))

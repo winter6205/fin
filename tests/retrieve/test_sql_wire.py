@@ -1,6 +1,6 @@
 """The ``sql`` 档's wire shape: window filters, named failures, row sibling.
 
-the tracked change T7 (specs/search-mode-business-sql-contract.md §4/§7/§8.0): fin
+T7 (specs/search-mode-business-sql-contract.md §4/§7/§8.0): fin
 no longer refuses ``sql`` at the port — the request reaches the iknow wire
 WITH its expiry window, and what comes back is consumed as its own evidence
 kind, never as a chunk. What is pinned here, in spec order:
@@ -696,7 +696,7 @@ def _citations_call(citations: list[dict]):
     one. Imported locally: :mod:`fin.host` imports back into
     :mod:`fin.retrieve.mcp_adapter`, so a top-level import here closes a
     cycle (the same reason the adapter defers its own import)."""
-    from fin.host.evidence_contract import (
+    from fin.host.evidence.evidence_contract import (
         seed_context_from_rows,
         validate_evidence,
     )
@@ -814,7 +814,7 @@ def test_a_document_envelope_stays_byte_identical() -> None:
     (key ABSENT when not applicable) survives into the host envelope."""
     adapter = _CapturingAdapter({"result": {"chunks": []}})
     out = adapter.retrieve("q", search_mode="graph")
-    assert out == {"chunks": []}
+    assert out == {"chunks": [], "distribution": "zero"}
     assert DATABASE_ROWS_KEY not in out
 
 

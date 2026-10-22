@@ -53,15 +53,15 @@ from PIL import Image
 
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.corpus.parsers import NullLayout, PageRegionParser, PageRaster
-from fin.host.attachment_budgets import AttachmentBudgets, required_run_calls
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_budgets import AttachmentBudgets, required_run_calls
+from fin.host.attachment.attachment_prepare import (
     ATTACHMENT_EMPTY_TEXT,
     ATTACHMENT_NOT_TEXT,
     ATTACHMENT_PAGE_LANE_UNWIRED,
     ATTACHMENT_TYPE_UNSUPPORTED,
     AttachmentPreparationService,
 )
-from fin.host.attachment_store import InMemoryAttachmentStore
+from fin.host.attachment.attachment_store import InMemoryAttachmentStore
 from fin.host.http import (
     get_attachment_budgets,
     get_attachment_service,

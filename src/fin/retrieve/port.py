@@ -34,6 +34,7 @@ Two answers, never conflated (T21 / SC42 / SC43 / §B2 第 5 条):
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -155,6 +156,28 @@ def new_database_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def distribution_of(chunks: Sequence[Chunk]) -> str:
+    """The mechanical ``distribution`` value for one chunk list.
+
+    Spec ``qa-chain-corpus-retrieval`` §"Result, error, readiness, and
+    degradation wire": computed from the distinct document IDs among the
+    usable returned chunks — ``zero`` (none), ``hit`` (exactly one
+    document), ``dispersed`` (more than one). It describes where the
+    returned evidence came from and makes no answerability claim.
+
+    The PORT computes it and the host carries it verbatim, so it lives
+    with the rest of the wire contract rather than in one adapter: a
+    product adapter importing it out of the test fake would make the
+    fake load-bearing for a production answer.
+    """
+    documents = {chunk.source_ref.document_id for chunk in chunks}
+    if not documents:
+        return "zero"
+    if len(documents) == 1:
+        return "hit"
+    return "dispersed"
+
+
 # The structured-corpus-evidence lane's own sibling. It is NOT a
 # ``database_rows`` sibling and not a ``chunks`` entry: it carries a typed
 # entity/assertion result or an exact count receipt with its own finite
@@ -167,6 +190,18 @@ STRUCTURED_RESULT_KEY: Final[str] = "structured_result"
 # legacy SQL ledger's zero-row outcome.
 MALFORMED_STRUCTURED_QUERY_CODE: Final[str] = "malformed_structured_query"
 STRUCTURED_SEARCH_UNAVAILABLE_CODE: Final[str] = "structured_search_unavailable"
+
+# The requested filter and search-mode combination the backend cannot
+# honor (spec qa-chain-corpus-retrieval §"Result, error, readiness, and
+# degradation wire"). Never a silent drop of the filter.
+UNSUPPORTED_FILTER_MODE_CODE: Final[str] = "unsupported_filter_mode"
+
+# The trusted source scope a leg cannot carry (spec's named-failure
+# table). Upstream's structured lane refuses a request that combines
+# ``structured_query`` with a scope key under this code, because a
+# structured read has no exact-match filter channel — so the scope is
+# precisely what cannot be honored.
+UNSUPPORTED_SOURCE_SCOPE_CODE: Final[str] = "unsupported_source_scope"
 
 # The producer's token for that sibling and its explicit integer version
 # (ADR 0093: the token is the stable name, never a versioned suffix).
@@ -184,7 +219,7 @@ def structured_result_of(sibling: object) -> Mapping[str, Any] | None:
     or it carries a non-object this consumer cannot read. Reading stays
     permissive about the contents; the exact key set, version and bounds
     are the structured lane validator's boundary in
-    :mod:`fin.host.structured_evidence`, not this reader's. The retrieve
+    :mod:`fin.host.evidence.structured_evidence`, not this reader's. The retrieve
     adapter and host use this accessor to preserve the sibling without
     interpreting its result fields.
     """
@@ -201,13 +236,33 @@ def _structured_query_refusal_code(
     *,
     search_mode: str | None,
     has_outer_filters: bool,
+    has_generic_filters: bool = False,
+    has_scope_locator: bool = False,
+    has_document_scope: bool = False,
 ) -> str | None:
     """Return the fin-side refusal for a structured request it cannot bind.
 
     Query fields and predicates remain the structured backend's concern.
+
+    ``has_generic_filters`` is its own named refusal rather than one more
+    outer filter: the generic metadata map is NOT translated into SQL
+    predicates, so combining the two would drop the narrowing silently.
+    That is ``unsupported_filter_mode`` (spec qa-chain-corpus-retrieval
+    §"Trusted source scope and retrieval arms"), while the legacy outer
+    names keep the malformed-query code they have always answered.
+
+    ``has_scope_locator`` is the trusted-source-scope refusal: a structured
+    read has no exact-match filter channel, so an explicit ``document_id``
+    beside it cannot be applied at all. That is ``unsupported_source_scope``
+    — the scope is precisely what cannot be honored — and it is the same
+    fact the upstream lane refuses under ``unsupported_field``.
     """
     if structured_request is None:
         return None
+    if has_generic_filters:
+        return UNSUPPORTED_FILTER_MODE_CODE
+    if has_scope_locator or has_document_scope:
+        return UNSUPPORTED_SOURCE_SCOPE_CODE
     if (
         not isinstance(structured_request, Mapping)
         or search_mode != "sql"
@@ -384,6 +439,82 @@ class Chunk:
     score: float
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentScopeEntry:
+    """One trusted, versioned corpus document allowed for a retrieve call."""
+
+    document_id: str
+    version: str
+
+
+DocumentScope = tuple[DocumentScopeEntry, ...]
+MAX_DOCUMENT_SCOPE_ENTRIES: Final[int] = 200
+MAX_DOCUMENT_SCOPE_FIELD_BYTES: Final[int] = 256
+
+
+def document_scope_refusal_code(scope: object) -> str | None:
+    """Return the named refusal when a trusted document scope is unusable.
+
+    ``None`` is the legacy unrestricted form. A present scope must be a
+    nonempty tuple of at most 200 versioned document identities, with each
+    identity field a nonempty, control-free string of at most 256 UTF-8 bytes.
+    """
+    if scope is None:
+        return None
+    if not isinstance(scope, tuple) or not scope or len(scope) > MAX_DOCUMENT_SCOPE_ENTRIES:
+        return UNSUPPORTED_SOURCE_SCOPE_CODE
+    for entry in scope:
+        if not isinstance(entry, DocumentScopeEntry):
+            return UNSUPPORTED_SOURCE_SCOPE_CODE
+        if not _document_scope_field_is_valid(entry.document_id):
+            return UNSUPPORTED_SOURCE_SCOPE_CODE
+        if not _document_scope_field_is_valid(entry.version):
+            return UNSUPPORTED_SOURCE_SCOPE_CODE
+    return None
+
+
+def _document_scope_field_is_valid(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        if len(value.encode("utf-8")) > MAX_DOCUMENT_SCOPE_FIELD_BYTES:
+            return False
+    except UnicodeEncodeError:
+        return False
+    return not any(unicodedata.category(char) == "Cc" for char in value)
+
+
+def intersect_document_scope(
+    scope: DocumentScope, document_id: str | None
+) -> DocumentScope:
+    """Conjoin an explicit document filter with a trusted scope."""
+    if document_id is None:
+        return scope
+    return tuple(entry for entry in scope if entry.document_id == document_id)
+
+
+def prepare_document_scope(
+    scope: DocumentScope | None,
+    document_id: str | None,
+    search_mode: str | None,
+) -> tuple[DocumentScope | None, str | None]:
+    """Validate and conjoin a trusted scope before an adapter runs."""
+    refusal = document_scope_refusal_code(scope)
+    if refusal is not None:
+        return None, refusal
+    if scope is None:
+        return None, None
+    if search_mode in {"global", "sql"}:
+        return None, UNSUPPORTED_SOURCE_SCOPE_CODE
+    if document_id is not None and not document_id.strip():
+        return scope, None
+    effective_scope = intersect_document_scope(scope, document_id)
+    refusal = document_scope_refusal_code(effective_scope)
+    if refusal is not None:
+        return None, refusal
+    return effective_scope, None
+
+
 @runtime_checkable
 class RetrievePort(Protocol):
     """Structural protocol for v1 retrieve adapters.
@@ -415,6 +546,8 @@ class RetrievePort(Protocol):
         structured_request: Mapping[str, Any] | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
+        filters: Mapping[str, Any] | None = None,
+        document_scope: DocumentScope | None = None,
     ) -> dict[str, Any]:
         """Return ``{"chunks": [...]}`` ranked descending by BM25 score.
 
@@ -469,6 +602,27 @@ class RetrievePort(Protocol):
             binds it to the ``sql`` 档; the adapter carries it as the
             object-valued ``filters.structured_query`` field. It cannot
             be combined with legacy outer filters or expiry windows.
+        filters
+            The generic metadata filter object (spec
+            ``qa-chain-corpus-retrieval`` §"Retrieve request and
+            metadata filters"): at most the four catalog-owned keys
+            ``title`` / ``doc_type`` / ``company`` / ``period``,
+            validated at the boundary BEFORE any I/O. ``None`` (the
+            default) is the absent form — the caller's whole
+            authorized scope. Values normalize by NFC and
+            Unicode-whitespace trim; an out-of-contract map answers
+            ``{"error": "invalid_filter"}`` and starts nothing. The
+            legacy EDGAR arguments above stay separate port
+            parameters; both apply conjunctively.
+        document_scope
+            Optional trusted, versioned document allowlist. ``None`` keeps
+            the legacy unrestricted request. A present scope must be
+            nonempty; an empty or malformed scope answers
+            ``unsupported_source_scope``. Each entry binds document id and
+            version, and an explicit ``document_id`` intersects the
+            allowlist. A blank ``document_id`` keeps its legacy miss shape.
+            Adapters enforce both fields before ranking and refuse modes that
+            cannot honor the scope, including global, SQL, and scoped reports.
 
         Returns
         -------
@@ -487,6 +641,10 @@ class RetrievePort(Protocol):
 
 __all__ = [
     "DATABASE_ROWS_KEY",
+    "DocumentScope",
+    "DocumentScopeEntry",
+    "MAX_DOCUMENT_SCOPE_ENTRIES",
+    "MAX_DOCUMENT_SCOPE_FIELD_BYTES",
     "DATABASE_ROWS_RESULT_COUNT_FIELD",
     "DATABASE_ROWS_ROWS_FIELD",
     "DATABASE_ROWS_SCHEMA",
@@ -512,7 +670,12 @@ __all__ = [
     "SEARCH_MODE_FILTER_KEY",
     "TierUnavailableError",
     "database_rows_of",
+    "distribution_of",
+    "document_scope_refusal_code",
+    "intersect_document_scope",
+    "prepare_document_scope",
     "new_database_rows",
     "resolve_search_mode",
     "resolve_sql_window",
+    "UNSUPPORTED_SOURCE_SCOPE_CODE",
 ]

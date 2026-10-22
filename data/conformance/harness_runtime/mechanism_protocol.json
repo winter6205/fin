@@ -1,0 +1,319 @@
+{
+  "schema_version": "1.0.0",
+  "lane": "mechanism",
+  "protocol_id": "p4-mechanism-1.0.0",
+  "dataset_manifest_version": null,
+  "frozen_on": "2026-10-21",
+  "authority": "specs/harness-runtime-acceptance.md#Contract (Mechanism evidence)",
+  "status": "frozen-protocol; no mechanism campaign has run or passed",
+  "required_services": {
+    "runtime_api_processes": 2,
+    "graph_worker_processes": 2,
+    "postgres": "real PostgreSQL, database name ends in _test via FIN_TEST_DSN",
+    "redis": "real Redis instance distinct from any development instance",
+    "fencing": "barrier-controlled; sleeps alone never establish a race",
+    "artifact_root": "injected temporary root; no artifact under the product data paths"
+  },
+  "denominator_rule": "Every case below is required and stays in the mechanism denominator in every campaign. An attempt never removes a case. Missing, blocked, interrupted, not_run, and unscored cases stay countable. A case that passed only after an earlier failed attempt is flaky, which is not a clean pass.",
+  "attempt_rule": "A retry appends attempt+1 for the same case_id. Logical operations are counted separately from HTTP attempts; the report carries both numbers.",
+  "lock_rule": "PostgreSQL ownership locks never span external fetch, validation, model/network wait, or indexing.",
+  "integration_gates": {
+    "P3": "durable tool outcome ledger (required by M24, M25)",
+    "P4": "this protocol, the passing lane preflight, and the case/run/report contract",
+    "P5": "event/outbox delivery (required by M08, M09, M10, M22)",
+    "P6": "parser adoption/readiness (required by M15, M16, M17, M18, M19, M20, M21, M22)",
+    "P7": "API/worker lifecycle and cancellation (required by M01, M02, M03, M04, M05, M06, M07, M11, M12, M13, M14, M21, M22, M23, M24)",
+    "P10_freeze": "only a case that consumes a P10 rubric; none of the cases below declares one"
+  },
+  "cases": [
+    {
+      "case_id": "M01",
+      "case_version": "1.0.0",
+      "primary_category": "ordering",
+      "barrier": "both API processes accept one operation for the same thread; release both sends after both are accepted",
+      "required_observations": [
+        "exactly one graph owner executes the thread at a time",
+        "durable accepted order equals the recorded acceptance order",
+        "the second operation does not start before the first terminal commit"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M02",
+      "case_version": "1.0.0",
+      "primary_category": "ordering",
+      "barrier": "two threads accept an operation; the first thread's worker is held at a barrier while the second runs to completion",
+      "required_observations": [
+        "the second thread reaches terminal state while the first is still held",
+        "both threads keep independent operation identity and durable state"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M03",
+      "case_version": "1.0.0",
+      "primary_category": "identity",
+      "barrier": "one client intent is submitted twice before any thread ID exists",
+      "required_observations": [
+        "one durable accepted operation exists for the intent",
+        "exactly one thread is created",
+        "the second HTTP attempt returns the original accepted operation"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M04",
+      "case_version": "1.0.0",
+      "primary_category": "identity",
+      "barrier": "the same operation ID and payload is delivered concurrently to both API processes",
+      "required_observations": [
+        "one durable accepted operation and one logical run",
+        "HTTP attempt count is greater than the logical operation count",
+        "a changed payload under the same ID conflicts instead of creating a second operation"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M05",
+      "case_version": "1.0.0",
+      "primary_category": "identity",
+      "barrier": "the response of an accepted operation is dropped; the client retries with the same operation ID",
+      "required_observations": [
+        "the retry converges on the original operation instead of a new run",
+        "durable state shows one logical operation"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M06",
+      "case_version": "1.0.0",
+      "primary_category": "recovery",
+      "barrier": "kill a graph worker after claim, before terminal commit; restart a new worker",
+      "required_observations": [
+        "the restarted worker reclaims the run under a new worker attempt",
+        "the killed attempt cannot commit afterwards",
+        "durable terminal state is reached exactly once"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M07",
+      "case_version": "1.0.0",
+      "primary_category": "recovery",
+      "barrier": "after the terminal commit, start a fresh OS process with no prior in-memory state",
+      "required_observations": [
+        "the fresh process reads the accepted operation and terminal message",
+        "reconstruction inside the original process is not used as evidence"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M08",
+      "case_version": "1.0.0",
+      "primary_category": "publication",
+      "barrier": "hold event publication after the PostgreSQL commit",
+      "required_observations": [
+        "the durable event position is committed before any Redis notification exists",
+        "a reader that arrives while publication is held still observes the committed state"
+      ],
+      "integration_gates": ["P1", "P5"]
+    },
+    {
+      "case_id": "M09",
+      "case_version": "1.0.0",
+      "primary_category": "publication",
+      "barrier": "interrupt Redis before and during publication",
+      "required_observations": [
+        "PostgreSQL-backed snapshots still answer",
+        "live delivery is reported degraded rather than silently empty",
+        "no accepted operation disappears"
+      ],
+      "integration_gates": ["P1", "P5"]
+    },
+    {
+      "case_id": "M10",
+      "case_version": "1.0.0",
+      "primary_category": "recovery",
+      "barrier": "leave pending outbox rows, then restore delivery",
+      "required_observations": [
+        "replay republishes each pending notification at least once",
+        "duplicate delivery is idempotent at the consumer",
+        "the final event position matches the durable position"
+      ],
+      "integration_gates": ["P1", "P5"]
+    },
+    {
+      "case_id": "M11",
+      "case_version": "1.0.0",
+      "primary_category": "fencing",
+      "barrier": "expire a worker lease and let a second worker take it over",
+      "required_observations": [
+        "the takeover is recorded as a new worker attempt",
+        "only the current owner can advance the run",
+        "durable state shows a single owner at the cut point"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M12",
+      "case_version": "1.0.0",
+      "primary_category": "fencing",
+      "barrier": "release a stale worker after takeover; let it deliver its output",
+      "required_observations": [
+        "the stale output is rejected",
+        "the current generation and state are unchanged by the stale worker"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M13",
+      "case_version": "1.0.0",
+      "primary_category": "fencing",
+      "barrier": "call checkpointer put from an attempt whose lease has been fenced",
+      "required_observations": [
+        "the write is rejected inside the ownership transaction",
+        "no checkpoint row is added by the fenced attempt",
+        "a missing adapter wiring fails closed instead of writing"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M14",
+      "case_version": "1.0.0",
+      "primary_category": "fencing",
+      "barrier": "call checkpointer put_writes from an attempt whose lease has been fenced",
+      "required_observations": [
+        "the write is rejected inside the same ownership transaction as put",
+        "no checkpoint_write row is added by the fenced attempt"
+      ],
+      "integration_gates": ["P1", "P7"]
+    },
+    {
+      "case_id": "M15",
+      "case_version": "1.0.0",
+      "primary_category": "parser-cas",
+      "barrier": "hold result validation outside the lock; commit a source replacement first",
+      "required_observations": [
+        "the stale result cannot associate with the replaced content",
+        "ready is not published for the stale generation"
+      ],
+      "integration_gates": ["P1", "P2", "P6"]
+    },
+    {
+      "case_id": "M16",
+      "case_version": "1.0.0",
+      "primary_category": "parser-cas",
+      "barrier": "hold result validation outside the lock; commit a cancellation first",
+      "required_observations": [
+        "adoption rejects the cancelled job",
+        "ready is not published for a cancelled job"
+      ],
+      "integration_gates": ["P1", "P2", "P6"]
+    },
+    {
+      "case_id": "M17",
+      "case_version": "1.0.0",
+      "primary_category": "parser-cas",
+      "barrier": "hold result validation outside the lock; commit a tombstone deletion first",
+      "required_observations": [
+        "the late result is rejected at adoption and at the ready transaction",
+        "the tombstoned object stays deleted"
+      ],
+      "integration_gates": ["P1", "P2", "P6"]
+    },
+    {
+      "case_id": "M18",
+      "case_version": "1.0.0",
+      "primary_category": "parser-cas",
+      "barrier": "deliver a parser completion after the caller already adopted a newer result",
+      "required_observations": [
+        "the late completion cannot change the adopted result or readiness",
+        "the event is recorded without becoming readiness"
+      ],
+      "integration_gates": ["P1", "P6"]
+    },
+    {
+      "case_id": "M19",
+      "case_version": "1.0.0",
+      "primary_category": "parser-cas",
+      "barrier": "deliver the same parser completion twice",
+      "required_observations": [
+        "the second delivery is idempotent",
+        "one adoption transaction commits"
+      ],
+      "integration_gates": ["P1", "P6"]
+    },
+    {
+      "case_id": "M20",
+      "case_version": "1.0.0",
+      "primary_category": "parser-cas",
+      "barrier": "deliver completions out of order relative to job generation",
+      "required_observations": [
+        "only the current generation can reach ready",
+        "an older generation is rejected by the generation check"
+      ],
+      "integration_gates": ["P1", "P6"]
+    },
+    {
+      "case_id": "M21",
+      "case_version": "1.0.0",
+      "primary_category": "cancellation",
+      "barrier": "cancel while a parser worker is still computing",
+      "required_observations": [
+        "the late worker result cannot publish ready",
+        "the cancelled state is durable and visible after restart"
+      ],
+      "integration_gates": ["P2", "P6", "P7"]
+    },
+    {
+      "case_id": "M22",
+      "case_version": "1.0.0",
+      "primary_category": "reconciliation",
+      "barrier": "crash at each durable cut point; restart and reconcile",
+      "required_observations": [
+        "a pending inbox record reconciles parser-owned status without treating the notification as readiness",
+        "each cut point has a durable before/after assertion",
+        "Redis presence alone is never read as a business result"
+      ],
+      "integration_gates": ["P1", "P5", "P6", "P7"]
+    },
+    {
+      "case_id": "M23",
+      "case_version": "1.0.0",
+      "primary_category": "typed-failure",
+      "barrier": "request an absent or tombstoned resource",
+      "required_observations": [
+        "the response is a typed 404",
+        "the state is not rendered as retryable failure"
+      ],
+      "integration_gates": ["P7"]
+    },
+    {
+      "case_id": "M24",
+      "case_version": "1.0.0",
+      "primary_category": "typed-failure",
+      "barrier": "inject a retryable service or storage failure, then a timeout",
+      "required_observations": [
+        "the response stays a retryable 5xx or timeout state",
+        "it never becomes false absence, false readiness, or successful completion",
+        "an uncertain external effect is reconciled by operation identity before replay"
+      ],
+      "integration_gates": ["P3", "P7"]
+    },
+    {
+      "case_id": "M25",
+      "case_version": "1.0.0",
+      "primary_category": "ledger-trace",
+      "barrier": "sample or drop diagnostic spans; toggle the trace exporter off and on; fail the exporter",
+      "required_observations": [
+        "attempt numerators and denominators reproduce from the durable tool outcome ledger",
+        "removing spans, UI rows, or receipts does not change any metric",
+        "unknown outcomes stay visible and separate from success",
+        "a zero eligible denominator reports N/A",
+        "a failing exporter does not fail the turn",
+        "artifacts carry no credentials, raw environment values, or source content"
+      ],
+      "integration_gates": ["P3"]
+    }
+  ]
+}

@@ -11,7 +11,7 @@ What it drives is the compiled host graph (``compile_graph``) with its
 normal scripted LLM, so the whole hop is on the path: the cascade names a
 档 from the utterance → ``classify_node`` writes the run's audit →
 ``model`` → the single ``retrieve`` tool → the reader in
-``fin.host.search_mode_decision`` → ``fin.retrieve.tool`` → the port →
+``fin.host.grounded.search_mode_decision`` → ``fin.retrieve.tool`` → the port →
 ``MCPRetrieveAdapter`` → the REAL stdio server over PG + ES + Neo4j.
 Nothing here calls the adapter by hand; the only adapter in the run is the
 one the graph was compiled with.
@@ -54,7 +54,7 @@ from fin.corpus.parsers._common import build_unit
 from fin.corpus.push import envelope_of_unit
 from fin.host.graph import compile_graph
 from fin.host.scripted_model import ScriptedChatModel
-from fin.host.search_mode_decision import assigned_retrieve_mode
+from fin.host.grounded.search_mode_decision import assigned_retrieve_mode
 from fin.host.state import reset_input_state
 from fin.retrieve.port import SEARCH_MODE_FILTER_KEY
 

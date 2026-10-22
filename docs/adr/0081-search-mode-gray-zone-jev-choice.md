@@ -1,7 +1,9 @@
 # 0081. Search-mode gray-zone classify is Jev Choice
 
 Date: 2026-09-21
-Status: accepted
+Status: accepted; superseded-by ADR-0104 unresolved-mode window/terminal-failure clause only
+
+> **Amended 2026-10-20:** [ADR 0104](0104-internal-search-mode-automatic-fallback.md) replaces unresolved mode selection with audited graph fallback and removes mode pickers from the interface. Fast/content windows and the remaining contracts stand. The decision is accepted and the correction is implemented on `fix/qa-design-correction-20261020`; the real-model browser acceptance is Not run because the external model provider is unavailable — see the [implementation report](../verification/2026-10-20-qa-design-correction-implementation.md). The original text below is retained as history.
 
 After Soft-Track has already chosen **grounded**, the search-mode ambiguous tier (rules miss, and inherit would not already decide) is a TypeSafe **Jev** closed-set Choice over `A | graph | global | D` on the same host client as ADR 0080. MiniMax `FIN_MODEL` JSON classify is removed from that tier and is not a fallback. Low confidence, missing key, or judge-down follows the existing cascade: **choice window** or typed 具名失败 — never silent **global**. Default pytest injects a Fake Choice. Landing this path **requires** a live Jev item (real key, assert a real 档 Choice); missing key blocks done — never a green Fake pass counted as live. Wire tokens follow `graph` / `global`, not lasting `B` / `C`. Ranking stays in iknow (ADR 0061). This amends ADR 0062’s “structured classify” clause only.
 

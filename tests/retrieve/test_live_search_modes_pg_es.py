@@ -1,4 +1,4 @@
-"""fin the tracked change task 2: cross-repo search-mode driver on real PG + ES + Neo4j.
+"""Task 2: cross-repo search-mode driver on real PG + ES + Neo4j.
 
 The default ``uv run pytest -q`` never runs this file — it is marked
 ``mcp`` and ``tests/retrieve/conftest.py`` deselects that mark unless
@@ -43,8 +43,8 @@ Focus assertions — what this fin-side driver PROVES (spec
   transport.
 
 What this driver does NOT prove: graph-priority REORDERING is iknow's
-internal contract, validated against real Neo4j + GDS in the tracked change
-task 3 (``iknow-memory/tests/integration/neo4j-ppr-arm.test.ts``).
+internal contract, validated against real Neo4j + GDS in iknow task 3
+(``iknow-memory/tests/integration/neo4j-ppr-arm.test.ts``).
 Here entity extraction needs an LLM while the harness runs fake
 embeddings against an empty ``ANTHROPIC_AUTH_TOKEN``, so the
 entity-less corpus gives the graph arm no seeds and no reorder is
@@ -78,7 +78,7 @@ import pytest
 from fin.corpus.chunking import split_unit
 from fin.corpus.parsers._common import build_unit
 from fin.corpus.push import envelope_of_unit
-from fin.host.evidence_contract import seed_context_from_rows, validate_evidence
+from fin.host.evidence.evidence_contract import seed_context_from_rows, validate_evidence
 from fin.host.named_failures import (
     COMMUNITY_SUMMARY_INDEX_FAILURE,
     SQL_PRODUCER_FAILURE_CODES,
@@ -417,7 +417,7 @@ def test_a_global_send_reaches_the_server_and_surfaces_the_runtime_index_failure
 def test_sql_tier_reaches_the_real_producer_with_the_full_stack_live(
     live: Any,
 ) -> None:
-    """A2 (the tracked change T7) retired this file's old 「真库未接 refuses at the
+    """A2 (T7) retired this file's old 「真库未接 refuses at the
     door」pin: the sql 档 is OPEN, so a ledger request with a bindable
     window SPENDS its wire call — the acceptance mirror of the refusal the
     routing table used to answer. The live producer then answers under its

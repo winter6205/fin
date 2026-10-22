@@ -32,16 +32,21 @@ from fin.corpus.errors import (
     ExtractMethodConflictError,
     ExtractMethodTargetMissingError,
 )
-from fin.host import extract_method_proposal as host_proposal
+from fin.host.question import extract_method_proposal as host_proposal
 
 
 def _valid_row(**overrides: object) -> dict[str, object]:
+    # ``title`` and ``doc_type`` are required non-empty fields of the T6
+    # row contract; every case here is about ``extract_method``, so the
+    # fixture carries the minimum that satisfies the row contract.
     row: dict[str, object] = {
         "document_id": "TEST-2023Q1",
         "company": "TEST",
         "period": "2023 Q1",
         "version": "a" * 64,
         "page_count": 3,
+        "title": "Test filing",
+        "doc_type": "narrative",
     }
     row.update(overrides)
     return row

@@ -121,6 +121,30 @@ class IngestStateStore(Protocol):
         """
         ...
 
+    def append_audit(
+        self,
+        document_id: str,
+        action: str,
+        metadata: Mapping[str, Any],
+        *,
+        actor: str | None = None,
+    ) -> IngestAuditRow:
+        """Append one process-level event row outside the state machine.
+
+        T6's durable publication events (``upload_metadata_accepted``,
+        ``push_succeeded``, the ``catalog_publication_*`` family) are
+        audit FACTS about a job, not state transitions: they carry no
+        ``from_state``/``to_state`` and must never move the job. Writing
+        them through ``transition`` would invent states; writing them
+        only through store internals would leave the durable store and
+        this one diverging on the row shape.
+
+        ``metadata`` is the event's JSON object (already schema-checked
+        by the caller); ``actor`` defaults to the process identity like
+        every other audit write.
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class IngestAuditRow:
@@ -412,6 +436,28 @@ def job_superseded_audit(
     )
 
 
+def event_audit(
+    document_id: str,
+    action: str,
+    metadata: Mapping[str, Any],
+    actor: str | None,
+    now: datetime,
+) -> IngestAuditRow:
+    """One state-machine-external event row, shared by both stores.
+
+    The event row has no ``from_state`` / ``to_state``: it records a
+    publication fact, not a machine move, so a reader can tell the two
+    apart by shape alone.
+    """
+    return IngestAuditRow(
+        document_id=document_id,
+        action=action,
+        actor=actor or _process_actor(),
+        occurred_at=now,
+        metadata=dict(metadata),
+    )
+
+
 __all__ = [
     "ALL_DOCUMENTS",
     "AllDocuments",
@@ -424,6 +470,7 @@ __all__ = [
     "coerce_state",
     "coerce_state_filter",
     "coerce_request",
+    "event_audit",
     "failure_guard",
     "job_created_audit",
     "job_superseded_audit",

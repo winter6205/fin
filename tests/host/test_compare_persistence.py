@@ -35,7 +35,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.evidence_contract import AdmissionContext, validate_evidence
+from fin.host.evidence.evidence_contract import AdmissionContext, validate_evidence
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.thread_store import InMemoryThreadStore, RunRecord
 from fin.host.tools.compare_facts import COMPARISON_SCHEMA

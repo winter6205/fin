@@ -38,21 +38,21 @@ from fin.host.agent_instructions import (
     VISUAL_LANE_INSTRUCTIONS_MARKER,
     messages_for_model,
 )
-from fin.host.attachment_budgets import (
+from fin.host.attachment.attachment_budgets import (
     AttachmentBudgets,
     VisionCallLedger,
 )
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_source_read import AttachmentSourceReader
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_source_read import AttachmentSourceReader
+from fin.host.attachment.attachment_store import (
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
     StoredPageRegion,
 )
-from fin.host.attachment_vision import VisionCallResult, VisionUsage
+from fin.host.attachment.attachment_vision import VisionCallResult, VisionUsage
 from fin.host.state import reset_input_state
 from fin.host.thread_store import InMemoryThreadStore
-from fin.host.visual_evidence import (
+from fin.host.evidence.visual_evidence import (
     VISUAL_CLAIM_FIELDS,
     VISUAL_EVIDENCE_KIND,
     VISUAL_LANE_UNWIRED,

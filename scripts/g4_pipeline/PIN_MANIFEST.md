@@ -39,7 +39,7 @@ It recorded a legacy image id and `docling-parse 7.21.0`, while
 `results/image_pip_freeze.txt` recorded `docling-parse 7.22.1`. Neither
 authority is prose; both are committed artifacts. That is L7 in
 `docs/validation/2026-09-29-g4-t5-unit-citation-legacy-removal.md`, and it is
-the defect the tracked change task C1 set out to remove. That legacy digest is
+the defect task C1 set out to remove. That legacy digest is
 `8e10185f…`, and it is unreachable by any current builder; *Builder
 reproducibility* below is where it is recorded as history, because a value
 this section still calls the expectation would be a live claim.
@@ -52,7 +52,7 @@ this section still calls the expectation would be a live claim.
 | `sha256:0f278c22…` | `results/image_identity.txt` | the **observed identity** of a rebuild that drifted |
 | `python:3.12-slim@sha256:44ff437b…` | `Dockerfile` | the **digest-pinned base** the pin is now anchored to |
 
-`b1b5270c…` is the expectation, and it is **not** `0f278c22…`: the tracked change forbids
+`b1b5270c…` is the expectation, and it is **not** `0f278c22…`: the pin contract forbids
 silently replacing the expected digest, and `0f278c22…` is the very artifact
 whose drift was the open defect, so adopting it would launder the bug into the
 contract. `b1b5270c…` was adopted instead because two independent clean builds
@@ -136,7 +136,7 @@ two full builds have since been run: they agreed on `b1b5270c…`, and the
 operator adopted it as `expected_image_id`, so §1 is the current statement and
 this subsection is history. The legacy digest stays unreachable either way.
 
-**Builder provenance is mechanical.** the tracked change asks for package, OS, base,
+**Builder provenance is mechanical.** The C1 contract asks for package, OS, base,
 builder, model and source provenance to be checkable "without prose-only
 pins". All six are now declared in `image-pin.json` / lock files and verified
 before or after each build. The builder block names engine, buildx builder,
@@ -298,7 +298,7 @@ check the cache against `models.lock` before any measurement.
 
 ## 5. Heron / TableFormer artifact pins (host-mounted cache, never baked into the image)
 
-Host cache root: `<host-model-cache>` (a local directory such as `$HOME/.cache/fin-g4-docling-models`) → mounted read-write at
+Host cache root: `/home/operator/.cache/fin-g4-docling-models` → mounted read-write at
 `/models` (`DOCLING_ARTIFACTS_PATH=/models`, `HF_HOME=/models/hf`).
 Measured size of the cache after a complete fetch: **701,236,013 bytes** (`du -sb`),
 **70 files**, `670M` on disk (`du -sh`).
@@ -368,7 +368,7 @@ against `models.lock`):
 docker run --rm --memory=4g --memory-swap=4g --cpus=4 --user 1000:1000 --env HOME=/tmp \
   --env HF_HOME=/models/hf --env DOCLING_ARTIFACTS_PATH=/models \
   --env HF_HUB_DISABLE_XET=1 --env HF_HUB_DOWNLOAD_TIMEOUT=180 --env HF_HUB_ETAG_TIMEOUT=120 \
-  --volume <host-model-cache>:/models \
+  --volume /home/operator/.cache/fin-g4-docling-models:/models \
   --entrypoint /usr/local/bin/python fin-g4-pipeline:t2a - \
   docling-project/docling-layout-heron@8f39ad3c0b4c58e9c2d2c84a38465abf757272d8:/models/docling-project--docling-layout-heron \
   docling-project/docling-models@fc0f2d45e2218ea24bce5045f58a389aed16dc23:/models/docling-project--docling-models \
@@ -422,9 +422,9 @@ docker run \
   --env HF_HUB_DISABLE_TELEMETRY=1 \
   --env HF_HUB_DISABLE_XET=1 \
   --env PYTHONPATH=/worktree/src \
-  --volume <fin-checkout>:/worktree:ro \
+  --volume /home/operator/projects/fin-wt-g4-attachment:/worktree:ro \
   --volume <...>/scripts/g4_pipeline/results/<run>:/out \
-  --volume <host-model-cache>:/models \
+  --volume /home/operator/.cache/fin-g4-docling-models:/models \
   --entrypoint python fin-g4-pipeline:t2a \
   /worktree/scripts/g4_pipeline/driver.py --pdf <pdf> --artifacts /models --write-images --image-dir /out/pages
 ```

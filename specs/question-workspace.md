@@ -1,5 +1,9 @@
 # Spec: Question experience workspace
 
+> **Adopted QA-chain amendment (2026-10-16):** The operator accepted the routing, retrieval, lifecycle and scoped persistence proposals. This canonical module contract incorporates the relevant behaviour below; the [shared wire contract](question-task-runtime-contract.md) freezes representation. [Routing/grounded](qa-chain-grounded-experience.md), [server/receipts](qa-chain-server-runtime.md), and [catalog/retrieval](qa-chain-corpus-retrieval.md) own their deltas. The journey acceptance contract remains the sole integrated acceptance gate. No implementation or acceptance pass is claimed.
+
+> **Adopted clarification-continuation correction (2026-10-20):** A content clarification is a terminal question plus a new-message continuation; only the document-choice interrupt remains an interactive resumable pause. The [host contract](search-mode-host.md#clarification-contract) owns the trigger, candidate and identity rules. This is implemented on `fix/qa-design-correction-20261020`; the evidence is still being recorded in the [implementation report](../docs/verification/2026-10-20-qa-design-correction-implementation.md), and no passing-check claim is made here.
+
 > **Status:** Decision-level contract for one of four independently developed modules. It records product behavior and ownership, not an implementation design.
 > **Architecture review:** Passed decision-only review; [review record](question-task-runtime.md#architecture-change-review). No implementation approval is implied.
 
@@ -39,13 +43,17 @@ Keep the task experience within the current research-thread surface and preserve
 
 ### Clarification and original input
 
-Show the complete question before its options. The operator can choose an offered option or select Other; free text appears inside the selected Other option. Preserve the exact text, selected option, and association with the original question and its originating basis. Do not preselect an answer.
+Show the complete question before its options. The operator can choose an offered option or select Other; free text appears inside the selected Other option. When the host offers only the reserved Other — no real document option — the card presents the free-text field directly, with no Other button to click first, and submits the non-blank text with the reserved `other` choice. Preserve the exact text, selected option, and association with the original question and its originating basis. Do not preselect an answer.
+
+A content clarification is the turn's terminal question: the host asks it after retrieval and performs no further work on that turn. The reply is a new input, not a resume. The workspace submits it through the normal send door with `question_id` and the selected choice or free text; Runtime admits it once and opens a new turn in the same thread. The answered turn stays terminal, and the unchanged task goal plus the thread transcript carry the original question as context. No interrupt, paused run, or resume participates, and the workspace never presents a content clarification as resumable. The pending question must carry the turn's real `task_id`: the host never publishes a task clarification with an empty one, and the workspace decoder keeps rejecting a task clarification whose `task_id` is empty. A send carrying an unknown `question_id` but no answer value is submitted as an ordinary follow-up message and is never silently swallowed; an answer attempt naming an unknown or superseded question, or a question that already has an accepted answer, still follows the stale-reply refusal.
+
+The document-choice question is the one interactive exception. Its interrupt pauses the graph, and an accepted reply (a candidate pick or Other with free text) continues that same paused run and receipt through the existing resume path (`Command(resume=...)`, also exposed as `POST /resume`). Reload displays it from the committed pending question without a bodyless resume. Its deterministic candidate labels and four-choice bound remain the shared wire contract's; the terminal content-clarification rules above do not apply to it. The two mechanisms must not be presented or wired as interchangeable.
 
 The browser sends the original clarification response with its question association to Runtime. Runtime validates whether the question still applies, assigns accepted-input identity, and determines the resulting task state. The browser does not invent or change task identity, current basis, or revision.
 
 Dismissing or collapsing a clarification is presentation-only. It supplies no default answer, does not answer or cancel the task, and leaves the pending question recoverable from authoritative state. A rejected stale reply does not mutate, reactivate, or answer another task. Preserve the original question association and the user's draft; never silently rebase the old reply onto a new question.
 
-If a transport retry is needed, resend the identical reply with its original question association. A valid clarification continues the same task unless Runtime explicitly reports a task change. Runtime's acceptance or rejection controls what the workspace displays; local selection alone does not count as an accepted answer.
+If a transport retry is needed, resend the identical reply with its original question association. A valid clarification continues the same task unless Runtime explicitly reports a task change: a content clarification continues it in a new turn, while a document-choice reply continues it in the paused run. Runtime's acceptance or rejection controls what the workspace displays; local selection alone does not count as an accepted answer.
 
 ### Active work, outcomes, and history
 
@@ -63,37 +71,45 @@ Runtime orders and reconciles accepted user inputs. The workspace distinguishes 
 
 The conceptual UI seam is an authoritative current projection for display and a user-intent submission that preserves original text and question association. Source Scope supplies effective scope and capabilities; Grounded Answer supplies semantic assessment; Runtime supplies lifecycle truth. The host integrator owns shared mapping and persistence.
 
-Before parallel implementation begins, the module owners must freeze one concrete shared representation for this seam. This spec deliberately does not select its model, wire, or store form.
+The [shared wire contract](question-task-runtime-contract.md) now freezes this seam for independent implementation; this module does not duplicate its field definitions.
+
+### Adopted QA-chain presentation and replies
+
+Document-choice clarification displays at most four admitted title/section labels and supported summaries, followed by the existing Other action labelled “换个问法”. Reload reads the complete question from Runtime's single pending question; it does not resume execution. A click is submitted to normal reply admission with the original question/choice IDs. Other opens its input first; actual submission preserves exact free text. Runtime's successful reply acceptance advances input history once and continues the same run/receipt; duplicate or stale clicks cannot launch another execution. The [shared wire contract](question-task-runtime-contract.md#document-clarification-and-accepted-input-scheduling) owns fields and bounds. This subsection describes the document-choice exception only; the terminal content clarification above keeps its new-turn continuation and is never rendered or wired as this resumable pick.
+
+Show the accepted corpus/attachment restriction as saved intent and the fresh Source Scope evaluation separately. New questions and mode-only changes do not clear it. Only an explicit user scope change accepted by Runtime replaces/clears it. Attachments state “仅在本对话中可用”; inaccessible sources are never presented as usable merely because a saved selection names them.
+
+All answer views use the same admitted readable projection, inline `[n]` markers and trailing clickable sources. The default surface omits internal tool/engine/slot identifiers and receipt panels while existing developer diagnostics remain available. Progress remains responsive without exposing unverified answer text. Use distinct index/busy/insufficient-evidence copy from the [grounded contract](qa-chain-grounded-experience.md), and generic Chinese copy rather than financial-slot prerequisites.
 
 ## Success Criteria
 
-These are required observations, not implementation steps or a separate acceptance suite. Module-local workspace contract verification is distinct from the tracked change's final four-module H/M/B acceptance gate.
+These are required observations, not implementation steps or a separate acceptance suite. Module-local workspace contract verification is distinct from the journey acceptance contract's final four-module H/M/B acceptance gate.
 
 | Criterion | Pass condition | Acceptance mapping |
 | --- | --- | --- |
-| SC-1: Current task visibility | The thread surface shows Runtime-reported task outcome, turn result, and material gaps separately from run status. Citations and run completion never cause the workspace to infer task completion. | the tracked change J01–J21 browser journeys, as applicable. |
-| SC-2: Truthful source visibility | Current restrictions and capabilities reflect fresh host authority; a saved restriction is not displayed as a current grant. Actual answer sources are separate from eligible sources. No technique picker or impossible source menu appears. | the tracked change J03–J05, J08–J12, J15, J20, and J22 source-related checks. |
-| SC-3: Complete clarification | The full question and all options are available; Other text is inside the selected Other option; exact original text and question association reach Runtime. Dismissal supplies no answer and leaves the question recoverable. | the tracked change J06–J07 and mapped clarification journeys. |
-| SC-4: Stale reply safety | A stale reply is rejected without mutating or reactivating a task, applying to another question, or losing its original association and user draft. | Applicable the tracked change stale-input and lifecycle journeys. |
-| SC-5: Input during active work | Compatible follow-up input can be accepted while work is visibly active. It does not trigger concurrent graph execution or automatic cancellation of unaffected work. | the tracked change J14/J16 browser journeys. |
-| SC-6: Recovery and restore | Reload displays persisted current task and pending question without a bodyless-resume workaround. Archive and completion remain distinct; explicit restore waits for Runtime revalidation and preserves historical evidence. | Applicable the tracked change browser journeys through real persistence. |
-| SC-7: Required browser coverage | Mapped browser journeys J01–J21 complete through the integrated application. J22 browser inspection is covered through J08/J21 as the manifest specifies. | the tracked change B assignments and evidence rules; no separate acceptance spec. |
+| SC-1: Current task visibility | The thread surface shows Runtime-reported task outcome, turn result, and material gaps separately from run status. Citations and run completion never cause the workspace to infer task completion. | J01–J21 browser journeys, as applicable. |
+| SC-2: Truthful source visibility | Current restrictions and capabilities reflect fresh host authority; a saved restriction is not displayed as a current grant. Actual answer sources are separate from eligible sources. No technique picker or impossible source menu appears. | J03–J05, J08–J12, J15, J20, and J22 source-related checks. |
+| SC-3: Complete clarification | The full question and all options are available; a content clarification is terminal and its reply opens a new turn in the same thread, while a document-choice reply continues its paused run; Other text is inside the selected Other option, or, when the host offers only the reserved Other, the free-text field is presented directly with no Other button; exact original text and question association reach Runtime. Dismissal supplies no answer and leaves the question recoverable. | J06–J07 and mapped clarification journeys. |
+| SC-4: Stale reply safety | A stale reply is rejected without mutating or reactivating a task, applying to another question, or losing its original association and user draft. | Applicable stale-input and lifecycle journeys. |
+| SC-5: Input during active work | Compatible follow-up input can be accepted while work is visibly active. It does not trigger concurrent graph execution or automatic cancellation of unaffected work. | J14/J16 browser journeys. |
+| SC-6: Recovery and restore | Reload displays persisted current task and pending question without a bodyless-resume workaround. Archive and completion remain distinct; explicit restore waits for Runtime revalidation and preserves historical evidence. | Applicable browser journeys through real persistence. |
+| SC-7: Required browser coverage | Mapped browser journeys J01–J21 complete through the integrated application. J22 browser inspection is covered through J08/J21 as the manifest specifies. | The journey acceptance contract's B assignments and evidence rules; no separate acceptance spec. |
 
-The final integrated gate retains the tracked change's full H/M/B assignments and repetitions across all four modules. Module-local UI verification may establish the presentation/input seam, but cannot be reported as integrated acceptance. No acceptance run is claimed here.
+The final integrated gate retains the journey acceptance contract's full H/M/B assignments and repetitions across all four modules. Module-local UI verification may establish the presentation/input seam, but cannot be reported as integrated acceptance. No acceptance run is claimed here.
 
 ## Open Questions
 
-No product-behavior decision remains open. Exact model/store mapping, transport, screen layout and copy, accessibility implementation, retry encoding, and fixture/runner details are downstream choices and are not selected here. Module owners must agree on the common representation before parallel implementation. If repository constraints require changing approved behavior or adding a new authority, return that decision to the operator first.
+No product or shared-wire decision remains open for the adopted scope. The shared contract selects reply admission, origin association, retry semantics and source/question projection; the QA-chain grounded contract selects the required copy and admitted presentation. Detailed layout, accessibility implementation and fixture/runner choices remain implementation work. A change to the approved behaviour or state authority requires a new operator decision.
 
 ## Inherits / Changes
 
 ### Confirmed inherited assumptions
 
 1. The product remains a durable research thread in the current local workspace; the task experience does not become a new route or one-shot surface. **Confirmed by** [ADR 0025](../docs/adr/0025-ordinary-person-workspace.md), [ADR 0026](../docs/adr/0026-workspace-streaming-resume.md), [docs/context-map.md](../docs/context-map.md), and the user's four-module scope.
-2. Users do not preselect documents or retrieval techniques for an ordinary question. Current effective scope comes from Source Scope and existing permission. **Confirmed by** issue and [question-source-scope.md](question-source-scope.md).
-3. Runtime owns input ordering, task lifecycle, persistence, pending-question truth, and stale-reply decisions; Workspace presents and submits operator intent. **Confirmed by** issue, issue, and [question-task-runtime.md](question-task-runtime.md).
-4. Source Scope owns permission-constrained selection; Grounded Answer judges semantic support and completion. Workspace presents both owners' current results without substituting its own decisions. **Confirmed by** issue, issue, [question-source-scope.md](question-source-scope.md), and [question-grounded-answer.md](question-grounded-answer.md).
-5. the tracked change v1.0 is the sole integrated acceptance contract; this spec defines no fifth acceptance document. **Confirmed by** issue and the user's direction.
+2. Users do not preselect documents or retrieval techniques for an ordinary question. Current effective scope comes from Source Scope and existing permission. **Confirmed by** [question-source-scope.md](question-source-scope.md).
+3. Runtime owns input ordering, task lifecycle, persistence, pending-question truth, and stale-reply decisions; Workspace presents and submits operator intent. **Confirmed by** [question-task-runtime.md](question-task-runtime.md).
+4. Source Scope owns permission-constrained selection; Grounded Answer judges semantic support and completion. Workspace presents both owners' current results without substituting its own decisions. **Confirmed by** [question-source-scope.md](question-source-scope.md), and [question-grounded-answer.md](question-grounded-answer.md).
+5. The journey acceptance contract v1.0 is the sole integrated acceptance contract; this spec defines no fifth acceptance document. **Confirmed by** the journey acceptance contract and the user's direction.
 
 The exact relevant glossary entry in [`docs/CONTEXT.md`](../docs/CONTEXT.md) is:
 

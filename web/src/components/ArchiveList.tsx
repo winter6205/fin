@@ -23,7 +23,7 @@ import {
   type RestoreDecision,
   type RestoreState,
 } from "../archiveRestore";
-import { TASK_RUNTIME_REFUSAL_COPY, type TaskRuntimeDecodeRefusal } from "../taskRuntime";
+import { TASK_RUNTIME_REFUSAL_COPY, type TaskRuntimeDecodeRefusal } from "../capabilities/task/taskRuntime";
 import { useWorkspaceStore } from "../store";
 
 /** Which paragraph a verdict occupies, and its tone. Only ``refused`` and

@@ -14,7 +14,7 @@
 //      terminal status, thinking prose leaking into the answer, a
 //      citation set that contradicts the status)
 //   2  the lane could not run (server never came up, thread could not
-//      be created, browser harness missing) — never reported as a pass
+//      be created, model config missing, browser harness missing) — never a pass
 //   3  FIN_API_KEY is missing: nothing was started
 //
 // Why exit 3 exists, and why the check lives HERE: `fin.host.compile`
@@ -31,17 +31,16 @@
 // `scripts/`, is reached only by the command above, and starts its own
 // server on a free port.
 
-import { execFile } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import path from "node:path";
-import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import {
   REPO_ROOT,
   ensureSpaBuild,
-  exists,
   freePort,
-  readCompileDefaults,
+  readDefaultBaseUrl,
   run,
   startWorkspace,
   stopWorkspace,
@@ -50,7 +49,6 @@ import {
 } from "./lib/workspace-server.mjs";
 
 const RUNNER = path.join(REPO_ROOT, "scripts", "run-stream-checks.mjs");
-const DOTENV = path.join(REPO_ROOT, ".env");
 
 const EXIT_OK = 0;
 const EXIT_CHECK_FAILED = 1;
@@ -86,11 +84,12 @@ Options:
   --json              print the raw report as JSON instead of the table
   -h, --help          this text
 
-Requires ${CREDENTIAL_VAR} in the environment (or in ./.env, which this
-lane applies to the server child the way \`fin-serve\` does). Without it
-the lane exits ${EXIT_MISSING_CREDENTIAL} and starts nothing — it never skips quietly.
+Requires ${CREDENTIAL_VAR} in the environment or llm.apiKey in ~/.fin/settings.yaml
+(this lane applies that file to the server child the way \`fin-serve\` does).
+Without it the lane exits ${EXIT_MISSING_CREDENTIAL} and starts nothing — it never skips quietly.
 Provider selection is read from FIN_MODEL / FIN_BASE_URL, in the
-environment or in that same ./.env; no credential value is ever printed.`;
+environment or in that same file. FIN_MODEL is required; no compiled-in model
+fallback exists. No credential value is ever printed.`;
 
 function log(message) {
   console.log(`live-smoke: ${message}`);
@@ -147,100 +146,66 @@ function parseArgs(argv) {
   return opts;
 }
 
-// ----- operator ./.env -----
-
-// Same shape `fin.host.operator_env.parse_env_file` reads, because
-// `childEnv` below fills the server child from this file exactly as
-// `fin-serve` does: a token that lives only in that file is a token
-// the run really has, and aborting on it would be a false alarm.
-// Values are parsed, never logged.
-function parseEnvFile(text) {
-  const pairs = new Map();
-  for (const raw of text.split("\n")) {
-    let line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    if (line.startsWith("export ")) line = line.slice("export ".length).trim();
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const key = line.slice(0, eq).trim();
-    if (!key) continue;
-    let value = line.slice(eq + 1).trim();
-    if (value.length >= 2 && value[0] === value[value.length - 1] && (value[0] === '"' || value[0] === "'")) {
-      value = value.slice(1, -1);
+export function resolveConfiguredModel({
+  override = "",
+  env = process.env,
+  settings = {},
+} = {}) {
+  for (const candidate of [override, env.FIN_MODEL, settings.FIN_MODEL]) {
+    if (typeof candidate === "string" && candidate.trim() !== "") {
+      return candidate.trim();
     }
-    pairs.set(key, value);
   }
-  return pairs;
+  return "";
 }
 
-// `git rev-parse --git-common-dir` prints the main checkout's `.git`.
-// Its parent is that checkout. A linked worktree's own root has no
-// `.env`; the closest file still wins when this checkout has one.
-function gitCommonDir(repoRoot) {
-  return new Promise((resolve) => {
-    execFile(
-      "git",
-      ["-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { encoding: "utf8" },
-      (error, stdout) => {
-        if (error) {
-          resolve(null);
-          return;
-        }
-        const text = String(stdout ?? "").trim();
-        resolve(text ? path.resolve(repoRoot, text) : null);
-      },
-    );
-  });
-}
+// ----- operator ~/.fin/settings.yaml -----
 
-async function isRegularFile(target) {
+// `fin-serve` calls `apply_operator_settings` before it binds. This lane
+// starts uvicorn directly, so it asks the same helper and fills the child
+// the same way: an explicit process variable still wins. Values are never
+// logged. There is no `.env` read.
+const SETTINGS_PYTHON = `
+import json
+from fin.host.operator_settings import projected_additions
+print(json.dumps(projected_additions()))
+`;
+
+function loadOperatorSettings() {
+  const venvPython = path.join(REPO_ROOT, ".venv", "bin", "python");
+  const command = existsSync(venvPython) ? venvPython : "uv";
+  const args = existsSync(venvPython)
+    ? ["-c", SETTINGS_PYTHON]
+    : ["run", "python", "-c", SETTINGS_PYTHON];
+  let stdout;
   try {
-    return (await stat(target)).isFile();
-  } catch {
-    return false;
+    stdout = execFileSync(command, args, {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    });
+  } catch (error) {
+    const stderr = error && error.stderr ? String(error.stderr).trim() : "";
+    throw new Error(stderr || "could not read ~/.fin/settings.yaml");
   }
+  return JSON.parse(stdout);
 }
-
-async function resolveDotenvPath() {
-  if (await exists(DOTENV)) return DOTENV;
-  const commonDir = await gitCommonDir(REPO_ROOT);
-  if (commonDir === null) return DOTENV;
-  const parent = path.dirname(commonDir);
-  if (path.resolve(parent) === path.resolve(REPO_ROOT)) return DOTENV;
-  const mainEnv = path.join(parent, ".env");
-  if (await isRegularFile(mainEnv)) return mainEnv;
-  return DOTENV;
-}
-
-// Read the file once: the credential gate and the child environment
-// must agree about what it says, or the lane could abort on a token
-// the server would have had (or boot a provider the report never
-// names).
-async function readDotenv(dotenvPath = DOTENV) {
-  if (!(await exists(dotenvPath))) return new Map();
-  try {
-    return parseEnvFile(await readFile(dotenvPath, "utf8"));
-  } catch {
-    /* unreadable .env is the same as absent — the server logs it too */
-    return new Map();
-  }
-}
-
-// ----- credential gate -----
 
 // Whitespace-only counts as missing: `_read_env` in
 // `fin.host.compile` treats a blank the same way and falls through to
 // the placeholder key, which is exactly the silent path this gate
 // exists to close.
-function resolveCredential(name, { env = process.env, dotenv, dotenvPath = DOTENV }) {
+function resolveCredential(name, { env = process.env, settings }) {
   const fromProcess = env[name];
   if (typeof fromProcess === "string" && fromProcess.trim() !== "") {
     return { present: true, source: "the process environment", value: fromProcess };
   }
-  const fromFile = dotenv.get(name);
+  const fromFile = settings[name];
   if (typeof fromFile === "string" && fromFile.trim() !== "") {
-    return { present: true, source: `${dotenvPath} (applied to the server child)`, value: fromFile };
+    return {
+      present: true,
+      source: "~/.fin/settings.yaml (applied to the server child)",
+      value: fromFile,
+    };
   }
   return { present: false, source: "", value: "" };
 }
@@ -259,13 +224,25 @@ function abortMissingCredential() {
     "missing credential would otherwise surface as an ordinary provider 401.",
     "",
     "Set it (the value is never printed by this lane) and re-run:",
-    `  export ${CREDENTIAL_VAR}=...        # or add it to ./.env`,
+    `  export ${CREDENTIAL_VAR}=...        # or set llm.apiKey in ~/.fin/settings.yaml`,
     "  node scripts/run-live-smoke.mjs",
     "",
     "The credential-free browser lane is `node scripts/run-scripted-e2e.mjs`.",
   ];
   for (const line of lines) console.error(line ? `live-smoke: ${line}` : "live-smoke:");
   return EXIT_MISSING_CREDENTIAL;
+}
+
+function abortMissingModel() {
+  const lines = [
+    "FIN_MODEL is not configured — this lane will not start without a model selection.",
+    "",
+    "Nothing was started: no workspace server, no browser, no provider call.",
+    "Set FIN_MODEL in the process environment or llm.model in ~/.fin/settings.yaml,",
+    "or pass --model=NAME for this run.",
+  ];
+  for (const line of lines) console.error(line ? `live-smoke: ${line}` : "live-smoke:");
+  return EXIT_LANE;
 }
 
 // ----- provider config (names and non-secret values only) -----
@@ -281,22 +258,16 @@ function safeOrigin(url) {
   }
 }
 
-// `fin-serve` calls `fin.host.operator_env.apply_dotenv` before it
-// binds, so for an operator the ./.env file IS the configured
-// provider. This lane cannot boot through `fin-serve` — that entry
-// point hardcodes 0.0.0.0:8000 and the lane needs a free port — so it
-// starts `uvicorn fin.host.http:app`, and importing the app never
-// applies the file. Filling it here is what keeps "the CONFIGURED
-// provider" true: without it the child boots on `compile.py`'s own
-// `DEFAULT_MODEL` / `DEFAULT_BASE_URL` pair, which is a different
-// provider than the one the operator configured and fails in ways that
-// have nothing to do with stream fidelity. `setdefault` semantics,
-// exactly like `apply_dotenv`: an
-// explicit process variable still wins.
-function childEnv({ port, model, baseUrl, credential, dotenv }) {
+// This lane cannot boot through `fin-serve` — that entry point hardcodes
+// 0.0.0.0:8000 and the lane needs a free port — so it starts
+// `uvicorn fin.host.http:app`, and importing the app never applies
+// settings. Filling them here is what keeps "the CONFIGURED provider"
+// true. `setdefault` semantics, exactly like `apply_operator_settings`:
+// an explicit process variable still wins.
+function childEnv({ port, model, baseUrl, credential, settings }) {
   const env = { ...process.env };
-  for (const [key, value] of dotenv) {
-    if (!(key in env)) env[key] = value;
+  for (const [key, value] of Object.entries(settings)) {
+    if (!(key in env) && value !== "") env[key] = value;
   }
   env[CREDENTIAL_VAR] = credential;
   delete env[SCRIPTED_OPT_IN];
@@ -562,6 +533,25 @@ function printReport(report) {
   );
 }
 
+function beginLane(modelOverride) {
+  let settings;
+  try {
+    settings = loadOperatorSettings();
+  } catch (error) {
+    return { exit: laneError(error.message) };
+  }
+  const credential = resolveCredential(CREDENTIAL_VAR, { settings });
+  if (!credential.present) return { exit: abortMissingCredential() };
+  log(`${CREDENTIAL_VAR} found in ${credential.source} — value not printed`);
+  const model = resolveConfiguredModel({
+    override: modelOverride,
+    env: process.env,
+    settings,
+  });
+  if (!model) return { exit: abortMissingModel() };
+  return { settings, credential, model };
+}
+
 async function main(argv) {
   let opts;
   try {
@@ -575,13 +565,11 @@ async function main(argv) {
     return EXIT_OK;
   }
 
-  // FIRST, before any port, any build, any process: the credential.
-  // Both the gate and the server child read this same resolved file.
-  const dotenvPath = await resolveDotenvPath();
-  const dotenv = await readDotenv(dotenvPath);
-  const credential = resolveCredential(CREDENTIAL_VAR, { dotenv, dotenvPath });
-  if (!credential.present) return abortMissingCredential();
-  log(`${CREDENTIAL_VAR} found in ${credential.source} — value not printed`);
+  // Before any port, build, or server process, require both credentials and
+  // a model selection from this invocation, the process, or operator settings.
+  const lane = beginLane(opts.model);
+  if (lane.exit !== undefined) return lane.exit;
+  const { settings, credential, model } = lane;
 
   if (opts.browserChecks) {
     const spaError = await ensureSpaBuild({ log });
@@ -594,18 +582,15 @@ async function main(argv) {
   const baseUrl = `http://127.0.0.1:${port}`;
   const env = childEnv({
     port,
-    model: opts.model,
+    model,
     baseUrl: opts.baseUrl,
     credential: credential.value,
-    dotenv,
+    settings,
   });
-  const compiled = await readCompileDefaults();
-  const model =
-    env.FIN_MODEL ||
-    (compiled.model ? `${compiled.model} (compile.py default)` : "the FIN_MODEL default");
+  const defaultBaseUrl = await readDefaultBaseUrl();
   const origin =
     safeOrigin(env.FIN_BASE_URL) ||
-    safeOrigin(compiled.baseUrl) ||
+    safeOrigin(defaultBaseUrl) ||
     "the FIN_BASE_URL default";
 
   log(`booting the workspace on the configured provider at ${baseUrl}`);

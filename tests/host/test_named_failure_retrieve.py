@@ -40,6 +40,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import ExtractedPage, Locator
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host.agent_instructions import NO_EVIDENCE_REFUSAL
 from fin.host.graph import _make_retrieve_tool
 from fin.host.named_failures import (
     CORPUS_NOT_READY,
@@ -444,7 +445,10 @@ def test_the_product_adapter_over_an_empty_wire_still_names_the_empty_bound_coll
     assert ledger.count() == 0
     assert payload["status"] == "refuse"
     assert payload["reason"] == CORPUS_NOT_READY
+    # GE-5 / T10: index-work copy is DISTINCT from the refusal sentence the
+    # old table shared with ``insufficient_evidence``.
     assert payload["assistant_message"] == ORDINARY_PERSON_COPY[CORPUS_NOT_READY]
+    assert payload["assistant_message"] != NO_EVIDENCE_REFUSAL
 
 
 class _InterleavingWireAdapter(MCPRetrieveAdapter):

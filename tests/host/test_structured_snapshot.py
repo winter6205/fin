@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
-from fin.host.evidence_contract import compute_snapshot_digest, snapshot_canonical_json
-from fin.host.structured_snapshot import (
+from fin.host.evidence.evidence_contract import compute_snapshot_digest, snapshot_canonical_json
+from fin.host.evidence.structured_snapshot import (
     SAFE_INTEGER_MAX,
     STRUCTURED_SNAPSHOT_FIELDS,
     StructuredSnapshotError,

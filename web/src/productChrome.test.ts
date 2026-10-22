@@ -14,9 +14,15 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createElement } from "react";
+import { renderToString } from "react-dom/server";
+import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import { KNOWLEDGE_MCP_FAULT_COPY } from "./knowledgeMcp";
 import { PRODUCT_ROUTE_PATHS } from "./productRoutes";
+import { decideThreadEntryRoute } from "./App";
+import Sidebar from "./components/Sidebar";
+import { DemoHomeLink } from "./pages/ThreadPage";
 
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 const APP_PATH = join(SRC_DIR, "App.tsx");
@@ -137,9 +143,12 @@ describe("Sidebar chrome", () => {
 describe("dead corpus plumbing", () => {
   it("App.tsx does not fire the retired boot corpus fetch", () => {
     // The corpus-card chrome is gone, so nothing consumes GET /api/corpus
-    // at boot. The store slice stays for the out-of-chrome 入库 path.
+    // at boot. The store slice stays for the out-of-chrome 入库 path, and
+    // the T6 generic overview is loaded on demand by its own home surface
+    // rather than here.
     const source = readFileSync(APP_PATH, "utf8");
     expect(source).not.toContain("loadCorpus");
+    expect(source).not.toContain("loadCatalogOverview");
   });
 
   it("the composer prefill plumbing has no orphaned producer", () => {
@@ -147,6 +156,19 @@ describe("dead corpus plumbing", () => {
       const source = readFileSync(path, "utf8");
       expect(source, `${path} contains prefill`).not.toContain("prefill");
     }
+  });
+
+  it("the retired corpus-card chrome does not return on the boot path", () => {
+    // T6 added a catalog OVERVIEW to home. That is the ingest area's own
+    // surface, not the retired thread-page corpus wall: it must not reach
+    // App's boot effects or the thread page, or the seam this spec
+    // retired comes back through a different door.
+    const app = readFileSync(APP_PATH, "utf8");
+    expect(app).not.toContain("getCatalogOverview");
+    expect(app).not.toContain("catalogOverview");
+    expect(readFileSync(THREAD_PAGE_PATH, "utf8")).not.toContain(
+      "catalogOverview",
+    );
   });
 });
 
@@ -183,3 +205,214 @@ describe("retired fake-retrieve health copy", () => {
     }
   });
 });
+
+// ----- T3: the navigation contract (plans/2026-10-20-qa-design-correction
+// task 3) and T2's route half (task 2). -----
+//
+// The chrome is rendered with ``renderToString`` because this project's
+// vitest setup has no DOM testing library (same split as
+// VisualClaims.test.ts / ArchiveList.test.ts). The nav contract is a
+// RENDERED fact, not a source string: the accessible name of a link is
+// its text, so the assertions read the rendered anchor.
+
+const THREAD_ID = "11111111-1111-4111-8111-111111111111";
+
+/** The rendered anchors whose href is exactly ``href``. */
+function anchorsTo(html: string, href: string): string[] {
+  return (
+    html.match(new RegExp(`<a [^>]*href="${href}"[^>]*>[\\s\\S]*?</a>`, "g")) ?? []
+  );
+}
+
+/** Visible text of rendered markup: tags and React's comment markers gone. */
+function visibleText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function renderSidebar(): string {
+  return renderToString(
+    createElement(
+      MemoryRouter,
+      { initialEntries: ["/"] },
+      createElement(Sidebar),
+    ),
+  );
+}
+
+function renderDemoHomeLink(enabled: boolean): string {
+  return renderToString(
+    createElement(
+      MemoryRouter,
+      { initialEntries: ["/"] },
+      createElement(DemoHomeLink, { enabled }),
+    ),
+  );
+}
+
+describe("the sidebar's home link", () => {
+  it("is named exactly 首页 and points at the homepage", () => {
+    const links = anchorsTo(renderSidebar(), "/");
+    expect(links).toHaveLength(1);
+    expect(visibleText(links[0])).toBe("首页");
+  });
+
+  it("keeps the 会话 navigation landmark and the thread list", () => {
+    const html = renderSidebar();
+    expect(html).toContain('aria-label="会话"');
+    expect(html).toContain("会话");
+  });
+});
+
+describe("the demo return link", () => {
+  it("is named exactly 返回演示首页 and points at the homepage", () => {
+    const links = anchorsTo(renderDemoHomeLink(true), "/");
+    expect(links).toHaveLength(1);
+    expect(visibleText(links[0])).toBe("返回演示首页");
+  });
+
+  it("is absent outside demo mode", () => {
+    // The demo link is decided by the demo presentation the ancestor
+    // provider carries, so a non-demo conversation shows no demo door.
+    expect(renderDemoHomeLink(false)).toBe("");
+  });
+
+  it("is decided by the demo presentation the route provides", () => {
+    // The thread page does not ask the server again and does not
+    // guess: it reads the demo fact its ancestor provider carries.
+    const source = readFileSync(THREAD_PAGE_PATH, "utf8");
+    expect(source).toContain("useDemoPresentation");
+    expect(source).toMatch(/<DemoHomeLink enabled=\{demo\.enabled\}/);
+  });
+});
+
+describe("the thread route's entry decision", () => {
+  const facts = {
+    threadId: THREAD_ID,
+    sendingThreadId: null,
+    activeThreadId: THREAD_ID,
+    reading: false,
+    fault: null,
+  };
+
+  it("keeps the live answer of a thread that is already streaming", () => {
+    // T2: entering a thread that is already answering on this client
+    // must not paint the entry loader over the live answer. The pane
+    // still holds that thread, so the live state is on screen.
+    const decision = decideThreadEntryRoute({
+      ...facts,
+      sendingThreadId: THREAD_ID,
+      reading: true,
+    });
+    expect(decision.view).toBe("live");
+  });
+
+  it("reads a thread again when the operator left it while it was streaming", () => {
+    // The send is still running, but the pane holds another thread:
+    // the live state is gone, so the entry read is REQUIRED and the
+    // route shows its loader while that read runs. The store's guard
+    // skips a read only when the pane still holds the thread.
+    const decision = decideThreadEntryRoute({
+      ...facts,
+      activeThreadId: "22222222-2222-4222-8222-222222222222",
+      sendingThreadId: THREAD_ID,
+      reading: true,
+    });
+    expect(decision.view).toBe("loading");
+  });
+
+  it("does not let a failed entry read clear the live turn table", () => {
+    const decision = decideThreadEntryRoute({
+      ...facts,
+      sendingThreadId: THREAD_ID,
+      fault: "missing",
+    });
+    expect(decision.mayClearActiveThread).toBe(false);
+  });
+
+  it("shows the loader while an ordinary entry read is in flight", () => {
+    expect(decideThreadEntryRoute({ ...facts, reading: true }).view).toBe(
+      "loading",
+    );
+  });
+
+  it("keeps the three refusal distinctions apart", () => {
+    expect(decideThreadEntryRoute({ ...facts, fault: "gated" }).view).toBe(
+      "gated",
+    );
+    expect(
+      decideThreadEntryRoute({ ...facts, fault: "pending_unavailable" }).view,
+    ).toBe("pending_unavailable");
+    // A missing thread is the one the pane does NOT hold: the refusal
+    // and the empty pane say the same thing.
+    expect(
+      decideThreadEntryRoute({
+        ...facts,
+        activeThreadId: null,
+        fault: "missing",
+      }).view,
+    ).toBe("missing");
+  });
+
+  it("renders the thread once it is loaded", () => {
+    expect(decideThreadEntryRoute(facts).view).toBe("thread");
+  });
+
+  it("may clear the pane only for its own thread, and never while it streams", () => {
+    expect(
+      decideThreadEntryRoute({ ...facts, activeThreadId: THREAD_ID })
+        .mayClearActiveThread,
+    ).toBe(true);
+    // Another thread's pane is not this route's to clear.
+    expect(
+      decideThreadEntryRoute({ ...facts, activeThreadId: "other-thread" })
+        .mayClearActiveThread,
+    ).toBe(false);
+    // A streaming thread keeps its turn table.
+    expect(
+      decideThreadEntryRoute({
+        ...facts,
+        sendingThreadId: THREAD_ID,
+      }).mayClearActiveThread,
+    ).toBe(false);
+  });
+});
+
+describe("the startup owner lives at the application lifetime", () => {
+  const app = readFileSync(APP_PATH, "utf8");
+  const home = readFileSync(join(SRC_DIR, "pages", "HomePage.tsx"), "utf8");
+
+  it("is the application root, not the homepage mount", () => {
+    // The homepage mount dies with the route; the opportunity must not.
+    // The RULES live in the pure reducer — they are covered
+    // behaviourally in ``lastThread.test.ts`` — and the application root
+    // only drives it. This source check says where the owner sits, not
+    // what it decides.
+    expect(app).toContain("useStartupRestore");
+    expect(app).toContain("reduceStartupOwner");
+    expect(home).not.toContain("decideLastThreadRestore");
+    expect(home).not.toContain("restoreAttempted");
+  });
+
+  it("never persists the consumed bit", () => {
+    // A reload must grant a fresh startup opportunity, so the consumed
+    // bit may not live in browser storage.
+    expect(app).not.toContain("localStorage.setItem");
+    expect(app).not.toContain("sessionStorage");
+  });
+
+  it("keeps the homepage in the history when an example is opened", () => {
+    // The example navigation is an explicit push: the homepage stays a
+    // history entry, so Back returns to it.
+    expect(home).toContain("replace: false");
+    expect(home).not.toContain("replace: true");
+  });
+
+  it("reads the thread-scoped in-flight fact on the route", () => {
+    expect(app).toContain("sendingThreadId");
+  });
+});
+

@@ -1,4 +1,4 @@
-"""Workspace HTTP routes for the T1 surface (#28).
+"""Workspace HTTP routes for the T1 surface.
 
 Routes
 ------
@@ -10,7 +10,7 @@ Routes
                                           table.
 * ``DELETE /api/threads/{id}``          - drop metadata row + call
                                           checkpointer.delete_thread.
-* ``POST   /api/threads/{id}/messages`` - the T1 (#33) send path:
+* ``POST   /api/threads/{id}/messages`` - the T1 send path:
                                           ``graph.stream`` driven
                                           with ``stream_mode=
                                           ["messages", "values"]``
@@ -45,10 +45,10 @@ Routes
                                           settles — no operator
                                           resend.
 * ``POST   /api/threads/{id}/resume``   - crash resume on the SAME
-                                          delta wire (T2, #36).
+                                          delta wire (T2).
 * ``POST   /api/threads/{id}/stop``     - cooperative stop of the
-                                          in-flight run (T4 workflow,
-                                          the tracked change): flips the run's stop
+                                          in-flight run (T4 workflow):
+                                          flips the run's stop
                                           token, the SSE generator
                                           closes the graph stream and
                                           writes a terminal ``refuse``
@@ -60,7 +60,7 @@ Routes
                                           one is still 409.
 * ``GET    /api/threads/{id}/export``   - the thread's comparison or
                                           citation bundle as a file
-                                          download (T4 workflow, the tracked change).
+                                          download (T4 workflow).
                                           Comparison exports bind to
                                           ``fin.comparison``; a
                                           missing run is a typed 404.
@@ -74,7 +74,7 @@ Routes
 * ``GET    /api/watchlist``             - watched issuers (+ form
                                           types); ``POST`` adds,
                                           ``DELETE /{watch_id}``
-                                          removes (T4 workflow, the tracked change).
+                                          removes (T4 workflow).
 * ``GET    /api/notices``               - in-app notices for watched
                                           filings in the LOCAL catalog
                                           and configured filing source; ``POST
@@ -83,7 +83,21 @@ Routes
                                           is emailed or posted out.
 * ``GET    /api/corpus``                - real ``list_filings()`` over
                                           the catalog metadata table
-                                          (ADR 0047).
+                                          (ADR 0047) — the FINANCIAL
+                                          compatibility projection, whose
+                                          six-key shape is unchanged.
+* ``GET    /api/corpus/overview``        - the GENERIC catalog surface
+                                          (T6): one entry per row with its
+                                          title, type and any present
+                                          company / period, plus the
+                                          presentation grouping (only
+                                          dimensions with two distinct
+                                          non-empty values, missing values
+                                          under 未分类, flat titles when no
+                                          dimension qualifies). A separate
+                                          mouth because ``/api/corpus`` is
+                                          frozen for its financial
+                                          callers.
 * ``POST   /api/corpus/ingest``         - the corpus-ingest door
                                           (corpus-serve-ingest T3 /
                                           ADR 0047): multipart upload
@@ -101,13 +115,20 @@ Routes
                                           ``ingest_upload_too_large``
                                           (413), ``invalid_doc_type`` /
                                           ``document_id_missing`` (422),
+                                          ``document_id_not_allowed`` /
+                                          ``invalid_upload_metadata``
+                                          (422),
                                           push/invalidation outage
-                                          codes (503). A catalog
+                                          codes (503). The 200 is an
+                                          ACCEPT only; a catalog
                                           registration failure after
-                                          the push lands is the named
-                                          ``catalog_warning`` field on
-                                          the 200 — never rolled back,
-                                          never silent. The ONLY product
+                                          the push lands is a durable
+                                          ``catalog_publication_failed``
+                                          audit event read back as the
+                                          ``catalog_warning`` field on the
+                                          STATUS poll — never rolled
+                                          back, never silent, never raw
+                                          exception text. The ONLY product
                                           surface that calls 切分;
                                           never a research tool.
 * ``GET    /api/status``                - the boot-scoped status
@@ -165,15 +186,15 @@ import os
 import re
 import tempfile
 import threading
-import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final, Iterator, Literal, Protocol, cast
 
+import anyio
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -187,13 +208,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from langchain_core.messages import (
-    AIMessage,
-    AIMessageChunk,
-    BaseMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from starlette.requests import ClientDisconnect
 from langgraph.types import Command
 from pydantic import (
     BaseModel,
@@ -203,21 +218,28 @@ from pydantic import (
     model_validator,
 )
 
-from fin.corpus.catalog import list_filings, record_filings
+from fin.corpus.catalog import (
+    catalog_grouping,
+    list_catalog_entries,
+    list_filings,
+    record_filings,
+)
+from fin.corpus.catalog_publication import PublicationWarning
 from fin.corpus.errors import (
-    CatalogCorruptError,
-    CatalogRowError,
     ParseError,
     UnsupportedFormatParseError,
 )
 from fin.corpus.ingest_endpoint import (
+    PUBLIC_DOCUMENT_ID_REFUSAL,
     IngestConcurrentRunError,
+    IngestDocumentIdNotAllowedError,
     IngestDocumentIdMissingError,
     IngestDurableCommitError,
     IngestEndpoint,
     IngestedDocument,
     IngestFormatUnspecifiedError,
     IngestInvalidDocTypeError,
+    IngestInvalidUploadMetadataError,
     IngestObjectCleanupError,
     IngestUploadTooLargeError,
 )
@@ -232,43 +254,46 @@ from fin.corpus.parsers import (
     PageRegionParser,
 )
 from fin.corpus.pushed_records import PushedRecordsStore
-from fin.host.attachment_budgets import AttachmentBudgets
-from fin.host.attachment_layout import (
+from fin.host.attachment.attachment_budgets import AttachmentBudgets
+from fin.host.attachment.attachment_layout import (
     HeronLayoutConfig,
     HeronPageLayout,
     LayoutRecordRunner,
 )
-from fin.host.attachment_prep_worker import (
+from fin.host.attachment.attachment_prep_worker import (
     ATTACHMENT_PREP_WORKER_CHECK_INTERVAL_SECONDS,
     AttachmentPrepWorker,
     DrainCadence,
     PeriodicDrainWorker,
     drain_periodically,
 )
-from fin.host.attachment_prepare import (
+from fin.host.attachment.attachment_prepare import (
     ATTACHMENT_PAGE_LANE_UNWIRED,
     AttachmentCleanupError,
     AttachmentNotFoundError,
     AttachmentNotReadyError,
     AttachmentPreparationService,
 )
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     AttachmentStoreError,
     AttachmentThreadGoneError,
     StoredPageRegion,
 )
-from fin.host.attachment_vision import ChatModelVisionAdapter
-from fin.host.citation_gate import (
+from fin.host.attachment.attachment_vision import ChatModelVisionAdapter
+from fin.host.grounded.citation_gate import (
     COMPANY_KIND,
     DATABASE_ROW_KIND,
     DATABASE_ROW_SNAPSHOT_KEY,
-    HIDDEN_BOUNCE_MARKER,
     database_row_snapshot,
-    strip_hidden_bounce_marker,
 )
 from fin.host.collection_bind import resolve_bound_collection_name
-from fin.host.evidence_contract import (
+from fin.host.question.document_choice_admission import (
+    accepted_document_reply,
+    document_choice_resume_value,
+    resolved_document_choice_pick,
+)
+from fin.host.evidence.evidence_contract import (
     CITATION_CHANNEL_SCHEMA,
     DATABASE_ROW_SNAPSHOT_SCHEMA,
     EVIDENCE_SCHEMA_VERSION,
@@ -276,7 +301,6 @@ from fin.host.evidence_contract import (
     MALFORMED_EVIDENCE_CONTRACT,
     MAX_CITATIONS_PER_RUN,
     UNSUPPORTED_EVIDENCE_CONTRACT,
-    VISUAL_CLAIM_SCHEMA,
     AdmissionContext,
     seed_context_from_rows,
     validate_evidence,
@@ -298,77 +322,87 @@ from fin.host.filing_monitor import FilingMonitor, default_filing_monitor
 from fin.host.filing_monitor_errors import FilingSourceUnavailableError
 from fin.host.graph import (
     ATTACHMENT_PREPARATION_INTERRUPT_KIND,
+    DOCUMENT_CHOICE_INTERRUPT_KIND,
     ConcurrentRunError,
     KnowledgeMCPFaultError,
     PendingCheckpointProjectionError,
-    analysis_from_tool_message,
-    comparison_from_tool_message,
 )
 from fin.host.knowledge_mcp import (
-    KNOWLEDGE_MCP_STATES,
     knowledge_mcp_gate_closed,
     knowledge_mcp_state,
+    knowledge_mcp_status_value,
     resolve_bound_retrieve_adapter_kind,
 )
 from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
 from fin.host.named_failures import (
-    TASK_ALREADY_RECONCILED,
-    TASK_APPLICABILITY_UNRESOLVED,
-    TASK_CAPABILITY_UNAVAILABLE,
-    TASK_CAPABILITY_UNSUPPORTED,
-    TASK_CHECKPOINT_FAILED,
-    TASK_DEPENDENCY_FAILURE,
-    TASK_EXECUTION_LIMIT,
-    TASK_FAILURE_KINDS,
-    TASK_HISTORY_FAILED,
     TASK_INPUT_INVALID,
-    TASK_INPUT_UNRECONCILED,
-    TASK_INSUFFICIENT_EVIDENCE,
-    TASK_INTENT_MISSING,
-    TASK_PERMISSION_DENIED,
     TASK_REPLY_EXPIRED,
     TASK_REPLY_UNKNOWN,
-    TASK_RESTORE_NOT_ADOPTED,
-    TASK_RESTORE_UNKNOWN,
     TIER_UNAVAILABLE_CODE,
     RetrieveTier,
     unavailable_tier,
 )
-from fin.host.observability import (
-    ObservabilityCollector,
-    ObservabilityError,
-)
+from fin.host.observability import ObservabilityCollector
 from fin.host.operator_env import resolve_retrieve_adapter_kind
-from fin.host.run_payload import RunResponsePayload, _run_to_response_payload
+from fin.host.run_payload import (
+    RunResponsePayload,
+    _run_to_response_payload,
+    citation_sections_from_evidence,
+)
 from fin.host.stream_map import (
-    InlineFilterState,
-    ThinkingClock,
-    format_tool_summary,
-    reasoning_delta_from_chunk,
-    split_stream_delta,
     strip_thinking_from_answer,
 )
-from fin.host.run_control import RunControl, StopToken
+from fin.host.grounded.route_intent import (
+    normalize_route_intent,
+    normalize_route_source,
+)
+from fin.host.run_control import RunAdmission, RunControl, StopToken
+from fin.host.turn_receipts import TurnReceiptProjector, default_receipts
+from fin.host.run_execution import (
+    ResumeRunRequest,
+    RunEvent,
+    RunEventKind,
+    RunExecutor,
+    RunRequest,
+    RunTerminal,
+    # WHY re-exported: the classifier and the visual-claim projection are
+    # execution facts other modules and tests read off this surface; they
+    # live with the run that produces them, and their old spelling here
+    # keeps every existing caller on one name.
+    _STREAM_FAILURE_USER_COPY,
+    _node_frame_events,
+    _sanitize_reason_text,
+    _visual_claims_wire_payload,
+    classify_stream_exception,
+    ensure_thread_occupancy,
+)
 from fin.host.state import reset_input_state
-from fin.host.structured_evidence_drain_worker import (
+from fin.host.evidence.structured_evidence_drain_worker import (
     INVALIDATION_DRAIN_CONSUMER_ID,
     InvalidationDrainTransport,
     StructuredInvalidationDrainWorker,
 )
-from fin.host.task_runtime_types import (
+from fin.host.task.task_runtime_types import (
     INPUT_MESSAGE,
     INPUT_REPLY,
     INPUT_RESTORE,
+    OTHER_CHOICE_ID,
+    PURPOSE_DOCUMENT_CHOICE,
+    PURPOSE_TASK_CLARIFICATION,
     AcceptedInput,
+    PendingQuestion,
+    ReconciliationProposal,
     TaskRuntimeError,
     TaskRuntimeState,
 )
-from fin.host.task_runtime import (
+from fin.host.task.task_runtime import (
     accept_input as accept_task_input,
     archived_task_summaries,
     bounded_input_history,
     current_task_summary,
+    decide as decide_task_runtime,
+    is_reconciled,
     pending_question_payload,
     reconcile_marker,
 )
@@ -380,9 +414,6 @@ from fin.host.thread_store import (
     ThreadStore,
     project_stored_citation,
 )
-from fin.host.visual_evidence import (
-    VISUAL_CLAIM_FIELDS,
-)
 from fin.host.watchlist import (
     InvalidWatchError,
     JsonFileWatchlistStore,
@@ -393,7 +424,8 @@ from fin.host.watchlist import (
     default_watchlist_store,
     refresh_notices,
 )
-from fin.host.workspace_registry import default_workspace_root
+from fin.host.fin_home import resolve_fin_home
+from fin.host.workspace_registry import workspace_root_for_fin_home
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.invalidation_port.errors import InvalidationError
 from fin.retrieve.invalidation_port.ledger import InvalidationLedger
@@ -418,209 +450,25 @@ logger = logging.getLogger(__name__)
 
 
 def default_workspace_root_for_process() -> Path:
-    """Resolve the process-default 工作区 from ``$HOME``.
+    """Resolve the process-default 工作区 from the fin home.
 
-    Reads ``$HOME`` at call time (NEVER ``Path.cwd()`` — spec SC3)
-    and delegates to
-    :func:`fin.host.workspace_registry.default_workspace_root` so
-    the SSOT for the ``<home>/.fin/default`` shape stays in the
-    registry module.
+    ``<FIN_HOME>/default`` is ``$HOME/.fin/default`` on a primary
+    checkout with ``FIN_HOME`` unset. A linked worktree must not
+    mkdir the operator's ``~/.fin``. Never ``Path.cwd()``.
     """
-    home = os.environ.get("HOME") or str(Path.home())
-    return default_workspace_root(home)
+    return workspace_root_for_fin_home(resolve_fin_home())
 
 
 def get_workspace_root() -> Path:
     """FastAPI dependency returning the resolved default 工作区 root.
 
-    Production resolves from ``$HOME`` per request (cheap; the mkdir
+    Production resolves the fin home per request (cheap; the mkdir
     is idempotent). Tests override via
     ``app.dependency_overrides[get_workspace_root]`` to inject a
     ``tmp_path``-rooted directory.
     """
     return default_workspace_root_for_process()
 
-
-# ----- mid-flight stream exception classification + sanitization -----
-#
-# Why classify here: every model call ultimately routes through
-# ``openai``'s SDK error hierarchy (or ``langchain_openai``'s
-# re-exports of the same classes). Surfacing a single English
-# sentence to the operator hides which axis to act on — auth,
-# network, rate-limit, etc. — so the SPA cannot render actionable
-# guidance. We dispatch on the exception type and pair it with a
-# short Chinese ordinary-person copy the SPA can render verbatim.
-#
-# Why a sanitize step: the refuse ``reason`` rides the SSE wire
-# (server logs + persisted RunRecord) and historically embedded
-# ``str(exc)`` — which carries the provider's full error text,
-# often including the API base URL with the key, the raw
-# ``Authorization: Bearer ...`` header, or a long opaque token.
-# A single regex pass drops anything that looks sensitive before
-# the reason reaches the wire. Defense in depth: the operator
-# copy is hand-written, so even an unsanitized leak can only
-# land in the ``reason`` field, never in the user-facing bubble.
-
-
-# Classification → user-facing Chinese copy (ordinary-person, no
-# provider internals). Single source of truth so the SSE frame
-# and the persisted ``RunRecord.assistant_message`` always agree.
-_STREAM_FAILURE_USER_COPY: Final[dict[str, str]] = {
-    "auth": "鉴权失败：服务返回 401。请检查 .env 里的 FIN_API_KEY 是否设置且有效。",
-    "network": "网络错误：无法连接到模型服务。请检查网络或代理（FIN_BASE_URL）。",
-    "timeout": "模型调用超时（默认 120s）。可重试，或调高 ChatOpenAI timeout。",
-    "rate_limit": "模型服务限流（429）。请稍后重试。",
-    "not_found": "模型或接口路径不存在（404）。检查 FIN_MODEL 和 FIN_BASE_URL 是否拼写正确。",
-    "server": "模型服务内部错误（5xx）。请稍后重试。",
-    "unknown": "未预期的错误。请把 server 日志贴出来排查。",
-}
-
-# Question/task runtime T2: ordinary-person copy for a refused task
-# reconciliation. Grouped by the FACT each failure names rather than
-# listed one per token — the operator cannot act on most of them, so
-# telling them which one it was would be noise. None of these asks the
-# user a question: an operational failure is a system outcome, never a
-# clarification.
-_TASK_REFUSAL_USER_COPY: Final[dict[str, str]] = {
-    TASK_INPUT_INVALID: "这次输入无法处理，当前任务未改变。请重试。",
-    TASK_INPUT_UNRECONCILED: "这次输入尚未确认，当前任务未改变。请重试。",
-    TASK_ALREADY_RECONCILED: "这次输入已经处理过了。",
-    TASK_PERMISSION_DENIED: "当前没有执行这项操作的权限。",
-    TASK_DEPENDENCY_FAILURE: "依赖服务出错，当前任务未改变。请稍后重试。",
-    TASK_CAPABILITY_UNAVAILABLE: "所需能力当前不可用。",
-    TASK_CAPABILITY_UNSUPPORTED: "当前来源版本不支持这项操作。",
-    TASK_INSUFFICIENT_EVIDENCE: "证据不足，任务保持进行中。",
-    TASK_APPLICABILITY_UNRESOLVED: "适用条件尚未确认，任务保持进行中。",
-    TASK_INTENT_MISSING: "缺少可确认的用户意图，任务未改变。",
-    TASK_EXECUTION_LIMIT: "已达到执行上限，任务保持进行中。",
-    TASK_CHECKPOINT_FAILED: "保存进度失败，当前任务保持上一个一致状态。",
-    TASK_HISTORY_FAILED: "读取历史失败，当前任务保持上一个一致状态。",
-    TASK_REPLY_EXPIRED: "这条回复对应的提问已经过期，当前任务未改变。",
-    TASK_REPLY_UNKNOWN: "当前没有待回答的提问。",
-    TASK_RESTORE_UNKNOWN: "找不到对应的历史任务，当前任务未改变。",
-    TASK_RESTORE_NOT_ADOPTED: "按当前条件不能恢复该历史任务，当前任务未改变。",
-}
-
-
-def _classify_exception_type(exc: BaseException) -> str:
-    """Map an exception instance to a kind string.
-
-    Dispatch by exact ``openai`` SDK class first, then by class
-    name substring (defensive against ``langchain_openai``'s
-    wrappers that re-export the same exceptions). Returns one of
-    the keys in ``_STREAM_FAILURE_USER_COPY``; falls back to
-    ``"unknown"`` for anything that does not match.
-    """
-    # Local imports: ``openai`` is a runtime dep (langchain-openai
-    # pulls it in), but only the workspace stream loop needs the
-    # error hierarchy — module-import order stays clean.
-    try:
-        import openai
-    except ImportError:  # pragma: no cover - openai is a hard dep
-        openai = None  # type: ignore[assignment]
-
-    # Auth axis: bad / missing token. ``PermissionDeniedError``
-    # (403) is a sibling failure mode with the same operator
-    # action — surface it under ``auth`` so the copy still
-    # points at the key.
-    if openai is not None:
-        # WHY this ordering: ``openai.APITimeoutError`` subclasses
-        # ``APIConnectionError`` so a naive isinstance on
-        # ``APIConnectionError`` would swallow every timeout. The
-        # specific subclasses go first; the parent class last.
-        if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
-            return "auth"
-        if isinstance(exc, openai.APITimeoutError):
-            return "timeout"
-        if isinstance(exc, openai.RateLimitError):
-            return "rate_limit"
-        if isinstance(exc, openai.NotFoundError):
-            return "not_found"
-        if isinstance(exc, openai.InternalServerError):
-            return "server"
-        if isinstance(exc, openai.APIConnectionError):
-            return "network"
-
-    # Defensive fallback for ``langchain_openai`` wrappers or any
-    # third-party SDK that re-exports an exception under a
-    # different module path. Class-name substring match is enough
-    # to disambiguate the seven kinds without overreaching.
-    cls_name = type(exc).__name__.lower()
-    cls_module = type(exc).__module__.lower()
-    combined = f"{cls_module}.{cls_name}"
-    if "authentication" in cls_name or "permissiondenied" in cls_name:
-        return "auth"
-    if "apitimeout" in cls_name or (
-        "timeout" in cls_name and "apiconnection" not in cls_name
-    ):
-        return "timeout"
-    if "ratelimit" in cls_name:
-        return "rate_limit"
-    if "notfound" in cls_name:
-        return "not_found"
-    if "internalserver" in cls_name:
-        return "server"
-    if "apiconnection" in cls_name or "connectionerror" in cls_name:
-        return "network"
-    if "server" in cls_name:
-        return "server"
-    # ``combined`` kept available for future module-scoped checks;
-    # the local var silences the linter without altering dispatch.
-    _ = combined
-    return "unknown"
-
-
-def classify_stream_exception(exc: BaseException) -> tuple[str, str]:
-    """Return ``(kind, user_copy)`` for a mid-flight stream exception.
-
-    ``kind`` is one of ``auth`` / ``network`` / ``timeout`` /
-    ``rate_limit`` / ``not_found`` / ``server`` / ``unknown`` —
-    a closed enum the SPA keys labels off of (no free text).
-    ``user_copy`` is short Chinese actionable text the SPA shows
-    verbatim; never blank.
-    """
-    kind = _classify_exception_type(exc)
-    return kind, _STREAM_FAILURE_USER_COPY[kind]
-
-
-# Patterns that look sensitive: an ``Authorization: Bearer ...``
-# header; ``key=...`` / ``token=...`` query-string style fragments;
-# full URLs whose path or query string embeds what looks like a
-# key (long alphanumeric token, hex blob). Each match collapses
-# to a short tag so the operator still sees "auth failed against
-# <URL redacted>" rather than losing all context.
-_SENSITIVE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)authorization\s*:\s*bearer\s+[A-Za-z0-9._\-]+"),
-    re.compile(r"(?i)(sk-[A-Za-z0-9_\-]{20,})"),
-    # ``key=`` / ``token=`` / ``api_key=`` query-string fragments;
-    # capture the assignment through the value delimiter.
-    re.compile(r"(?i)\b(api[_-]?key|token|access[_-]?token|secret)\s*[=:]\s*[^\s,;]+"),
-    # Long hex / base64url blobs (>=32 chars) — high-entropy tokens
-    # the operator never needs to see on the wire.
-    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
-    re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"),
-)
-
-
-def _sanitize_reason_text(text: str, max_len: int = 200) -> str:
-    """Redact sensitive substrings and cap length on a wire string.
-
-    Why a small standalone helper: the refuse ``reason`` is the one
-    field on the wire that may carry provider-internal text. The
-    contract is "single-line, <=max_len chars, no tokens, no
-    headers". One choke point keeps every future caller honest.
-    """
-    if not text:
-        return ""
-    out = text
-    for pattern in _SENSITIVE_PATTERNS:
-        out = pattern.sub("[redacted]", out)
-    # Collapse whitespace so a multi-line provider error still
-    # reads as one line on the wire (SSE is line-oriented).
-    out = re.sub(r"\s+", " ", out).strip()
-    if len(out) > max_len:
-        out = out[: max_len - 3] + "..."
-    return out
 
 
 def _dream_hook_kwargs(port: Any) -> dict[str, Any]:
@@ -672,73 +520,9 @@ def _register_dream_background(
     )
 
 
-@dataclass(frozen=True)
-class RunStreamOutcome:
-    """What ``_stream_run_frames`` hands back when the run's wire ends.
-
-    ``final_state`` is the last ``values`` frame (``None`` when the
-    stream produced nothing). ``thinking_ms`` is the run's total
-    streamed-thinking duration (T4, #37) — persisted on the
-    ``RunRecord`` and echoed on the terminal ``status`` frame so the
-    SPA's post-run collapse label matches the stored turn row.
-
-    ``refuse_reason`` / ``refuse_copy`` are set ONLY on the
-    mid-flight-raise path: the engine already emitted the terminal
-    refuse frames itself, and callers persist them on a
-    ``RunRecord`` so the failed exchange stays in the turn table
-    (spec line 67: GET history shows empty sources plus non-empty
-    assistant copy) instead of being wiped by the SPA's
-    openThread reconcile.
-
-    ``answer_reset`` is True when a bounce-marker SystemMessage set
-    a pending live-view reset that was never consumed by a
-    non-empty answer delta — callers attach ``reset: true`` to the
-    terminal answer frame so a refuse / empty terminal still clears
-    the stale draft.
-    """
-
-    final_state: dict[str, Any] | None
-    thinking_ms: int
-    refuse_reason: str | None = None
-    refuse_copy: str | None = None
-    # Mid-flight stream error taxonomy (auth / network / timeout /
-    # rate_limit / not_found / server / unknown). ``None`` when
-    # the run did not end on the refuse branch. The same value
-    # rides the SSE ``status_classified`` field and the persisted
-    # RunRecord so reload keeps the classification visible.
-    refuse_kind: str | None = None
-    answer_reset: bool = False
-    # T4 workflow (the tracked change): the operator pressed Stop and the engine
-    # closed the graph stream between frames. Distinct from
-    # ``refuse_reason`` (a failure) — a stop is a deliberate end, so
-    # the caller writes the ``stopped`` turn row and its own terminal
-    # frames rather than a stream-error refusal.
-    stopped: bool = False
-    # search-mode host T2: the run PAUSED on a 检索档 choice window
-    # (LangGraph HITL interrupt, ADR 0062). The engine already emitted
-    # the ``choice_window`` SSE frame; the caller persists NOTHING (a
-    # paused run is not a finished turn — the resumed remainder's
-    # completion writes the row) and closes the stream.
-    choice_window: dict[str, Any] | None = None
-    # T2f durable graph gate: the run PAUSED on the attachment
-    # preparation interrupt (payload kind
-    # ``attachment_preparation``). The engine already emitted the
-    # ``attachment_wait`` SSE frame carrying the run id; the caller
-    # persists NOTHING (same pause posture as ``choice_window``) — the
-    # auto-resumer drives the SAME checkpoint run id to completion once
-    # the durable preparation job settles.
-    attachment_wait: dict[str, Any] | None = None
 
 
-# Graph nodes whose model deltas are the operator-visible reply.
-# ``model`` is the research leaf; the three Soft-Track leaves
-# (specs/soft-track.md / ADR 0027) author their reply the same way,
-# so their tokens paint the live turn too. Every other node stays
-# off the wire — notably ``classify``, whose LLM tier streams
-# routing JSON that is not prose.
-_ANSWER_AUTHORING_NODES: frozenset[str] = frozenset(
-    {"model", "dialogue", "clarify", "off_topic"}
-)
+
 
 
 # Maximum characters of the first message used as the thread title.
@@ -751,7 +535,7 @@ _DEFAULT_TITLE: str = "New thread"
 
 
 # The scope label one attach carries; the byte cap is NOT here — it is
-# the deployed :class:`~fin.host.attachment_budgets.AttachmentBudgets`
+# the deployed :class:`~fin.host.attachment.attachment_budgets.AttachmentBudgets`
 # value the route reads through its dependency.
 ATTACHMENT_SCOPE: Final[str] = "thread_attach"
 
@@ -858,6 +642,12 @@ class SendMessageRequest(BaseModel):
     question_id: str | None = None
     choice_id: str | None = None
     free_text: str | None = None
+    # The run the caller believes it is answering. Optional: a client
+    # that does not track run ids sends nothing and the door admits the
+    # reply against the thread's paused run. When it IS named it must
+    # be that run — a reply aimed at a turn that is no longer the one
+    # in flight is refused rather than applied to whatever paused last.
+    origin_run_id: str | None = None
     # Question/task runtime T4: an EXPLICIT restore of a listed archived
     # task. Restore is never inferred from an unrelated message, and the
     # archived results stay historical until the current recheck passes.
@@ -911,13 +701,23 @@ class ResumeRequest(BaseModel):
     resume contract (``graph.stream(None)``) untouched, and against a
     pending window it REDRAWS the ``choice_window`` frame (the SPA's
     reload path).
+
+    ``free_text`` rides the reserved ``other`` pick (QA-chain T9 /
+    contract line 90). ``pickChoice`` reaches this route too, and the
+    paused graph node accepts the reply from the resume value ALONE — so
+    without the field here, an Other submitted over ``/resume`` would
+    answer the literal word "other". A 检索档 pick names no question and
+    carries no free text, so the field is inert on that lane. Omitted on
+    every body-less resume, which stays a transport control that creates
+    no user input (contract line 96).
     """
 
     pick: str | None = None
+    free_text: str | None = None
 
 
 class CreateWatchRequest(BaseModel):
-    """T4 workflow (the tracked change): one watched issuer, optionally narrowed.
+    """T4 workflow: one watched issuer, optionally narrowed.
 
     ``forms`` empty (or omitted) watches every form type — the
     operator asked about the issuer, not about a filing kind. The
@@ -1062,7 +862,7 @@ class TurnRow(BaseModel):
         default_factory=list
     )
     thinking_text: str = ""
-    # T4 (#37, spec line 31): total thinking duration in ms. Drives
+    # T4 (spec line 31): total thinking duration in ms. Drives
     # the post-run one-line collapse label ("Thought for 4.2s");
     # a reload restores it from this row. 0 when no thinking.
     thinking_duration_ms: int = 0
@@ -1070,6 +870,9 @@ class TurnRow(BaseModel):
     # keys are exactly ``name`` / ``summary`` / ``tool_call_id``.
     tool_summaries: list[ToolSummaryPayload] = Field(default_factory=list)
     assistant_message: str = ""
+    # A5: NULL is unknown. ``insufficient_evidence`` is the only token,
+    # and a done turn that carries it is not a complete answer.
+    semantic_outcome: str | None = None
     created_at: str
     # T4 (spec line 38): the live GET-while-running signal. Stamped
     # at serialization time from ``graph.is_locked(thread_id)`` on
@@ -1097,7 +900,7 @@ class TurnRow(BaseModel):
     # ``numeric_gate_fail`` the table is the evidence FOR the
     # refusal.
     comparisons: list[dict[str, Any]] = Field(default_factory=list)
-    # Trust (the tracked change, spec SC8): the locators this run retrieved or
+    # Trust (spec SC8): the locators this run retrieved or
     # read (``{document_id, version, unit}``), copied from the
     # run's evidence before the next run resets it. Wider than
     # ``citations``: a refused turn still shows what it looked at.
@@ -1106,7 +909,7 @@ class TurnRow(BaseModel):
     analysis_results: list[dict[str, Any]] = Field(default_factory=list)
     # ADR 0089 / spec thread-attachment-source-read: the visual claims this
     # run read, one provenance row per observation (key set SSOT:
-    # ``fin.host.visual_evidence.VISUAL_CLAIM_FIELDS``). It is a SEPARATE
+    # ``fin.host.evidence.visual_evidence.VISUAL_CLAIM_FIELDS``). It is a SEPARATE
     # channel from ``citations`` — a generated visual observation is never a
     # source quote — and travels the SSE ``visual_claims`` frame, the
     # persisted ``RunRecord``, and this row so the live wire, a reload, and
@@ -1120,6 +923,9 @@ class TurnRow(BaseModel):
     # Stored as the frozen record (snapshot + digest + selector); EP7's
     # replay reads it back against the original snapshot (T30).
     structured_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    # iknow retrieve window for this run. ``{}`` when the run did not
+    # retrieve. Keys are only the strings iknow returned.
+    retrieval_window: dict[str, Any] = Field(default_factory=dict)
     # T8: the operator's latest thumb for this run (``"up"`` /
     # ``"down"``). ``None`` when no thumb was ever set — additive and
     # nullable, so pre-T8 clients that ignore the field keep working.
@@ -1127,6 +933,20 @@ class TurnRow(BaseModel):
     # never part of the run's citations or evidence, so setting or
     # flipping a thumb cannot move the verified answer (ADR 0035/0036).
     feedback: str | None = None
+
+
+class RunCountsView(BaseModel):
+    """How many runs this process is in each state right now.
+
+    Three aggregates and no identity: no thread, no run id, no elapsed
+    figure, nothing about one turn. That is what keeps the counts on a
+    boot-scoped surface — the run-scoped facts each one summarizes stay on
+    the SSE contract and on the thread's own receipt view.
+    """
+
+    active: int
+    paused: int
+    suspected_stuck: int
 
 
 class WorkspaceStatusResponse(BaseModel):
@@ -1175,11 +995,12 @@ class WorkspaceStatusResponse(BaseModel):
     list (plan exclusion).
     """
 
-    knowledge_mcp: Literal["missing", "fault", "reachable"]
+    knowledge_mcp: Literal["missing", "fault", "reachable", "not_probed"]
     retrieve_adapter_kind: Literal["mcp", "fake"]
     model_identity: str
     corpus_filing_count: int
     bound_collection_name: str
+    run_counts: RunCountsView
 
 
 class InvalidationCheckpointResponse(BaseModel):
@@ -1287,6 +1108,49 @@ def _empty_task_runtime_view() -> dict[str, Any]:
     }
 
 
+def _source_scope_wire_projection(
+    graph: Any, thread_id: str
+) -> dict[str, Any] | None:
+    """The thread's accepted source-scope snapshot, or ``None``.
+
+    The projection, not a second store: the value is read off the SAME
+    checkpoint channel the resume commits it to. A thread with no accepted
+    restriction — and a stand-in graph with no seam — both read as
+    ``None``, which the wire contract distinguishes from an explicit
+    ``mode="unrestricted"`` clear.
+
+    A stored snapshot is user INTENT, never a current grant, so this is
+    published as the saved selection only: Source Scope rechecks current
+    permission, identity and version on every read path, and the reader
+    must not present the saved value as a live authorization.
+    """
+    reader = getattr(graph, "source_scope", None)
+    if not callable(reader):
+        return None
+    raw = reader(thread_id)
+    return cast(dict[str, Any], raw) if isinstance(raw, Mapping) and raw else None
+
+
+def _reply_answers_pending_choice(graph: Any, thread_id: str) -> bool:
+    """Whether this send is the operator's pick answering a paused
+    DOCUMENT CHOICE.
+
+    Read off the checkpoint's pending interrupt, narrowed to the pinned
+    ``document_choice`` kind: a ``task_clarification`` pause and a
+    search-mode ``choice_window`` keep the pre-existing 409, because a
+    reply to either of those is still refused at admission rather than
+    treated as the pick. Only the document-choice interrupt releases the
+    send door, and only for a send that NAMES a question.
+    """
+    probe = getattr(graph, "interrupt_pending", None)
+    if not callable(probe):
+        return False
+    pending = probe(thread_id)
+    return isinstance(pending, Mapping) and pending.get("kind") == (
+        DOCUMENT_CHOICE_INTERRUPT_KIND
+    )
+
+
 def _accepted_input_kind(body: SendMessageRequest) -> str:
     """Which of the three accepted-input doors this send uses.
 
@@ -1302,12 +1166,113 @@ def _accepted_input_kind(body: SendMessageRequest) -> str:
     return INPUT_MESSAGE
 
 
+def _question_hint_is_ordinary(
+    runtime_state: TaskRuntimeState, body: SendMessageRequest
+) -> bool:
+    """Whether a ``question_id`` names no answer this send can be.
+
+    An ANSWER carries a choice or free text. A bare id — neither — can
+    only claim which question the message belongs to, so when no question
+    owns that id the message is an ordinary follow-up in the same thread,
+    never a refused answer. A matching terminal clarification is NOT this
+    case: that reply must consume the question and open the next turn.
+
+    ``choice_id`` and non-blank ``free_text`` are answer values. A
+    free-text-only clarification reply travels as ``free_text`` with no
+    ``choice_id``, so a stale or duplicate delivery of it must keep the
+    reply vocabulary — the typed refusal or the recorded retry replay —
+    instead of being admitted as a second new turn.
+
+    A question id that already has an accepted reply is an answer attempt
+    even with no answer value on this delivery: it can only be a repeat
+    or a conflicting answer, and both are decided in the reply path.
+    """
+    question_id = (body.question_id or "").strip()
+    if not question_id:
+        return False
+    question = runtime_state.pending_question
+    if question is not None and question.question_id == question_id:
+        return False
+    if (body.choice_id or "").strip() or (body.free_text or "").strip():
+        return False
+    return not any(
+        row.kind == INPUT_REPLY and row.question_id == question_id
+        for row in runtime_state.input_history
+    )
+
+
+def _pending_terminal_clarification(
+    runtime_state: TaskRuntimeState, body: SendMessageRequest
+) -> PendingQuestion | None:
+    """The task clarification this send answers, if it names one.
+
+    The terminal clarification publishes its question on the thread and
+    ends its turn, so there is no paused run to continue: the reply is a
+    NEW turn that must consume this question. A mismatched id is not this
+    path — ``_plan_reply`` already judges reply admission in the runtime
+    vocabulary, and its refusal stays authoritative.
+    """
+    question_id = (body.question_id or "").strip()
+    if not question_id:
+        return None
+    question = runtime_state.pending_question
+    if question is None or question.purpose != PURPOSE_TASK_CLARIFICATION:
+        return None
+    if question.question_id != question_id:
+        return None
+    return question
+
+
+def _clarify_reply_turn_question(
+    question: PendingQuestion,
+    accepted: AcceptedInput,
+    runtime_state: TaskRuntimeState,
+) -> str:
+    """The new turn's user message: the original question plus the answer.
+
+    The follow-up that opened the task ("ZEUS 的年假政策是什么") is the
+    context this reply continues; the reply alone ("AAPL") names no
+    subject. The original comes from the committed task goal, never from
+    prose the host invents, and the operator's own answer is preserved
+    verbatim beside it.
+
+    This is the ONE value the reply turn carries: the same string is the
+    run's input message, the persisted ``RunRecord.question`` and the GET
+    history row, so a live optimistic row and a reload cannot disagree
+    about what was asked. The web mirror in ``store.ts`` reuses the same
+    shape and fallback because it renders before any host frame arrives.
+    """
+    original = (
+        runtime_state.current_task.goal
+        if runtime_state.current_task is not None
+        else question.prompt
+    )
+    answer = (accepted.payload or accepted.choice_id or "").strip()
+    return f"原问题：{original}\n补充回答：{answer}"
+
+
+def _accepted_payload(body: SendMessageRequest) -> str | None:
+    """The original text one accepted input stores, or ``None``.
+
+    A reply can be a CLICK: the choice is the answer and no prose was
+    authored. Storing ``""`` for it would refuse the input in Task
+    Runtime ("an accepted input must carry its original payload"), so a
+    blank message is the absent original — exactly the shape a document
+    choice click already stores. Free text and an ordinary message keep
+    their bytes.
+    """
+    text = body.question or body.free_text
+    return text if isinstance(text, str) and text.strip() else None
+
+
 def _accept_at_send_door(
     runtime_state: TaskRuntimeState,
     body: SendMessageRequest,
     *,
     kind: str,
     run_id: str,
+    graph: Any = None,
+    thread_id: str = "",
 ) -> tuple[TaskRuntimeState, AcceptedInput]:
     """Accept this send as the input kind it names, or refuse it typed.
 
@@ -1315,20 +1280,157 @@ def _accept_at_send_door(
     drop: an expired reply must not look like a message that was merely
     ignored. The envelope is left exactly as it was, so the last
     consistent task state stays authoritative.
+
+    A document reply passes :func:`_precheck_document_reply` first, so
+    the refusal happens before :func:`accept_task_input` — nothing is
+    written and no run starts. A duplicate pick returns the FIRST
+    accepted record, which is how ``input_version`` survives a double
+    click.
     """
+    duplicate = _precheck_document_reply(
+        graph, thread_id, runtime_state, body, kind=kind
+    )
+    if duplicate is not None:
+        return runtime_state, duplicate
     try:
         return accept_task_input(
             runtime_state,
             kind=kind,
-            payload=body.question or body.free_text,
+            payload=_accepted_payload(body),
             provenance="workspace_send",
-            question_id=body.question_id,
-            choice_id=body.choice_id,
+            # Only a reply ANSWERS a question. An ordinary message that
+            # carried a stale association hint is not recorded as having
+            # answered it.
+            question_id=body.question_id if kind == INPUT_REPLY else None,
+            choice_id=body.choice_id if kind == INPUT_REPLY else None,
             archive_id=body.restore_archive_id,
             run_id=run_id,
         )
     except TaskRuntimeError as exc:
         raise _task_input_http_error(exc) from exc
+
+
+def _checkpoint_origin_run_id(graph: Any, thread_id: str) -> str | None:
+    """The canonical run id of the checkpoint a reply would land on.
+
+    Read through the same ``checkpoint_run_id`` seam the resume route
+    uses, because a send and a resume address the SAME paused run: a
+    freshly minted send run id would name no question's origin and every
+    legitimate reply would look foreign. ``None`` when the seam is absent
+    or the checkpoint carries none, which is a thread with no run identity
+    to judge a reply against.
+    """
+    reader = getattr(graph, "checkpoint_run_id", None)
+    if not callable(reader):
+        return None
+    value = reader(thread_id)
+    return value if isinstance(value, str) and value else None
+
+
+def _accepted_document_reply(
+    runtime: TaskRuntimeState, *, question_id: str, choice_id: str
+) -> AcceptedInput | None:
+    """The FIRST accepted record for this exact document pick, if any.
+
+    Idempotency read, delegated to the public admission seam so the send
+    door and the resume node cannot disagree about what "already
+    accepted" means. The COMPOSITE key is what is matched, never the bare
+    candidate id: an ordinary ``task_clarification`` reply stores the bare
+    id on the accept path this work does not own, and short-circuiting
+    that one would change a door the pre-check was never asked about.
+
+    Returning the stored record — rather than refusing — is what keeps a
+    double click from advancing ``input_version`` twice: the record names
+    the input version the FIRST pick already reconciled, so the runtime
+    node recognizes it as reconciled and no-ops.
+    """
+    return accepted_document_reply(
+        runtime, question_id=question_id, choice_id=choice_id
+    )
+
+
+def _precheck_document_reply(
+    graph: Any,
+    thread_id: str,
+    runtime_state: TaskRuntimeState,
+    body: SendMessageRequest,
+    *,
+    kind: str,
+) -> AcceptedInput | None:
+    """Refuse a document reply that cannot possibly be valid — EARLY.
+
+    The QUESTION capability's ``document_choice_interrupt_node`` owns the decision and
+    keeps its validate-then-reopen loop: this is the backstop and the
+    only path that can reopen a question. What it cannot do is refuse an
+    invalid reply before the send door has already ACCEPTED it, because
+    acceptance is what advances ``input_version``, and an accepted input
+    is exactly the write the contract forbids for an invalid, foreign or
+    expired reply.
+
+    So the checks here are the same primitives the node consults, asked
+    one layer earlier and nothing more:
+
+    * :func:`accepted_document_reply` — a pick already in accepted
+      history returns its first outcome instead of a second input;
+    * the question id this reply NAMES must still be the pending one,
+      which is the ownership half of ``_decide_reply``'s reconciliation
+      check;
+    * :func:`resolved_document_choice_pick` — the node's own membership
+      and originating-run validation, run against the checkpoint's run id
+      read through the ``checkpoint_run_id`` seam rather than a run id
+      minted here.
+
+    Everything else is deliberately out of scope. A send with no question
+    named is an ordinary message; a thread with no pending question, a
+    thread whose pending question is a ``task_clarification`` (answered
+    through the ordinary reply path), and a graph with no run-identity
+    seam all pass through untouched — a pre-check that guessed on those
+    would be the second decision authority this is not allowed to be.
+    """
+    if kind != INPUT_REPLY:
+        return None
+    question_id = (body.question_id or "").strip()
+    choice_id = (body.choice_id or "").strip()
+    if not question_id or not choice_id:
+        return None
+
+    duplicate = _accepted_document_reply(
+        runtime_state, question_id=question_id, choice_id=choice_id
+    )
+    if duplicate is not None:
+        return duplicate
+
+    question = runtime_state.pending_question
+    if question is None or question.purpose != PURPOSE_DOCUMENT_CHOICE:
+        return None
+    if question.question_id != question_id:
+        raise _task_input_http_error(
+            TaskRuntimeError(
+                TASK_REPLY_EXPIRED,
+                "the document choice this reply names is no longer pending",
+                question_id=question_id,
+                pending_question_id=question.question_id,
+            )
+        )
+
+    origin_run_id = _checkpoint_origin_run_id(graph, thread_id)
+    if origin_run_id is None:
+        return None
+    if resolved_document_choice_pick(
+        runtime_state,
+        origin_run_id=origin_run_id,
+        raw_pick=choice_id,
+    ) is None:
+        raise _task_input_http_error(
+            TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "the pick names no candidate of this thread's pending "
+                "document choice",
+                question_id=question_id,
+                choice_id=choice_id,
+            )
+        )
+    return None
 
 
 def _task_input_http_error(exc: TaskRuntimeError) -> HTTPException:
@@ -1346,6 +1448,45 @@ def _task_input_http_error(exc: TaskRuntimeError) -> HTTPException:
     )
 
 
+def _reply_refusal(
+    runtime_state: TaskRuntimeState,
+    question_id: str,
+) -> TaskRuntimeError | None:
+    """Whether the question this reply names can still be answered, in
+    the SAME vocabulary the reconciliation boundary decides in.
+
+    Nothing pending at all is ``task_reply_unknown`` — the reply names a
+    clarification this thread never had. A question that is no longer
+    the pending one, or one whose task is no longer current, is
+    ``task_reply_expired``: the reply is real, but the question it
+    answers has been superseded or cancelled. Collapsing the two would
+    tell an operator to check for a pending question that does not
+    exist, and tell a surface that a live question was replaced when
+    none ever was.
+    """
+    question = runtime_state.pending_question
+    if question is None:
+        return TaskRuntimeError(
+            TASK_REPLY_UNKNOWN,
+            "no clarification is pending on this thread",
+            question_id=question_id,
+        )
+    if question.question_id != question_id:
+        return TaskRuntimeError(
+            TASK_REPLY_EXPIRED,
+            "the clarification this reply names is no longer pending",
+            question_id=question_id,
+            pending_question_id=question.question_id,
+        )
+    if question.task_id and runtime_state.current_task is None:
+        return TaskRuntimeError(
+            TASK_REPLY_EXPIRED,
+            "the task this clarification belongs to is no longer current",
+            question_id=question.question_id,
+        )
+    return None
+
+
 def _accepted_task_runtime_state(graph: Any, thread_id: str) -> TaskRuntimeState:
     """Read the committed task envelope to accept the next input against.
 
@@ -1357,6 +1498,444 @@ def _accepted_task_runtime_state(graph: Any, thread_id: str) -> TaskRuntimeState
     if not callable(reader):
         return TaskRuntimeState()
     return cast(TaskRuntimeState, reader(thread_id))
+
+
+@dataclass(frozen=True)
+class _ReplyPlan:
+    """What a clarification reply is, decided before any run starts.
+
+    ``retry`` is set when the (question_id, choice_id, free_text) tuple
+    is already in accepted history — the reply is a repeat delivery and
+    must not become a second accepted input. ``continued`` is set when
+    the thread still holds a paused run the reply answers; that run's
+    own identity is reused, so the reply cannot split one turn into
+    two. Both unset means the thread has no run to continue, and the
+    reply keeps the ordinary send door's existing behaviour.
+    """
+
+    retry: AcceptedInput | None = None
+    continued: "_ContinuedReply | None" = None
+
+
+@dataclass(frozen=True)
+class _ContinuedReply:
+    """A paused run, continued under the identity it already has.
+
+    ``accepted_input_version`` is the version Task Runtime's acceptance
+    actually reached, carried out of the planning section so the turn's
+    receipt records the authoritative one rather than counting its own.
+    """
+
+    run_id: str
+    resume_input: Any
+    resume_config: dict[str, Any]
+    accepted_input_version: int
+    #: QA-chain T9: a grounded document reply is accepted by the
+    #: ``document_choice_interrupt_node``, not by this door, so this
+    #: section has no acceptance of its own to project onto the receipt.
+    #: Counting the version it read would record an input it never
+    #: accepted and make a duplicate retry look like a second one.
+    accepted_by_this_door: bool = True
+
+
+def _reply_pick(body: SendMessageRequest) -> str:
+    """The value a continued run is handed as its resume value.
+
+    ``Command(resume=None)`` trips an ``UnboundLocalError`` in this
+    langgraph version, so a continuation always carries a value. The
+    operator's own submitted text is it: for a clarification that IS
+    the answer, and for any other paused node the value is ignored by
+    the node that receives it.
+    """
+    return body.free_text or body.choice_id or ""
+
+
+def _pending_document_choice(
+    runtime_state: TaskRuntimeState, body: SendMessageRequest
+) -> bool:
+    """Does this reply answer a pending GROUNDED DOCUMENT choice?
+
+    Checked against the committed envelope rather than only the live
+    interrupt, because by the time an identical retry arrives the pause
+    is already resolved: a reply NAMING a document question is that kind
+    even when nothing is pending any more. A reply with no ``choice_id``
+    is an ordinary message and never this kind.
+    """
+    if not (body.question_id or "").strip() or not (
+        body.choice_id or ""
+    ).strip():
+        return False
+    question = runtime_state.pending_question
+    if question is not None and question.purpose == PURPOSE_DOCUMENT_CHOICE:
+        return True
+    return _accepted_document_reply(
+        runtime_state,
+        question_id=(body.question_id or "").strip(),
+        choice_id=(body.choice_id or "").strip(),
+    ) is not None
+
+
+def _plan_document_reply(
+    graph: Any,
+    thread_id: str,
+    runtime_state: TaskRuntimeState,
+    body: SendMessageRequest,
+    workspace_root: Path,
+) -> _ReplyPlan:
+    """Classify a grounded document reply against the document seam.
+
+    QA-chain T9. Two facts separate this from the clarification path
+    above, and both are why the decision lives here rather than being
+    folded into it:
+
+    * the ``document_choice_interrupt_node`` is the ONE accept/reconcile
+      authority for this kind — on ``Command(resume=pick)`` it calls
+      ``accept_input`` with the COMPOSITE ``{question_id}/{choice_id}``
+      key, commits the checked scope and re-retrieves. Accepting here as
+      well would advance ``input_version`` a SECOND time and store the
+      BARE ``choice_id`` the node's duplicate guard does not match, so a
+      click would stop storing ``payload=null`` under its composite key
+      and an identical retry would stop being idempotent;
+    * the node reads the pick from the resume value ALONE, so the value
+      must be the structured shape it expects — a bare ``choice_id``
+      would discard the operator's rephrase and answer the literal word
+      "other" (contract line 90).
+
+    Refusals still happen EARLY, through
+    :func:`_precheck_document_reply`, before any wire is opened.
+    """
+    _precheck_document_reply(
+        graph, thread_id, runtime_state, body, kind=INPUT_REPLY
+    )
+    run_id = (
+        graph.checkpoint_run_id(thread_id)
+        if hasattr(graph, "checkpoint_run_id")
+        else None
+    )
+    if not run_id:
+        # No run identity to judge this reply against; fall through to
+        # the ordinary send door rather than continuing a run that
+        # cannot be identified.
+        return _ReplyPlan()
+    return _ReplyPlan(
+        continued=_ContinuedReply(
+            run_id=str(run_id),
+            resume_input=Command(
+                resume=document_choice_resume_value(
+                    (body.choice_id or "").strip(),
+                    body.free_text or body.question,
+                )
+            ),
+            resume_config={
+                "configurable": {
+                    "thread_id": thread_id,
+                    "run_id": str(run_id),
+                    "workspace_root": str(workspace_root),
+                }
+            },
+            # The node owns this acceptance, so this door holds no
+            # authoritative version of its own: the receipt records the
+            # one Task Runtime actually reached.
+            accepted_input_version=runtime_state.input_version,
+            accepted_by_this_door=False,
+        )
+    )
+
+
+def _plan_reply(
+    graph: Any,
+    thread_id: str,
+    runtime_state: TaskRuntimeState,
+    body: SendMessageRequest,
+    *,
+    workspace_root: Path,
+) -> _ReplyPlan:
+    """Classify a clarification reply against the committed envelope.
+
+    Every check here runs inside the door's admission section, so a
+    refusal is a plain 4xx and a continuation is admitted before any
+    other caller can read the same state.
+
+    The retry key is the tuple the first delivery recorded: question,
+    choice, and the payload the door accepted. An exact repeat is
+    idempotent; a DIFFERENT reply to a question that already has an
+    accepted answer is a conflict; a choice that is not on the current
+    question is not a candidate answer to anything.
+    """
+    # QA-chain T9: a grounded document reply is classified by the
+    # DOCUMENT seam, not by the clarification keys below. The node accepts
+    # it under the COMPOSITE ``{question_id}/{choice_id}`` key, so the
+    # bare-``choice_id`` ``prior`` lookup never matches it and the
+    # "already has an accepted answer" guard below would refuse every
+    # legitimate pick as a second answer. Decide the document kind first,
+    # then let the clarification rules handle only their own.
+    document_reply = _reply_answers_pending_choice(graph, thread_id)
+    if document_reply or _pending_document_choice(
+        runtime_state, body
+    ):
+        return _plan_document_reply(
+            graph, thread_id, runtime_state, body, workspace_root
+        )
+
+    if _question_hint_is_ordinary(runtime_state, body):
+        # No answer value traveled with the id, and no pending
+        # clarification owns it: this is a follow-up, not a stale reply.
+        return _ReplyPlan()
+
+    payload = _accepted_payload(body)
+    prior = next(
+        (
+            row
+            for row in runtime_state.input_history
+            if row.kind == INPUT_REPLY
+            and row.question_id == body.question_id
+            and row.choice_id == body.choice_id
+            and row.payload == payload
+        ),
+        None,
+    )
+    if prior is not None and is_reconciled(runtime_state, prior.input_version):
+        # The repeat of a reply that already has its outcome. Checked
+        # FIRST, before pending-ness: the question a reply answers is
+        # cleared by answering it, so a settled retry never matches a
+        # pending question again.
+        return _ReplyPlan(retry=prior)
+
+    if prior is None and any(
+        row.kind == INPUT_REPLY and row.question_id == body.question_id
+        for row in runtime_state.input_history
+    ):
+        # An accepted answer already exists for this question and this
+        # delivery is not it, so the reply would be a second answer to a
+        # question that has one. Checked before pending-ness: answering
+        # CLEARS the question, so the conflict outlives it.
+        raise _task_input_http_error(
+            TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "this clarification already has an accepted answer",
+                question_id=body.question_id,
+            )
+        )
+    refusal = _reply_refusal(runtime_state, str(body.question_id))
+    if refusal is not None:
+        raise _task_input_http_error(refusal)
+    question = runtime_state.pending_question
+    if question is not None and question.question_id == str(body.question_id).strip():
+        # The association is right but there is no answer value: a listed
+        # choice, the Other token's free text, or the message text the
+        # free-text-only card sends under its association. Accepting an
+        # empty reply would open a turn that answers nothing and show an
+        # empty "补充回答" line, so it is refused while the question stays
+        # pending and answerable.
+        if not (body.choice_id or body.free_text or body.question or "").strip():
+            raise _task_input_http_error(
+                TaskRuntimeError(
+                    TASK_INPUT_INVALID,
+                    "a clarification reply must carry a choice or free text",
+                    question_id=body.question_id,
+                )
+            )
+    if question is not None and body.choice_id is not None:
+        choice = body.choice_id.strip()
+        # The reserved Other token is always an offered option — it is the
+        # trailing token the wire adds, never a stored listed choice — and
+        # it is answerable only with the operator's own text.
+        if choice == OTHER_CHOICE_ID:
+            if not (body.free_text or body.question or "").strip():
+                raise _task_input_http_error(
+                    TaskRuntimeError(
+                        TASK_INPUT_INVALID,
+                        "the Other answer must carry its free text",
+                        question_id=body.question_id,
+                        choice_id=body.choice_id,
+                    )
+                )
+        elif choice not in question.choices:
+            raise _task_input_http_error(
+                TaskRuntimeError(
+                    TASK_INPUT_INVALID,
+                    "the chosen answer is not one of the offered choices",
+                    question_id=body.question_id,
+                    choice_id=body.choice_id,
+                )
+            )
+
+    paused_run_id = (
+        graph.checkpoint_run_id(thread_id)
+        if hasattr(graph, "checkpoint_run_id")
+        else None
+    )
+    if body.origin_run_id and body.origin_run_id != paused_run_id:
+        # The caller named the run it believes it is answering. Naming
+        # one that is not the thread's paused run means the client is
+        # answering a turn that is no longer the one in flight.
+        raise _task_input_http_error(
+            TaskRuntimeError(
+                TASK_INPUT_INVALID,
+                "the named origin run is not this thread's paused run",
+                origin_run_id=body.origin_run_id,
+                paused_run_id=paused_run_id,
+            )
+        )
+
+    recoverable = bool(
+        paused_run_id
+        and hasattr(graph, "pending_nodes")
+        and graph.pending_nodes(thread_id)
+    )
+    if not recoverable:
+        if prior is not None:
+            # Its input was accepted but nothing decided it and there is
+            # no paused run left to decide it in. Accepting the delivery
+            # again would be a second input for the same answer.
+            raise _task_input_http_error(
+                TaskRuntimeError(
+                    TASK_REPLY_EXPIRED,
+                    "this reply was accepted but its run is no longer resumable",
+                    question_id=body.question_id,
+                )
+            )
+        # A pending question that still MATCHES is this fallthrough: the
+        # question survives but the run that paused on it did not, so its
+        # clarification is answered by whatever run the delivery starts.
+        # Nothing is pending and nothing can be continued, though, and
+        # that case already refused above — falling through to the
+        # ordinary send door admitted a stale draft as a SECOND reply
+        # under a brand-new run id, so it became a turn, advanced
+        # ``input_version``, and only reached the reconciliation boundary
+        # — which refuses mid-run, long after the operator saw a 200
+        # stream.
+        return _ReplyPlan()
+
+    run_id = str(paused_run_id)
+    if prior is None:
+        runtime_state, accepted = _accept_at_send_door(
+            runtime_state,
+            body,
+            kind=INPUT_REPLY,
+            run_id=run_id,
+            graph=graph,
+            thread_id=thread_id,
+        )
+        decided = _decide_continued_reply(runtime_state, accepted)
+    else:
+        # An exact retry whose reconciliation never landed: continue the
+        # run with the acceptance already recorded, never a second one.
+        accepted = prior
+        decided = None
+    resume_config: dict[str, Any] = {
+        "configurable": {
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "workspace_root": str(workspace_root),
+            "accepted_task_input": accepted.to_state_dict(),
+        }
+    }
+    # The reconciled envelope rides the SAME ``Command`` that continues
+    # the run, so the accepted input and its decision become durable in
+    # one checkpoint write and the reconcile node downstream finds the
+    # version already reconciled. An acceptance that is still waiting for
+    # its decision carries no envelope: the node that owes the decision
+    # is the one that will make it.
+    resume_input: Any = Command(resume=_reply_pick(body))
+    if decided is not None:
+        resume_input = Command(
+            resume=_reply_pick(body),
+            update={"task_runtime": decided.to_state_dict()},
+        )
+    return _ReplyPlan(
+        continued=_ContinuedReply(
+            run_id=run_id,
+            resume_input=resume_input,
+            resume_config=resume_config,
+            accepted_input_version=accepted.input_version,
+        )
+    )
+
+
+def _decide_continued_reply(
+    runtime_state: TaskRuntimeState, accepted: AcceptedInput
+) -> TaskRuntimeState:
+    """Commit this reply's decision before the continued run starts.
+
+    Same pure decision the reconcile node would make, applied one step
+    earlier: a paused run resumes at whatever node it stopped on, which
+    is usually past ``reconcile_task``, so leaving the node to decide
+    would leave the accepted input permanently unreconciled.
+    """
+    try:
+        return decide_task_runtime(
+            runtime_state,
+            accepted,
+            ReconciliationProposal(
+                kind=INPUT_REPLY, reason="clarification reply"
+            ),
+        )
+    except TaskRuntimeError as exc:
+        raise _task_input_http_error(exc) from exc
+
+
+def _retry_frames(
+    store: ThreadStore, thread_id: str, prior: AcceptedInput
+) -> Iterator[str]:
+    """The terminal frames of the run a repeated reply already produced.
+
+    A repeat delivery is a no-op for everything durable — no second
+    accepted input, no second run, no second turn row — so the only
+    honest thing left to send is the outcome the first delivery
+    already published, read back off the row that published it. A run
+    that never wrote a row (stopped, or a process that died before
+    finalizing) has no outcome to return, so the retry says so with the
+    typed token instead of inventing one.
+
+    The replay is the turn's OUTCOME, not a byte-for-byte repeat of the
+    live wire: ``fin_run`` is the durable record of what the turn
+    produced, and a live channel it never persisted cannot be recovered
+    from it. The visual-claim lane and the semantic verdict ARE persisted
+    columns, so they ride the replay too — a duplicate delivery that
+    dropped them would show a turn with no claims and no
+    ``insufficient_evidence`` verdict while ``GET`` history showed both.
+    """
+    row = next(
+        (run for run in store.list_runs(thread_id) if run.id == prior.run_id),
+        None,
+    )
+    if row is None:
+        payload = _run_to_response_payload(
+            {"status": "refuse", "status_reason": TASK_REPLY_EXPIRED}
+        )
+    else:
+        payload = _run_to_response_payload(
+            {
+                "status": row.status,
+                "answer": row.answer,
+                "status_reason": row.status_reason,
+                "citations": row.citations,
+                "thinking_text": row.thinking_text,
+                "tool_summaries": row.tool_summaries,
+                "track_decision": dict(row.track_decision or {}),
+                "comparisons": list(row.comparisons or []),
+                "analysis_results": list(row.analysis_results or []),
+                "evidence_locators": list(row.evidence_locators or []),
+                "retrieval_window": dict(row.retrieval_window or {}),
+            }
+        )
+    # Re-normalised from the persisted rows, not lifted verbatim: the row
+    # and the frame are the SAME rows through the SAME projector, so a
+    # duplicate delivery cannot mint a second shape for them.
+    claim_rows, claim_refusals = (
+        _visual_claims_wire_payload(row.visual_claims)
+        if row is not None
+        else ([], [])
+    )
+    return _terminal_sse_frames(
+        run_id=prior.run_id or "",
+        payload=payload,
+        thinking_ms=row.thinking_duration_ms if row is not None else None,
+        claim_rows=claim_rows,
+        visual_refusals=claim_refusals,
+        semantic_outcome=row.semantic_outcome if row is not None else None,
+    )
 
 
 class PendingTurnResponse(BaseModel):
@@ -1420,6 +1999,15 @@ class ThreadDetailResponse(BaseModel):
     # response model does not declare — the same reason ``pending_turn`` and
     # ``pending_interrupt_kind`` are declared.
     task_runtime: TaskRuntimeView = Field(default_factory=TaskRuntimeView)
+    # QA-chain T9: the thread's ACCEPTED source-scope snapshot, exactly as
+    # ``fin.host.source_scope`` freezes it
+    # (``{schema_version, mode, sources[], accepted_input_version}``).
+    #
+    # ``None`` means no accepted restriction exists yet — the
+    # whole-corpus default — and is NOT the same as an unrestricted
+    # snapshot, which is an explicit accepted clear. Declared here because
+    # FastAPI filters any key the response model does not declare.
+    source_scope: dict[str, Any] | None = None
     turns: list[TurnRow]
 
 
@@ -1519,7 +2107,7 @@ def _structured_evidence_wire_payload(rows: Any) -> list[dict[str, Any]]:
     is read off the frozen snapshot, so it needs no backend outcome --
     MP15 must never become an input to it (docs/decisions/p2-d2).
     """
-    from fin.host.evidence_contract import EVIDENCE_EXPIRED
+    from fin.host.evidence.evidence_contract import EVIDENCE_EXPIRED
 
     now = datetime.now(timezone.utc)
     payload: list[dict[str, Any]] = []
@@ -1664,7 +2252,7 @@ def _serialize_run(
         # the entries nest (rows -> cells), so a shallow ``dict()``
         # would still share the inner lists with the store.
         "comparisons": copy.deepcopy(list(run.comparisons or [])),
-        # Trust (the tracked change): copied so a caller cannot mutate the store's
+        # Trust: copied so a caller cannot mutate the store's
         # list through the serialized view.
         "evidence_locators": [dict(loc) for loc in run.evidence_locators],
         "analysis_results": copy.deepcopy(list(run.analysis_results or [])),
@@ -1678,8 +2266,13 @@ def _serialize_run(
         "structured_evidence": _structured_evidence_wire_payload(
             run.structured_evidence
         ),
+        "retrieval_window": copy.deepcopy(dict(run.retrieval_window or {})),
         # T8: the latest thumb for this run (``None`` when unset).
         "feedback": feedback,
+        # A5: NULL is unknown. A done turn with insufficient_evidence
+        # is a partial answer, and this is the field that survives
+        # after the checkpoint is cleared.
+        "semantic_outcome": run.semantic_outcome,
     }
 
 
@@ -1718,391 +2311,7 @@ def _format_sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {encoded}\n\n"
 
 
-# ----- SSE frame builders (T1 #33 / T3) -----
 
-
-def _tool_result_frames(
-    message: ToolMessage,
-    pending_args: dict[str, dict[str, Any]] | None = None,
-) -> Iterator[tuple[str, Any]]:
-    """Yield the ``tool_result`` (plus ``comparison``/``analysis``)
-    frames for one ``ToolMessage``.
-
-    Split from :func:`_node_frame_payloads` to keep each function
-    under the complexity budget (code-review T2 finding): the
-    args-consuming summary belongs to the T1 contract, the
-    structured envelopes to the T3 comparison wire.
-    """
-    tool_name = getattr(message, "name", "") or ""
-    tool_call_id = getattr(message, "tool_call_id", "") or ""
-    raw_content = message.content
-    parsed: Any = raw_content
-    if isinstance(raw_content, str):
-        try:
-            parsed = json.loads(raw_content)
-        except (TypeError, ValueError):
-            parsed = raw_content
-    # Strip the marker from the human-readable summary so a
-    # bounce template embedded in tool output never escapes
-    # to the SPA (ADR 0021).
-    call_args = (
-        pending_args.get(tool_call_id) if pending_args is not None else None
-    )
-    if pending_args is not None and tool_call_id:
-        pending_args.pop(tool_call_id, None)
-    yield (
-        "tool_result",
-        {
-            "name": tool_name,
-            "summary": strip_hidden_bounce_marker(
-                format_tool_summary(tool_name, result=parsed, args=call_args)
-            ),
-            "tool_call_id": tool_call_id,
-        },
-    )
-    # T3: the comparison table rides its own frame so the SPA
-    # does not have to re-parse ``tool_result``. Reuses the
-    # graph's extractor so the wire entry and the persisted
-    # ``RunRecord.comparisons`` entry are byte-identical.
-    comparison = comparison_from_tool_message(message)
-    if comparison is not None:
-        yield ("comparison", comparison)
-    analysis = analysis_from_tool_message(message)
-    if analysis is not None:
-        yield ("analysis", analysis)
-
-
-def _node_frame_payloads(
-    message: BaseMessage,
-    pending_args: dict[str, dict[str, Any]] | None = None,
-) -> Iterator[tuple[str, Any]]:
-    """Yield the node-complete ``(event, data)`` frames for a message.
-
-    Node-complete frames are synthesized from ``values``-mode
-    emissions (each arrives AFTER the node's checkpoint write):
-
-    * ``AIMessage``  -> one ``tool_call`` frame per parsed tool call
-      (args are complete and parsed here — chunk-level
-      ``tool_call_chunks`` would emit partial args). Thinking is
-      NOT emitted here: the split-channel deltas already streamed
-      via ``messages`` mode (whatever the assembled message carries
-      on ``additional_kwargs.reasoning_details`` arrived chunk by
-      chunk first).
-    * ``ToolMessage`` -> one ``tool_result`` frame with the
-      human-readable summary (never the raw JSON payload), plus —
-      for ``compare_facts`` only — one ``comparison`` frame
-      carrying the ``fin.comparison`` envelope (T3). That
-      envelope is the sole structured payload on this wire: it is
-      tool-computed data, not model prose, and the live view
-      renders it as a table before the answer arrives. A typed
-      EXIT (no columns) emits no frame.
-    * HumanMessage / SystemMessage / others -> no frame. The user
-      side has its own UI; SystemMessages are the gate's hidden
-      bounce templates and MUST NOT appear on the wire (ADR 0021).
-    """
-    if isinstance(message, AIMessage):
-        for call in message.tool_calls or ():
-            args = call.get("args") or {}
-            if isinstance(args, str):
-                # LangChain sometimes leaves args as a JSON string
-                # when the model streamed them; parse defensively.
-                try:
-                    args = json.loads(args)
-                except (TypeError, ValueError):
-                    args = {}
-            call_id = call.get("id", "")
-            # Register id -> args so the matching ToolMessage frame
-            # can summarize with the same args the persist path uses
-            # (turn-trace-folds: live one-liners match GET history).
-            if pending_args is not None and call_id:
-                pending_args[str(call_id)] = dict(args)
-            yield (
-                "tool_call",
-                {
-                    "name": call.get("name", ""),
-                    "args": args,
-                    "tool_call_id": call_id,
-                },
-            )
-        return
-    if isinstance(message, ToolMessage):
-        yield from _tool_result_frames(message, pending_args)
-
-
-def _stream_run_frames(
-    graph: Any,
-    *,
-    run_id: str,
-    input_value: Any,
-    config: dict[str, Any],
-    seen_message_ids: set[str],
-    thread_id: str | None = None,
-    stop_token: StopToken | None = None,
-) -> Iterator[str]:
-    """Drive one run on the combined delta wire; return the outcome.
-
-    The shared engine behind the send route (T1, #33) and the
-    resume route (T2, #36) so the two surfaces cannot drift on the
-    wire contract. On exception the generator still emits
-    ``status`` / ``answer`` / ``citations`` before returning so the
-    SPA's reader closes cleanly instead of hanging on a truncated
-    stream (mid-flight failures otherwise leave the live view
-    frozen in ``running``).
-
-    Consumes ``graph.stream`` with
-    ``stream_mode=["messages", "values"]``:
-
-    * ``messages`` items arrive DURING an answer-authoring node's
-      execution (``_ANSWER_AUTHORING_NODES``: the research leaf and
-      the three Soft-Track leaves) — each ``AIMessageChunk`` maps to
-      zero or more ``thinking`` / ``answer`` delta frames (SC60:
-      reasoning deltas go to ``thinking``, inline ``<thinking>``
-      prose is filtered out of ``answer`` even when a tag spans
-      chunk boundaries). The aggregated end-of-call ``AIMessage``
-      (not a chunk) and chunks from every other node — the
-      ``classify`` tier above all — are skipped.
-    * ``values`` items arrive after each node completes (post
-      checkpoint) — new messages map to ``tool_call`` /
-      ``tool_result`` frames, deduplicated by message id through
-      the caller-owned ``seen_message_ids`` set (resume callers seed
-      it with the pre-resume checkpoint's ids so checkpointed
-      messages do not replay onto the wire).
-
-    Every emitted frame ticks the :class:`ThinkingClock` (T4, #37)
-    so the run's total thinking duration is known when the stream
-    ends. The generator's return value carries the final state and
-    ``thinking_ms``; ``None`` final state means the stream produced
-    nothing. On exception the generator still emits status / answer
-    / citations before returning; the send caller then persists a
-    refuse row (``refuse_reason`` set), the resume caller skips.
-
-    ``stop_token`` (T4 workflow, the tracked change) is checked between frames: a
-    set token stops consuming the graph stream and returns
-    ``stopped=True`` WITHOUT emitting terminal frames, because a stop
-    is not a stream failure and the caller owns the ``stopped`` copy.
-    The graph iterator is closed explicitly in a ``finally`` so
-    ``_LockedGraph.stream`` runs its own ``finally`` and releases the
-    per-thread lock right away — the composer must be usable the
-    moment the wire closes, not whenever the iterator is collected.
-    """
-    clock = ThinkingClock()
-
-    def _frame(event: str, data: Any) -> str:
-        # T4 (#37): thinking frames open a duration segment; every
-        # other frame closes it — the collapse label's data.
-        if event == "thinking":
-            clock.tick_thinking()
-        else:
-            clock.tick_other()
-        return _format_sse(event, data)
-
-    filter_state = InlineFilterState()
-    final_state: dict[str, Any] | None = None
-    # Bounce-marker SystemMessage arms a pending reset; the NEXT
-    # non-empty answer delta carries ``reset: true`` in the same
-    # frame as its text. Do NOT emit a standalone empty reset (that
-    # blanks the SPA before tool_call / retry prose). tool_call does
-    # not clear pending. If the run ends with pending still armed,
-    # the terminal empty answer flushes it (refuse / no retry prose).
-    pending_answer_reset = False
-    # tool_call_id -> args, registered when the AIMessage's
-    # ``tool_call`` frames are emitted and consumed by the matching
-    # ``tool_result`` frame so its summary carries the same args the
-    # graph persist path passes (turn-trace-folds T1: live one-liners
-    # match GET history, e.g. retrieve shows its query).
-    pending_args: dict[str, dict[str, Any]] = {}
-
-    def _answer_payload(text: str) -> dict[str, Any]:
-        nonlocal pending_answer_reset
-        data: dict[str, Any] = {"text": text}
-        if pending_answer_reset:
-            data["reset"] = True
-            pending_answer_reset = False
-        return data
-
-    stopped = False
-    # search-mode host T2: set when the run paused on a choice window
-    # (the final ``values`` frame carries ``__interrupt__``).
-    choice_window: dict[str, Any] | None = None
-    # T2f: set when the run paused on the attachment preparation gate.
-    attachment_wait: dict[str, Any] | None = None
-    graph_stream = graph.stream(
-        input_value,
-        config=config,
-        stream_mode=["messages", "values"],
-    )
-    try:
-        for mode, payload in graph_stream:
-            if stop_token is not None and stop_token.is_set():
-                stopped = True
-                break
-            if mode == "messages":
-                chunk, meta = payload
-                # The aggregated end-of-call AIMessage is not a chunk;
-                # only per-token AIMessageChunks carry new deltas.
-                if not isinstance(chunk, AIMessageChunk):
-                    continue
-                if meta.get("langgraph_node") not in _ANSWER_AUTHORING_NODES:
-                    continue
-                reasoning = reasoning_delta_from_chunk(chunk)
-                if reasoning:
-                    yield _frame(
-                        "thinking",
-                        {"text": strip_hidden_bounce_marker(reasoning)},
-                    )
-                content = chunk.content
-                if isinstance(content, str) and content:
-                    split = split_stream_delta(filter_state, content)
-                    filter_state = split.state
-                    if split.thinking:
-                        yield _frame("thinking", {"text": split.thinking})
-                    if split.answer:
-                        yield _frame("answer", _answer_payload(split.answer))
-            else:
-                final_state = payload
-                for message in payload.get("messages", []) or []:
-                    mid = getattr(message, "id", None)
-                    if mid and mid in seen_message_ids:
-                        continue
-                    if mid:
-                        seen_message_ids.add(mid)
-                    if isinstance(message, SystemMessage):
-                        # Only the gate's hidden bounce template (ADR
-                        # 0021 marker) arms pending reset. Other
-                        # SystemMessages are ignored. The template
-                        # itself never reaches the wire.
-                        raw = message.content
-                        if (
-                            isinstance(raw, str)
-                            and HIDDEN_BOUNCE_MARKER in raw
-                        ):
-                            pending_answer_reset = True
-                        continue
-                    for event, data in _node_frame_payloads(
-                        message, pending_args
-                    ):
-                        yield _frame(event, data)
-                # A paused HITL interrupt surfaces on the LAST
-                # ``values`` frame under the reserved ``__interrupt__``
-                # key (LangGraph contract). The choice-window payload is
-                # the frame's data verbatim — the host/HTTP contract the
-                # SPA paints (spec search-mode-host SC2, stub allowed).
-                # T2f: the attachment-preparation pause shares this loop
-                # but not this frame — the SPA does not answer it, so it
-                # rides a distinct ``attachment_wait`` event carrying
-                # the run id the auto-resumer will drive.
-                for pending in payload.get("__interrupt__") or ():
-                    value = getattr(pending, "value", None)
-                    if not isinstance(value, dict):
-                        continue
-                    if value.get("kind") == "choice_window":
-                        choice_window = value
-                        yield _frame("choice_window", value)
-                    elif (
-                        value.get("kind")
-                        == ATTACHMENT_PREPARATION_INTERRUPT_KIND
-                    ):
-                        attachment_wait = value
-                        yield _frame(
-                            "attachment_wait", {"run_id": run_id, **value}
-                        )
-
-        # Stream end: release any held-back inline-filter fragment so
-        # the live view never silently loses trailing text. Skipped on
-        # a stop — the operator asked for the run to end, and the
-        # caller's terminal empty answer frame clears the draft.
-        if not stopped:
-            tail = split_stream_delta(filter_state, "", final=True)
-            if tail.thinking:
-                yield _frame("thinking", {"text": tail.thinking})
-            if tail.answer:
-                yield _frame("answer", _answer_payload(tail.answer))
-    except Exception as exc:
-        # Mid-flight failure (model raise, node crash): without this
-        # boundary the exception escapes the generator, FastAPI kills
-        # the SSE body before any terminal frame, and the SPA's reader
-        # hangs waiting for ``citations`` (spec line 96: terminal
-        # statuses carry explicit copy — never swallowed blanks).
-        #
-        # Classify the exception so the SPA can render an actionable
-        # label instead of one opaque English sentence. The
-        # classification ``kind`` is a closed enum (auth / network /
-        # timeout / rate_limit / not_found / server / unknown); the
-        # user-facing copy is hand-written Chinese keyed off that
-        # kind. The exception type name rides ``reason`` for operator
-        # debuggability, with ``str(exc)`` appended only AFTER the
-        # sanitize pass — provider error text commonly embeds the
-        # auth header, the key, or a long opaque token, none of which
-        # belong on the wire.
-        kind, user_copy = classify_stream_exception(exc)
-        raw_reason = f"stream raised mid-flight: {type(exc).__name__}: {exc}"
-        sanitized = _sanitize_reason_text(raw_reason)
-        reason = f"{sanitized} (kind={kind})" if sanitized else f"stream raised mid-flight: {type(exc).__name__} (kind={kind})"
-        # Question/task runtime T2: a refused reconciliation names a real
-        # product fact, so it must not collapse into the generic "server"
-        # bucket. Its named failure IS the reason, and the copy says the
-        # run could not continue — never a question to the user, because an
-        # operational failure is not something an answer can fix.
-        refusal = getattr(exc, "kind", None)
-        if isinstance(refusal, str) and refusal in TASK_FAILURE_KINDS:
-            kind = refusal
-            user_copy = _TASK_REFUSAL_USER_COPY.get(
-                refusal, _STREAM_FAILURE_USER_COPY["server"]
-            )
-            reason = refusal
-        logger.exception(
-            "run stream raised mid-flight",
-            extra={
-                "run_id": run_id,
-                "thread_id": thread_id,
-                "kind": kind,
-            },
-        )
-        yield _format_sse(
-            "status",
-            {
-                "run_id": run_id,
-                "status": "refuse",
-                "reason": reason,
-                "assistant_message": user_copy,
-                "status_classified": kind,
-                "thinking_ms": clock.total_ms,
-                "evidence_schema": CITATION_CHANNEL_SCHEMA,
-                EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
-            },
-        )
-        # Flush pending bounce reset on the terminal empty answer
-        # when the raise happened before any retry prose.
-        yield _format_sse(
-            "answer", _answer_payload(strip_thinking_from_answer(""))
-        )
-        yield _format_sse("citations", [])
-        clock.close()
-        return RunStreamOutcome(
-            final_state=None,
-            thinking_ms=clock.total_ms,
-            refuse_reason=reason,
-            refuse_copy=user_copy,
-            refuse_kind=kind,
-        )
-    finally:
-        # Close the graph iterator explicitly. On the stop path the
-        # ``break`` above leaves it suspended, and only ``close()``
-        # runs ``_LockedGraph.stream``'s ``finally`` — i.e. releases
-        # the per-thread lock. Without it the composer would stay
-        # disabled until the generator was garbage-collected.
-        close = getattr(graph_stream, "close", None)
-        if callable(close):
-            close()
-    clock.close()
-    return RunStreamOutcome(
-        final_state=final_state,
-        thinking_ms=clock.total_ms,
-        answer_reset=pending_answer_reset,
-        stopped=stopped,
-        choice_window=choice_window,
-        attachment_wait=attachment_wait,
-    )
 
 
 def _resume_run_stream(
@@ -2114,142 +2323,43 @@ def _resume_run_stream(
     run_id: str,
     resume_input: Any,
     resume_config: dict[str, Any],
+    receipts: TurnReceiptProjector | None = None,
+    attachments: AttachmentPreparationService | None = None,
 ) -> Iterator[str]:
-    """Drive one resumed run on the shared delta wire; persist on finish.
+    """Drive one background resumed run to its turn row, discarding the wire.
 
-    THE one resume path, extracted from ``POST /threads/{id}/resume`` so
-    an operator resume and the T2f attachment auto-resumer cannot drift:
-    the auto-resumer consumes the generator to exhaustion in the
-    background and DISCARDS the frames — the resumed turn row is the
-    half it needs, the live wire is the half only an HTTP caller reads.
-
-    ``resume_input`` is LangGraph's ``Command(resume=pick)`` for an
-    operator answer, a ``Command(resume=<string>)`` for the
-    auto-resumer (the gate node ignores the value, and
-    ``Command(resume=None)`` trips an ``UnboundLocalError`` in this
-    langgraph version), or ``None`` for the plain crash resume.
-
-    The dedup set is seeded with the pre-resume checkpoint's message
-    ids: the first ``values`` frame replays the checkpointed messages
-    (the crashed run's HumanMessage + complete ``AIMessage``), and
-    re-emitting their frames would duplicate what the pre-crash stream
-    already sent.
+    The attachment auto-resumer's only path: it consumes the frames to
+    exhaustion and throws them away, because the resumed turn row is the
+    half it needs and no operator is reading a stream. The operator's
+    ``POST .../resume`` does NOT come through here — it builds its own
+    executor so it can hand that executor the claim its route already
+    took. What keeps the two surfaces from drifting is that both go
+    through :class:`~fin.host.run_execution.RunExecutor`, which owns the
+    graph consumption, the stop token, the iterator release and the one
+    row; a background resume that drove the graph itself is how they used
+    to diverge. A background resume ends on the same receipt as an
+    operator's: it continues that turn's run, so it reports on that
+    turn's receipt rather than starting a projection of its own.
     """
-    seen_message_ids: set[str] = set()
-    if hasattr(graph, "checkpoint_message_ids"):
-        seen_message_ids |= graph.checkpoint_message_ids(thread_id)
-    # A resumed remainder is an in-flight run on this thread too, so
-    # Stop must reach it (the composer is disabled for its whole
-    # duration).
-    stop_token = run_control.begin(thread_id, run_id)
-    try:
-        outcome = yield from _stream_run_frames(
-            graph,
-            run_id=run_id,
-            input_value=resume_input,
-            config=resume_config,
-            seen_message_ids=seen_message_ids,
-            thread_id=thread_id,
-            stop_token=stop_token,
-        )
-    finally:
-        run_control.end(stop_token)
 
-    if outcome.stopped:
-        # No row: the original send's row already tells the story, and
-        # one row per stopped Resume click would spam the turn table
-        # (same policy as this path's mid-flight refuse branch).
-        yield from _stopped_terminal_frames(
-            run_id, thinking_ms=outcome.thinking_ms
-        )
-        return
-
-    if outcome.choice_window is not None:
-        # Re-draw (body-less resume onto a pending window) or an invalid
-        # pick that REOPENED the window: the frame is out, the run is
-        # still paused, so persist nothing and close — the operator
-        # picks again.
-        return
-
-    if outcome.attachment_wait is not None:
-        # T2f: the resumed remainder paused on the attachment gate
-        # AGAIN (e.g. a re-upload changed the content version
-        # mid-resume). Same posture as the send route's pause: persist
-        # nothing and close; the next settled sweep drives this run.
-        return
-
-    if outcome.final_state is None:
-        # Mid-flight raise on a RESUME: unlike the send path, persist
-        # nothing — when the original send row exists it already tells
-        # the story, and appending a refuse row per failed Resume click
-        # would spam the turn table. After process death with no send
-        # row, a resume that also raises still leaves history without a
-        # row (success-path resume below does load the checkpoint
-        # HumanMessage when final_state is present).
-        return
-    payload = _run_to_response_payload(outcome.final_state)
-    # ADR 0089: the resumed remainder's visual claims, read off the final
-    # state (own channel, not the citation payload) and normalised once so
-    # the row and the frame agree; malformed live rows are NAMED (spec
-    # §8-R4), not dropped.
-    visual_claims, visual_refusals = _visual_claims_wire_payload(
-        outcome.final_state.get("visual_claims")
+    executor = RunExecutor(
+        graph=graph,
+        store=store,
+        run_control=run_control,
+        receipts=receipts,
+        publication_warnings=_publication_warnings(attachments),
     )
-    resume_question = (
-        graph.checkpoint_last_human_text(thread_id)
-        if hasattr(graph, "checkpoint_last_human_text")
-        else None
-    ) or ""
-    try:
-        store.append_run(
-            RunRecord(
-                id=run_id,
+    return _sse_frames(
+        executor.resume(
+            ResumeRunRequest(
                 thread_id=thread_id,
-                question=resume_question,
-                status=payload["status"],
-                status_reason=payload["reason"],
-                answer=payload["answer"],
-                citations=payload["citations"],
-                thinking_text=payload["thinking_text"],
-                thinking_duration_ms=outcome.thinking_ms,
-                tool_summaries=payload["tool_summaries"],
-                assistant_message=payload["assistant_message"],
-                track_decision=dict(payload.get("track_decision") or {}),
-                comparisons=list(payload.get("comparisons") or []),
-                analysis_results=list(payload.get("analysis_results") or []),
-                # SC8: the RESUMED remainder's locators. The crashed
-                # prefix's row (when one exists) keeps its own.
-                evidence_locators=list(payload["evidence_locators"]),
-                # ADR 0089: the RESUMED remainder's visual claims.
-                visual_claims=visual_claims,
-                # EP6: the RESUMED remainder's admitted snapshots. The
-                # crashed prefix's row keeps its own.
-                structured_evidence=list(
-                    outcome.final_state.get("structured_evidence") or []
-                ),
+                run_id=run_id,
+                resume_input=resume_input,
+                resume_config=resume_config,
             )
         )
-    except ThreadNotFoundError:
-        yield _format_sse("status", {
-            "run_id": run_id,
-            "status": "refuse",
-            "reason": "thread_not_found",
-            "assistant_message": "Thread was deleted while the run was resuming.",
-            "evidence_schema": CITATION_CHANNEL_SCHEMA,
-            EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
-        })
-        return
-    # Terminal frames per spec line 30 (shared emitter). The resume's
-    # thinking duration is the REMAINDER's, not the crashed prefix's
-    # (that time is unknowable post-crash).
-    yield from _terminal_sse_frames(
-        run_id=run_id,
-        payload=payload,
-        thinking_ms=outcome.thinking_ms,
-        answer_reset=outcome.answer_reset,
-        visual_claims=visual_claims,
-        visual_refusals=visual_refusals,
     )
+
 
 
 def _citations_wire_projection(
@@ -2480,69 +2590,255 @@ def _row_names_no_record(candidate: dict[str, Any]) -> bool:
     return not str(snapshot.get("source") or "") or not snapshot.get("record_key")
 
 
-def _visual_claims_wire_payload(
-    claims: Any,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Normalise the run's visual-claim channel into the wire / row shape,
-    returning ``(rows, refusals)``.
+def _reraise_single(group: BaseExceptionGroup) -> None:
+    """Re-raise one task failure unwrapped; re-raise a group of several.
 
-    A visual claim is NOT a citation (ADR 0089): it rides its own
-    ``visual_claims`` frame and its own ``fin_run`` column, never the
-    ``citations`` channel, so the quote the verifier passed and the
-    provenance of a generated observation cannot be confused for each
-    other. The row's key set IS :data:`VISUAL_CLAIM_FIELDS` in that fixed
-    order plus the one frozen ``fin.evidence.visual_claim`` token and
-    its ``schema_version`` sibling appended at the E5 versioning
-    cutover (spec 4.2/9), so neither the
-    live wire nor a reload can drift from the SSOT the evidence token
-    mints. Claims stored before the cutover replay byte-identically as
-    legacy v0 (spec 7) — the token is minted on this projection, never
-    back-filled into a stored row.
-
-    A malformed live row is NAMED, never dropped (spec §8-R4: the
-    grace of §7 is for stored legacy records; a live decoding after
-    E5 refuses): the minted candidate is judged by the validator home
-    and the exact §6 code rides the ``evidence_refusals`` frame beside
-    the row's index. Only the code and field names are logged, never a
-    row's content (filename / image hash are thread-private material).
+    A task group always collects its tasks' failures into a group. The
+    transport above this response understands a bare ``OSError`` or
+    ``ClientDisconnect`` and nothing else, so the single-exception case —
+    the only one a disconnect produces — has to reach it unwrapped. Two
+    unrelated failures stay a group, because dropping one of them would
+    hide a second defect behind a first.
     """
-    rows: list[dict[str, Any]] = []
-    refusals: list[dict[str, Any]] = []
-    claim_rows = list(claims or ())
-    # WHY seeded from the rows' own identities: thread trust and the
-    # stored observation version are admission facts the transport
-    # cannot see; the posture and its never-hash rule live with the
-    # home's ``seed_context_from_rows``.
-    seeded = seed_context_from_rows(visual_claim_rows=claim_rows)
-    for index, row in enumerate(claim_rows):
-        candidate: Any = row
-        if isinstance(row, Mapping) and all(
-            name in row for name in VISUAL_CLAIM_FIELDS
-        ):
-            # The projector is the single normaliser (unchanged SSOT
-            # behavior): onto the frozen 14 keys IN ORDER, extra keys
-            # off, then the E5 cutover mint (spec 4.2: the lane gains
-            # the one ``schema`` field and its ``schema_version``
-            # sibling; spec 7.5: a fresh emission without them is
-            # malformed). A row MISSING any field is passed to the
-            # home verbatim so the refusal names the missing keys
-            # instead of a generic one here.
-            candidate = {name: row[name] for name in VISUAL_CLAIM_FIELDS}
-            candidate["schema"] = VISUAL_CLAIM_SCHEMA
-            candidate[EVIDENCE_SCHEMA_VERSION_FIELD] = EVIDENCE_SCHEMA_VERSION
-        outcome = validate_evidence({"visual_claims": [candidate]}, seeded)
-        if outcome.accepted:
-            projected = {name: candidate[name] for name in VISUAL_CLAIM_FIELDS}
-            projected["schema"] = VISUAL_CLAIM_SCHEMA
-            projected[EVIDENCE_SCHEMA_VERSION_FIELD] = EVIDENCE_SCHEMA_VERSION
-            rows.append(projected)
+    if len(group.exceptions) != 1:
+        raise group
+    exception = group.exceptions[0]
+    context = None if exception.__suppress_context__ else exception.__context__
+    raise exception from group.__cause__ or context
+
+
+class _ClaimedStreamingResponse(StreamingResponse):
+    """A run stream that hands the door's claim back however the wire ends.
+
+    The claim is taken at the door, before the first byte, because a
+    refusal has to be a 409 with no stream at all. Releasing it from the
+    run generator's ``finally`` was the one place it could NOT be
+    released: a client that disconnects before the first body chunk
+    means that generator never starts, so the claim outlived every
+    caller and the thread answered 409 ``concurrent_run`` to
+    everything after it — while ``GET thread`` reported nothing in
+    flight, because no run ever held anything but the claim. The graph
+    was never reached, so nothing inside the graph could free it
+    either, and on this transport shape the failure escapes before
+    ``background`` is awaited.
+
+    The response is the one object that always runs: its ``finally``
+    fires on the normal path, on a mid-stream transport failure, and on
+    a disconnect before iteration. ``RunAdmission.release`` is
+    idempotent, so the executor's own release stays a no-op.
+
+    That same ``finally`` is also where a turn whose stream was
+    abandoned gets its outcome recorded, and the ORDER is the point:
+    the claim comes back first, so a receipt write that itself fails
+    cannot leave the thread locked, and the recorder decides for itself
+    whether the run had already reported an end.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        admission: RunAdmission,
+        on_disconnect: Callable[[], None] | None = None,
+        on_end: Callable[[], None] | None = None,
+        abandonment: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._admission = admission
+        self._on_disconnect = on_disconnect
+        self._on_end = on_end
+        self._abandonment = abandonment
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        disconnect_reported = False
+        stream_completed = False
+
+        def report_disconnect() -> None:
+            nonlocal disconnect_reported
+            if disconnect_reported:
+                return
+            disconnect_reported = True
+            if self._on_disconnect is not None:
+                self._on_disconnect()
+
+        async def observed_receive() -> Any:
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                report_disconnect()
+            return message
+
+        async def observed_send(message: Any) -> None:
+            try:
+                await send(message)
+            except OSError:
+                report_disconnect()
+                raise
+
+        try:
+            spec_version = tuple(
+                map(
+                    int,
+                    scope.get("asgi", {}).get("spec_version", "2.0").split("."),
+                )
+            )
+            # WHY one task group for both: the two ASGI spec versions differ
+            # only in WHO swallows the transport's OSError. The disconnect
+            # itself has to be observed on both, because a run blocked in
+            # synchronous work never touches ``receive`` again, so a
+            # listener that does not run alongside the stream reports a
+            # lost client only once that work finishes on its own.
+            try:
+                async with anyio.create_task_group() as task_group:
+
+                    async def stream_response() -> None:
+                        nonlocal stream_completed
+                        try:
+                            await self.stream_response(observed_send)
+                            stream_completed = True
+                        except OSError as exc:
+                            report_disconnect()
+                            if spec_version < (2, 4):
+                                raise ClientDisconnect() from exc
+                            raise
+                        finally:
+                            task_group.cancel_scope.cancel()
+
+                    async def listen_for_disconnect() -> None:
+                        await self.listen_for_disconnect(observed_receive)
+                        report_disconnect()
+                        task_group.cancel_scope.cancel()
+
+                    task_group.start_soon(stream_response)
+                    await listen_for_disconnect()
+            except BaseExceptionGroup as group:
+                _reraise_single(group)
+            if self.background is not None:
+                await self.background()
+        finally:
+            try:
+                if self._on_end is not None:
+                    self._on_end()
+            finally:
+                try:
+                    self._admission.release()
+                finally:
+                    if not stream_completed:
+                        self._record_abandonment()
+
+    def _record_abandonment(self) -> None:
+        """Tell the receipt its stream ended without an outcome.
+
+        Swallowed on purpose: this runs in the response's teardown, where
+        an exception would replace whatever the wire was already
+        reporting with a failure nobody asked about. A receipt that
+        cannot be written is logged, not raised.
+        """
+        if self._abandonment is None:
+            return
+        try:
+            self._abandonment()
+        except Exception:
+            logger.exception(
+                "the abandoned turn's receipt could not be recorded"
+            )
+
+
+def _publication_warnings(
+    attachments: AttachmentPreparationService | None,
+) -> Callable[[str], int] | None:
+    """The receipt's warning counter for whichever attachment store exists.
+
+    ``None`` when no preparation service is wired — a deployment with no
+    attachment lane has no documents to be unsearchable, and passing the
+    counter anyway would report a clean thread on the strength of a
+    measurement nobody could have made.
+    """
+    if attachments is None:
+        return None
+    return attachments.unresolved_publication_count
+
+
+def _abandoned_stream(
+    receipts: TurnReceiptProjector, *, thread_id: str, turn_id: str
+) -> Callable[[], None]:
+    """The recorder one run stream hands its outcome to on teardown.
+
+    Bound here rather than at each call site so every run stream asks
+    the same question of the same receipt, and so the projector — not
+    the transport — decides whether an ending wire was a lost client or
+    a run that had already reported its own end.
+    """
+
+    def record() -> None:
+        receipts.stream_abandoned(thread_id=thread_id, turn_id=turn_id)
+
+    return record
+
+
+def _disconnect_stop(stop_token: StopToken) -> Callable[[], None]:
+    """The one call a lost client makes on the run it left behind.
+
+    Capturing the token fences even a resumed segment that reuses the
+    same ``run_id``: a delayed disconnect cannot stop its newer token.
+    ``client_disconnect`` is a receipt reason, so the abandoned run says
+    why it stopped rather than reporting a timeout.
+    """
+
+    def stop() -> None:
+        stop_token.stop(reason="client_disconnect")
+
+    return stop
+
+
+def _sse_frames(events: Iterable[RunEvent]) -> Iterator[str]:
+    """Encode typed run events as the SSE frames the SPA reads.
+
+    The ONE place a run's events become bytes. The event name is the kind, so
+    no second table can disagree about a channel name, and a body rides
+    through untouched: its key order is part of the observed wire contract,
+    which is why the engine builds it and this only encodes it.
+    """
+    for event in events:
+        if event.kind is RunEventKind.TERMINAL:
+            yield from _terminal_frames(event.data)
             continue
-        code = outcome.refusal.code if outcome.refusal is not None else MALFORMED_EVIDENCE_CONTRACT
-        logger.warning(
-            "visual_claims wire: refused row %d as %s", index, code
-        )
-        refusals.append({"citation_index": index, "error": code})
-    return rows, refusals
+        yield _format_sse(event.kind.value, event.data)
+
+
+def _terminal_frames(terminal: RunTerminal) -> Iterator[str]:
+    """The fixed-order terminal frames for one finished run.
+
+    A finished turn reaches the wire as a projection, not a fixed body: how
+    many frames it takes (the visual-claim channel only speaks when the run
+    has claims) and which envelope the citations carry are properties of the
+    run, so the run decides and this orders them.
+    """
+    yield from _terminal_sse_frames(
+        run_id=terminal.run_id,
+        payload=terminal.payload,
+        thinking_type=terminal.thinking_type,
+        thinking_ms=terminal.thinking_ms,
+        answer_reset=terminal.answer_reset,
+        claim_rows=terminal.claim_rows,
+        visual_refusals=terminal.claim_refusals,
+        semantic_outcome=terminal.semantic_outcome,
+        evidence=terminal.evidence,
+    )
+
+
+def _node_frame_payloads(
+    message: Any,
+    pending_args: dict[str, dict[str, Any]] | None = None,
+) -> list[tuple[str, Any]]:
+    """The node-complete ``(event, data)`` pairs for one message.
+
+    The engine consumes typed events; this pair form is the shape a caller
+    reading a single message's events off a run script expects.
+    """
+    return [
+        (event.kind.value, event.data)
+        for event in _node_frame_events(message, pending_args)
+    ]
 
 
 def _terminal_sse_frames(
@@ -2552,32 +2848,27 @@ def _terminal_sse_frames(
     thinking_type: str | None = None,
     thinking_ms: int | None = None,
     answer_reset: bool = False,
-    visual_claims: Any = None,
+    claim_rows: list[dict[str, Any]] | None = None,
     visual_refusals: list[dict[str, Any]] | None = None,
+    semantic_outcome: str | None = None,
+    evidence: Any = None,
 ) -> Iterator[str]:
     """Yield the fixed-order terminal frames: ``status`` -> ``answer``
-    -> ``visual_claims`` (only when non-empty) -> ``citations``
-    (spec line 30; citations is TERMINAL so the SPA closes its reader).
+    -> ``visual_claims`` (only when non-empty) -> ``citations``.
 
-    Shared by the send and resume routes so the two surfaces cannot
-    drift on order / marker-stripping / citation shaping. Optional
-    extras on the status frame: ``thinking_type`` (send route echo)
-    and ``thinking_ms`` (T4, #37 — the collapse label's duration,
-    known by stream end).
+    ``citations`` is TERMINAL so the SPA closes its reader, so anything after
+    it is unreachable; the visual-claim lane therefore rides BETWEEN the
+    answer frames and the citations frame, and only when non-empty — a run
+    with no claim leaves no frame, matching the persisted ``[]`` (consumers
+    never branch on absence).
 
-    ``answer_reset`` attaches ``reset: true`` to the terminal answer
-    when a bounce left pending reset unconsumed (typical: refuse
-    with empty text and no retry prose). Mid-run empty
-    ``{text:"", reset:true}`` is forbidden; this terminal flush is
-    the sole empty+reset exception.
-
-    ``visual_claims`` is the run's visual-claim channel (raw graph state).
-    It is emitted AFTER the answer frames and BEFORE the terminal
-    ``citations`` frame - the SPA closes its reader on ``citations``, so
-    anything after it is unreachable - and ONLY when non-empty: a run with
-    no claim leaves no frame, matching the persisted ``[]`` (consumers never
-    branch on absence).
+    ``claim_rows`` arrives already normalised by the run that owns them: the
+    same rows are the persisted ``fin_run`` column, and normalising twice
+    would be a second chance for the row and the frame to disagree.
     """
+    # The answer was already projected when the run state was mapped into
+    # this payload, so the terminal frame publishes the SAME string the
+    # history row and the export carry (GE-5).
     safe_answer = strip_thinking_from_answer(
         payload["answer"] if payload["status"] == "done" else ""
     )
@@ -2586,27 +2877,60 @@ def _terminal_sse_frames(
         "status": payload["status"],
         "reason": payload["reason"] or None,
         "assistant_message": payload["assistant_message"],
-        # Spec 2.2 rule 2: the terminal frame declares the citation
-        # channel once here, so the citations array keeps its exact
-        # eight-key row shape and a client decodes against a named
-        # version instead of a guess.
+        # The terminal frame declares the citation channel once here, so
+        # the citations array keeps its exact eight-key row shape and a
+        # client decodes against a named version instead of a guess.
         "evidence_schema": CITATION_CHANNEL_SCHEMA,
         EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
     }
-    # Soft-Track: expose the graph track so the SPA can render a
-    # light research hint without Chat|Research chrome.
+    # Soft-Track: expose the graph track so the SPA can render a light
+    # research hint without Chat|Research chrome.
     if payload.get("track"):
         status_body["track"] = payload["track"]
+    # QA-chain T8: the product route intent/source ride the terminal
+    # frame so the live receipt reports the same value as the persisted
+    # turn row's ``track_decision`` (which carries them nested).
+    #
+    # THIS is the emission door for the closed vocabulary. T8 fixes four
+    # wire intents (``retrieve`` / ``overview`` / ``chat`` /
+    # ``policy_refuse``) and three sources (``rule`` / ``jev`` /
+    # ``fallback``), and the contract lives in
+    # :mod:`fin.host.grounded.route_intent` — so the two ``normalize_*`` readers
+    # that own it are called HERE rather than the strings being
+    # republished on truthiness. ``classify_node`` is the only writer of
+    # these values and it projects through :func:`decide_route_intent`,
+    # which is total, so nothing in the production path can produce an
+    # out-of-vocabulary value; the check is the wire boundary's own.
+    #
+    # WHY the emitter rather than the graph writer: the graph owns the
+    # DECISION and its audit, and a persisted audit should record what
+    # the run actually decided even while that record is malformed. The
+    # wire owns the CONTRACT, and a client that switches on these two
+    # fields must be able to assume the vocabulary is closed. The same
+    # reasoning splits the source: it rides only beside an intent that
+    # survived, because 「how was this turn routed」 is not a standalone
+    # fact — without the disposition it describes, it is unattributed.
+    route_decision = dict(payload.get("track_decision") or {})
+    route_intent = normalize_route_intent(route_decision.get("route_intent"))
+    if route_intent is not None:
+        status_body["route_intent"] = route_intent
+        route_source = normalize_route_source(route_decision.get("route_source"))
+        if route_source is not None:
+            status_body["route_source"] = route_source
+    status_body["search_mode_decision"] = dict(
+        payload.get("search_mode_decision") or {}
+    )
     if thinking_type is not None:
         status_body["thinking_type"] = thinking_type
     if thinking_ms is not None:
         status_body["thinking_ms"] = thinking_ms
+    if semantic_outcome == "insufficient_evidence":
+        status_body["semantic_outcome"] = semantic_outcome
     answer_body: dict[str, Any] = {"text": safe_answer}
     if answer_reset:
         answer_body["reset"] = True
     yield _format_sse("status", status_body)
     yield _format_sse("answer", answer_body)
-    claim_rows, recheck_refusals = _visual_claims_wire_payload(visual_claims)
     if claim_rows:
         # Emitted between the answer frames and the terminal ``citations``
         # frame: a visual claim is its own channel, and the citations frame
@@ -2615,118 +2939,29 @@ def _terminal_sse_frames(
     citation_rows, citation_refusals = _citations_wire_projection(
         payload["citations"]
     )
-    # Spec §8-R4: the visual lane's named refusals ride the SAME
-    # ``evidence_refusals`` frame as the citation lane's (per-row
-    # ``{citation_index, error}`` entries; the index addresses the
-    # row's position in its own channel) — a dropped malformed live
-    # row is closed there too.
+    display_sections = citation_sections_from_evidence(citation_rows, evidence)
+    for row, section in zip(citation_rows, display_sections, strict=True):
+        if section is not None:
+            row["section"] = section
+    # The visual lane's named refusals ride the SAME ``evidence_refusals``
+    # frame as the citation lane's (per-row ``{citation_index, error}``
+    # entries; the index addresses the row's position in its own channel) —
+    # a dropped malformed live row is closed there too.
     refusal_entries = [
         *(visual_refusals or ()),
-        *recheck_refusals,
         *citation_refusals,
     ]
     if refusal_entries:
         # A refused row rides its own frame BEFORE the terminal
         # ``citations`` frame (which closes the reader): the entry shape
-        # mirrors the history read's ``rejected_citations`` so one
-        # refusal vocabulary serves both surfaces, and a mid-stream
-        # loss is named instead of silent.
+        # mirrors the history read's ``rejected_citations`` so one refusal
+        # vocabulary serves both surfaces, and a mid-stream loss is named
+        # instead of silent.
         yield _format_sse(
             "evidence_refusals", {"refusals": refusal_entries}
         )
     yield _format_sse("citations", citation_rows)
 
-
-# T4 workflow (the tracked change): the ordinary-person copy a stopped run leaves on
-# its turn row. A stop is the operator's own action, so the copy says
-# what happened and what is possible next — never an error sentence.
-STOPPED_ASSISTANT_MESSAGE: Final[str] = "本轮已停止。可以直接再发一条。"
-
-# ``RunRecord.status`` is a closed enum (``done`` / ``refuse`` /
-# ``step_cap``); a stop is not a completed answer, so it lands on
-# ``refuse`` with ``status_reason="stopped"`` as the discriminator the
-# SPA reads. Adding a fourth status would ripple through the gate, the
-# ask payload, and the persisted enum for one presentation difference.
-STOPPED_STATUS_REASON: Final[str] = "stopped"
-
-
-def _stopped_terminal_frames(run_id: str, *, thinking_ms: int) -> Iterator[str]:
-    """Terminal ``status`` -> ``answer`` -> ``citations`` for a stop.
-
-    Same fixed order (and same terminal ``citations`` frame) as every
-    other run end, so the SPA's reader closes on a stop exactly as it
-    does on a refuse. The empty answer frame clears whatever partial
-    draft was on screen when the operator pressed Stop.
-    """
-    yield _format_sse(
-        "status",
-        {
-            "run_id": run_id,
-            "status": "refuse",
-            "reason": STOPPED_STATUS_REASON,
-            "assistant_message": STOPPED_ASSISTANT_MESSAGE,
-            "thinking_ms": thinking_ms,
-            "evidence_schema": CITATION_CHANNEL_SCHEMA,
-            EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
-        },
-    )
-    yield _format_sse("answer", {"text": "", "reset": True})
-    yield _format_sse("citations", [])
-
-
-def _persist_and_close_stopped_run(
-    graph: Any,
-    *,
-    store: ThreadStore,
-    thread_id: str,
-    run_id: str,
-    question: str,
-    thinking_ms: int,
-) -> Iterator[str]:
-    """Write the stopped turn row, clear the checkpoint, close the wire.
-
-    A stopped run is still a turn the operator can see: without the row
-    the SPA's ``openThread`` reconcile would replace its optimistic turn
-    with the server's list and the question would vanish (same
-    reasoning as the mid-flight refuse row).
-
-    ``finalize_abandoned_run`` mirrors the mid-flight refuse path: the
-    LangGraph checkpoint may still list pending nodes after the stream
-    was closed, and without this a Resume banner would appear above a
-    turn the operator deliberately ended.
-    """
-    try:
-        store.append_run(
-            RunRecord(
-                id=run_id,
-                thread_id=thread_id,
-                question=question,
-                status="refuse",
-                status_reason=STOPPED_STATUS_REASON,
-                answer="",
-                citations=[],
-                thinking_text="",
-                thinking_duration_ms=thinking_ms,
-                tool_summaries=[],
-                assistant_message=STOPPED_ASSISTANT_MESSAGE,
-            )
-        )
-    except ThreadNotFoundError:
-        # The thread was deleted while the run was being stopped; do
-        # not resurrect it. The frames below still close the wire so
-        # the SPA's reader does not hang.
-        logger.debug(
-            "run %s stop finalized after thread %s was deleted",
-            run_id,
-            thread_id,
-        )
-    if hasattr(graph, "finalize_abandoned_run"):
-        graph.finalize_abandoned_run(
-            thread_id,
-            status="refuse",
-            status_reason=STOPPED_STATUS_REASON,
-        )
-    yield from _stopped_terminal_frames(run_id, thinking_ms=thinking_ms)
 
 
 # T2 (ADR 0044 / plan session-compaction T2): operator receipt copy for
@@ -2756,6 +2991,7 @@ def _run_compact_command(
     graph: Any,
     store: ThreadStore,
     thread_id: str,
+    run_control: RunControl,
 ) -> Response:
     """Run the ``/compact`` command and stream its receipt (T2).
 
@@ -2803,9 +3039,26 @@ def _run_compact_command(
     ``ConcurrentRunError`` from ``compact_thread`` (a run in flight)
     propagates untouched — the plain 409 contract, identical to the
     ``is_locked`` probe on the ordinary send path.
+
+    Admission: the command claims the thread for exactly the compaction,
+    the one part that writes. ``compact_thread``'s own per-thread lock
+    only covers a run that has REACHED the graph, so without the claim a
+    compact could land in the window where a reply has been admitted and
+    decided but its stream has not started — writing the checkpoint out
+    from under an acceptance computed against the pre-compaction
+    envelope. The claim ends with the compaction, before the receipt
+    frames: those read only the receipt already in hand, so holding it
+    through the stream would buy nothing and would strand a client that
+    disconnected. A refusal keeps the operator's 409 either way — the
+    claim refuses as ``concurrent_run`` and the lock refuses as
+    ``concurrent_run``.
     """
     run_id = str(uuid.uuid4())
-    receipt = graph.compact_thread(thread_id)
+    claim = run_control.admit(thread_id)
+    try:
+        receipt = graph.compact_thread(thread_id)
+    finally:
+        claim.release()
 
     if receipt.get("outcome") == "compacted":
         copy = COMPACT_DONE_COPY
@@ -2821,6 +3074,11 @@ def _run_compact_command(
 
     def event_stream() -> Iterator[str]:
         try:
+            # WHY no receipt: a command is not an accepted answer turn. It
+            # accepts no input, answers no question, and runs no model on
+            # a turn identity, so there is no (thread_id, turn_id) turn to
+            # project — this row stands in ``fin_run`` alone, under its own
+            # minted run id, and the operator reads it as a command result.
             store.append_run(
                 RunRecord(
                     id=run_id,
@@ -2862,17 +3120,13 @@ def _run_compact_command(
 
 
 def _model_identity() -> str:
-    """The resolved ``FIN_MODEL`` slug, or the ADR 0022 default.
+    """The configured ``FIN_MODEL`` slug, or empty when unset.
 
-    Same resolution ``fin.host.compile._build_default_model``
-    performs, minus everything else it reads: the endpoint and the
-    auth token never reach this payload (ADR 0033).
+    The endpoint and auth token never reach this payload (ADR 0033).
     """
     import os
 
-    from fin.host.compile import DEFAULT_MODEL
-
-    return (os.environ.get("FIN_MODEL") or "").strip() or DEFAULT_MODEL
+    return (os.environ.get("FIN_MODEL") or "").strip()
 
 
 def _corpus_filing_count() -> int:
@@ -2953,6 +3207,12 @@ _INGEST_ERROR_TABLE: Final[
     (IngestUploadTooLargeError, 413, False),
     (IngestFormatUnspecifiedError, 422, False),
     (IngestDocumentIdMissingError, 422, False),
+    # The public upload identity refuses a caller-chosen id, and explicit
+    # upload metadata is validated (not edited) against the shared
+    # bounds. Both are caller-input refusals before any write, so both
+    # answer 422 with their named code.
+    (IngestDocumentIdNotAllowedError, 422, False),
+    (IngestInvalidUploadMetadataError, 422, False),
     (IngestInvalidDocTypeError, 422, False),
     # Accept-time conflict families: the upload is refused, nothing was
     # written, and the caller's next move differs (wait vs. give up).
@@ -3144,75 +3404,84 @@ _ingest_service_singleton: IngestEndpoint | None = None
 _ingest_service_lock = threading.Lock()
 
 
-# ----- ingest -> catalog registration (T2 x T3 wiring) -----
+# ----- ingest -> catalog registration (T6) -----
 #
-# Why a thread-local slot: the ``on_ingested`` hook runs INSIDE
-# ``service.ingest`` (after the push landed), so a hook failure cannot
-# become the route's error answer without denying an already-successful
-# push — and it must not vanish either (error-handling-enforcer: no
-# silent skip-as-success). The hook records the named failure on this
-# thread's slot; the ingest route resets the slot before the call,
-# reads it after, and surfaces it as the response's named
-# ``catalog_warning`` field. Thread-local because the service is a
-# process-wide singleton while sync routes run on a threadpool:
-# concurrent ingests must never read each other's warnings.
-_catalog_hook_slot = threading.local()
-
-# The named warning code the response carries when the catalog
-# registration failed after a successful push. The detail (str(exc))
-# follows the code and names the drifted field / broken table, so the
-# operator can act without reading server logs.
-CATALOG_RECORD_FAILED: Final[str] = "catalog_record_failed"
-
-# The failure families the hook converts into the named warning:
-# ``CatalogRowError`` / ``CatalogCorruptError`` are the catalog's own
-# contract failures (bad row / unreadable table); ``OSError`` covers
-# the filesystem outages ``record_filings`` cannot type (mkdir, lock,
-# fsync, replace). Anything else is a bug and keeps propagating typed
-# (T3 contract: the hook's own failures propagate).
-_CATALOG_FAILURES: Final[tuple[type[BaseException], ...]] = (
-    CatalogRowError,
-    CatalogCorruptError,
-    OSError,
-)
+# The catalog write is no longer a side effect the sync route observes
+# through a thread-local slot. It is a RECOVERABLE step of the durable
+# run: the endpoint persists ``catalog_publication_pending`` with the
+# complete row, performs the upsert through this hook, and records a
+# typed success or failure in the audit trail. Warning state is read
+# back from that trail on poll, so it survives a restart and no
+# thread-local transport is involved.
+#
+# The hook therefore PROPAGATES the catalog's own failures instead of
+# swallowing them: the endpoint is the layer that knows how to type a
+# ``CatalogRowError`` / ``CatalogCorruptError`` / ``OSError`` into a
+# ``catalog_publication_failed`` event and keep the job in
+# ``cataloging``. A hook that swallowed here would make every catalog
+# outage look like a success.
 
 
 def _record_ingested_filing(doc: IngestedDocument) -> None:
     """Product ``on_ingested`` hook: register the pushed filing.
 
-    Maps the :class:`IngestedDocument` onto the T2 row contract and
+    Maps the :class:`IngestedDocument` onto the T6 row contract and
     upserts it into the default catalog table (``record_filings``'
     own default — the ``data/corpus/catalog.json`` the ``GET
-    /api/corpus`` route reads). ``source_sha256`` is left out: the
-    ingest version IS the sha256 of the source bytes, so storing it
-    twice would duplicate one value under two keys.
+    /api/corpus`` route reads). ``title`` and ``doc_type`` are the
+    display fields the row contract now requires; ``source_sha256`` is
+    carried only when the run set it (public uploads), so one value is
+    never stored under two keys for the trusted replay leg.
 
-    A catalog-side failure never rolls the push back and never fails
-    the request: it is logged with traceback and recorded on the
-    thread slot so the ingest route answers 200 with the named
-    ``catalog_warning``.
+    A catalog-side failure propagates: the durable run converts it to
+    the typed ``catalog_publication_failed`` audit event, keeps the job
+    in ``cataloging``, and surfaces the warning through polling. The
+    push itself already landed and is never rolled back.
     """
-    try:
-        # One row: ``record_filings`` takes an iterable of rows.
-        record_filings(
-            [
-                {
-                    "document_id": doc.document_id,
-                    "company": doc.company,
-                    "period": doc.period,
-                    "version": doc.version,
-                    "page_count": doc.page_count,
-                }
-            ]
-        )
-    except _CATALOG_FAILURES as exc:
-        _catalog_hook_slot.warning = f"{CATALOG_RECORD_FAILED}: {exc}"
-        logger.warning(
-            "ingest: catalog registration failed for %s "
-            "(the push stands)",
-            doc.document_id,
-            exc_info=True,
-        )
+    row: dict[str, object] = {
+        "document_id": doc.document_id,
+        "version": doc.version,
+        "page_count": doc.page_count,
+        "title": doc.title,
+        "doc_type": doc.doc_type,
+    }
+    # Optional fields are OMITTED when absent, never written as ``None``:
+    # the row contract refuses a non-string and a missing company is not
+    # a company named "None".
+    if doc.company:
+        row["company"] = doc.company
+    if doc.period:
+        row["period"] = doc.period
+    if doc.source_sha256:
+        row["source_sha256"] = doc.source_sha256
+    # One row: ``record_filings`` takes an iterable of rows.
+    record_filings([row])
+
+
+def _catalog_warning_body(
+    warning: PublicationWarning | None,
+) -> dict[str, Any] | None:
+    """The pollable warning shape, or ``None`` when the publication settled.
+
+    Only typed, already-safe values cross this boundary: the code, the
+    typed failure classification and the 1-based attempt number — never
+    an exception message, a path or a DSN. A poller renders a fixed
+    安全 copy from ``code``; the detail it needs to route the operator is
+    ``failure_code`` / ``failure_stage``, which are closed vocabularies.
+    """
+    if warning is None:
+        return None
+    body: dict[str, Any] = {
+        "code": warning.code,
+        "attempts": warning.attempts,
+    }
+    if warning.failure_code is not None:
+        body["failure_code"] = warning.failure_code
+    if warning.failure_stage is not None:
+        body["failure_stage"] = warning.failure_stage
+    if warning.stage is not None:
+        body["stage"] = warning.stage
+    return body
 
 
 # The durable append-only journals the ingest service owns between
@@ -3240,13 +3509,21 @@ def _configured_journal_path(env_var: str, default: Path) -> Path:
 def _ingest_components(*, catalog_path: Path | None = None) -> dict[str, Path]:
     """Where the four durable ingest journals live.
 
-    The default sits beside the catalog (``DEFAULT_CATALOG_PATH``'s
-    parent) so one visible data dir holds all ingest state; an env var
-    overrides one journal without moving the others.
+    An explicit catalog keeps every journal beside that file. With no
+    catalog path, the two ledger files follow the fin home when that
+    home is active, and the push journal stays next to the repo catalog.
+    An env var overrides one journal without moving the others.
     """
-    from fin.corpus.catalog import DEFAULT_CATALOG_PATH
+    from fin.corpus.catalog import DEFAULT_CATALOG_PATH, default_corpus_ledger_path
 
-    data_dir = Path(catalog_path or DEFAULT_CATALOG_PATH).parent
+    if catalog_path is not None:
+        data_dir = Path(catalog_path).parent
+        pushed_default = data_dir / "pushed_records.jsonl"
+        index_default = data_dir / INDEX_JOBS_FILE
+    else:
+        data_dir = Path(DEFAULT_CATALOG_PATH).parent
+        pushed_default = default_corpus_ledger_path("pushed_records.jsonl")
+        index_default = default_corpus_ledger_path(INDEX_JOBS_FILE)
     return {
         "push_journal_path": _configured_journal_path(
             _PUSH_JOURNAL_PATH_ENV, data_dir / "push_journal.jsonl"
@@ -3255,10 +3532,10 @@ def _ingest_components(*, catalog_path: Path | None = None) -> dict[str, Path]:
             _INVALIDATION_LEDGER_PATH_ENV, data_dir / "invalidation_ledger.jsonl"
         ),
         "pushed_records_path": _configured_journal_path(
-            _PUSHED_RECORDS_PATH_ENV, data_dir / "pushed_records.jsonl"
+            _PUSHED_RECORDS_PATH_ENV, pushed_default
         ),
         "index_job_ledger_path": _configured_journal_path(
-            _INDEX_JOB_LEDGER_PATH_ENV, data_dir / INDEX_JOBS_FILE
+            _INDEX_JOB_LEDGER_PATH_ENV, index_default
         ),
     }
 
@@ -3356,7 +3633,10 @@ def _build_default_ingest_service() -> IngestEndpoint:
     chain: the HTTP accept door does not parse or push, so it never
     reaches the hook.
     """
-    from fin.host.operator_env import resolve_retrieve_adapter_kind
+    from fin.host.operator_env import (
+        resolve_corpus_scope_id,
+        resolve_retrieve_adapter_kind,
+    )
 
     components = _ingest_components()
     pushed_records_store = PushedRecordsStore(
@@ -3374,6 +3654,7 @@ def _build_default_ingest_service() -> IngestEndpoint:
         "pushed_records_store": pushed_records_store,
     }
     objects, pointers, states = _ingest_ports_from_env()
+    corpus_scope_id = resolve_corpus_scope_id()
     if resolve_retrieve_adapter_kind() == "fake":
         shared: FakePushPort = FakePushPort()
         return _JournaledIngestEndpoint(
@@ -3383,6 +3664,7 @@ def _build_default_ingest_service() -> IngestEndpoint:
             object_store=objects,
             metadata_store=pointers,
             state_store=states,
+            corpus_scope_id=corpus_scope_id,
             **journal_wiring,
         )
     from fin.retrieve.mcp_invalidation_port import MCPInvalidationPort
@@ -3395,6 +3677,7 @@ def _build_default_ingest_service() -> IngestEndpoint:
         object_store=objects,
         metadata_store=pointers,
         state_store=states,
+        corpus_scope_id=corpus_scope_id,
         **journal_wiring,
     )
 
@@ -3540,6 +3823,45 @@ def _drain_ingest_queue(
             return
 
 
+def _build_ingest_worker(
+    *,
+    endpoint: IngestEndpoint | None,
+    journal_dir: Path | None,
+    index_job_tracker: IndexJobTracker | None,
+    index_job_ledger: IndexJobLedger | None,
+) -> IngestWorker:
+    if index_job_tracker is None and index_job_ledger is None:
+        index_job_tracker, index_job_ledger = _get_index_job_components()
+    return IngestWorker(
+        endpoint if endpoint is not None else get_ingest_service(),
+        journal_dir=(
+            journal_dir if journal_dir is not None else _ingest_worker_journal_dir()
+        ),
+        index_job_tracker=index_job_tracker,
+        index_job_ledger=index_job_ledger,
+    )
+
+
+def _build_ingest_drain_thread(
+    worker: IngestWorker,
+    check_interval_seconds: float | None,
+) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_drain_ingest_queue,
+        args=(
+            worker,
+            stop_event,
+            check_interval_seconds
+            if check_interval_seconds is not None
+            else INGEST_WORKER_CHECK_INTERVAL_SECONDS,
+        ),
+        name=INGEST_WORKER_THREAD_NAME,
+        daemon=True,
+    )
+    return stop_event, thread
+
+
 def start_ingest_worker(
     *,
     endpoint: IngestEndpoint | None = None,
@@ -3582,33 +3904,14 @@ def start_ingest_worker(
                     "timed out); start again once its thread exits"
                 )
             return current
-        if index_job_tracker is None and index_job_ledger is None:
-            index_job_tracker, index_job_ledger = _get_index_job_components()
-        service = endpoint if endpoint is not None else get_ingest_service()
-        worker = IngestWorker(
-            service,
-            journal_dir=(
-                journal_dir
-                if journal_dir is not None
-                else _ingest_worker_journal_dir()
-            ),
+        worker = _build_ingest_worker(
+            endpoint=endpoint,
+            journal_dir=journal_dir,
             index_job_tracker=index_job_tracker,
             index_job_ledger=index_job_ledger,
         )
-        stop_event = threading.Event()
-        thread = threading.Thread(
-            target=_drain_ingest_queue,
-            args=(
-                worker,
-                stop_event,
-                (
-                    check_interval_seconds
-                    if check_interval_seconds is not None
-                    else INGEST_WORKER_CHECK_INTERVAL_SECONDS
-                ),
-            ),
-            name=INGEST_WORKER_THREAD_NAME,
-            daemon=True,
+        stop_event, thread = _build_ingest_drain_thread(
+            worker, check_interval_seconds
         )
         _ingest_worker_stop_event = stop_event
         _ingest_worker_thread = thread
@@ -3642,6 +3945,40 @@ def stop_ingest_worker(*, timeout: float = 60.0) -> None:
                 _ingest_worker_stop_event = None
 
 
+def start_application_ingest_worker(
+    *,
+    endpoint: IngestEndpoint | None = None,
+    journal_dir: Path | None = None,
+    check_interval_seconds: float | None = None,
+    index_job_tracker: IndexJobTracker | None = None,
+    index_job_ledger: IndexJobLedger | None = None,
+) -> Callable[[], None]:
+    """Start one application's ingest drain and return its exact stop.
+
+    The durable service and index-job projection remain process-wide, while
+    the loop and its stop event belong to this application. This lets two
+    mounted apps drain the shared durable queue without either app's shutdown
+    stopping the other's thread.
+    """
+    worker = _build_ingest_worker(
+        endpoint=endpoint,
+        journal_dir=journal_dir,
+        index_job_tracker=index_job_tracker,
+        index_job_ledger=index_job_ledger,
+    )
+    stop_event, thread = _build_ingest_drain_thread(
+        worker, check_interval_seconds
+    )
+    thread.start()
+
+    def _stop() -> None:
+        stop_event.set()
+        if thread is not threading.current_thread():
+            thread.join(timeout=60.0)
+
+    return _stop
+
+
 # One attachment service per process, over the env-selected thread store
 # and object store: attachment rows are durable product state, so they
 # follow the same singletons the thread sidebar and corpus ingest use.
@@ -3660,7 +3997,7 @@ class HeronPageLaneParser(PageRegionParser):
     """The deployed pages port: one pinned Heron pass per PDF document.
 
     The core binds its layout at construction and never hands a document
-    to it, while :class:`~fin.host.attachment_layout.HeronPageLayout` is
+    to it, while :class:`~fin.host.attachment.attachment_layout.HeronPageLayout` is
     built over one file on disk; uploads, though, are bytes the door has
     already stored. So this composition-root port owns the per-document
     meeting of the two shapes: a PDF extract stages the bytes as a
@@ -3857,7 +4194,7 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
     validated strictly at build time. A process that declares none has
     not opted in, and this root does not crash it: it builds T2d's
     shipped text-only door, where a page document answers the pinned
-    :class:`~fin.host.attachment_prepare.AttachmentPageLaneUnwiredError`
+    :class:`~fin.host.attachment.attachment_prepare.AttachmentPageLaneUnwiredError`
     and text keeps working. That is not an operator escape hatch —
     ``serve()`` reads the boot singleton before binding regardless, so a
     server without its bounds still fails at startup; only non-``serve``
@@ -3870,11 +4207,11 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
         object_store_from_env,
     )
     from fin.corpus.object_store_errors import ObjectStoreNotConfiguredError
-    from fin.host.attachment_job_store import (
+    from fin.host.attachment.attachment_job_store import (
         InMemoryThreadAttachmentJobStore,
         PostgresThreadAttachmentJobStore,
     )
-    from fin.host.attachment_store import (
+    from fin.host.attachment.attachment_store import (
         InMemoryAttachmentStore,
         PostgresAttachmentStore,
     )
@@ -3890,7 +4227,7 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
     # through. ``BOUND_ENV_KEYS`` is imported for the key NAMES only: the
     # module that owns the bounds owns how they are spelled, so the gate
     # here can never drift from what ``from_environ`` reads.
-    from fin.host.attachment_budgets import BOUND_ENV_KEYS
+    from fin.host.attachment.attachment_budgets import BOUND_ENV_KEYS
 
     lane_declared = any(key in os.environ for key, _ in BOUND_ENV_KEYS)
     budgets: AttachmentBudgets | None = None
@@ -3986,6 +4323,16 @@ _attachment_prep_worker: AttachmentPrepWorker | None = None
 _attachment_prep_worker_lock = threading.Lock()
 
 
+def _build_attachment_prep_worker(
+    service: AttachmentPreparationService | None,
+    interval_s: float,
+) -> AttachmentPrepWorker:
+    return AttachmentPrepWorker(
+        service if service is not None else default_attachment_service(),
+        interval_s=interval_s,
+    )
+
+
 def start_attachment_prep_worker(
     service: AttachmentPreparationService | None = None,
     *,
@@ -4007,9 +4354,8 @@ def start_attachment_prep_worker(
     global _attachment_prep_worker
     with _attachment_prep_worker_lock:
         if _attachment_prep_worker is None:
-            _attachment_prep_worker = AttachmentPrepWorker(
-                service if service is not None else default_attachment_service(),
-                interval_s=interval_s,
+            _attachment_prep_worker = _build_attachment_prep_worker(
+                service, interval_s
             )
         return _attachment_prep_worker.start()
 
@@ -4025,6 +4371,17 @@ def stop_attachment_prep_worker(*, timeout: float = 60.0) -> None:
         worker = _attachment_prep_worker
     if worker is not None:
         worker.stop(timeout=timeout)
+
+
+def start_application_attachment_prep_worker(
+    service: AttachmentPreparationService,
+    *,
+    interval_s: float = ATTACHMENT_PREP_WORKER_CHECK_INTERVAL_SECONDS,
+) -> Callable[[], None]:
+    """Start an app-owned prep drain and return its exact stop callback."""
+    worker = _build_attachment_prep_worker(service, interval_s)
+    worker.start()
+    return worker.stop
 
 
 # The resume sweep is a PeriodicDrainWorker over the shared guard; it is
@@ -4062,6 +4419,7 @@ def _resume_one_attachment_wait(
     thread_id: str,
     *,
     workspace_root: Path | None = None,
+    receipts: TurnReceiptProjector | None = None,
 ) -> bool:
     """Drive ONE thread's settled attachment pause to its turn row.
 
@@ -4138,6 +4496,8 @@ def _resume_one_attachment_wait(
         run_id=run_id,
         resume_input=Command(resume="attachment_preparation_settled"),
         resume_config=resume_config,
+        receipts=receipts,
+        attachments=service,
     ):
         pass
     return True
@@ -4150,6 +4510,7 @@ def _resume_attachment_waits_once(
     run_control: RunControl,
     *,
     workspace_root: Path | None = None,
+    receipts: TurnReceiptProjector | None = None,
 ) -> int:
     """One sweep over every thread; resume each settled attachment pause.
 
@@ -4167,6 +4528,7 @@ def _resume_attachment_waits_once(
                 run_control,
                 thread.id,
                 workspace_root=workspace_root,
+                receipts=receipts,
             ):
                 resumed += 1
         except Exception:
@@ -4188,11 +4550,12 @@ def _check_attachment_resume_waits(
     workspace_root: Path | None,
     stop_event: threading.Event,
     check_interval_seconds: float,
+    receipts: TurnReceiptProjector | None = None,
 ) -> None:
     """Startup sweep, then a bounded periodic re-check, until stopped.
 
     The loop body is kept separate from the thread plumbing (the shared
-    :func:`~fin.host.attachment_prep_worker.drain_periodically`, the
+    :func:`~fin.host.attachment.attachment_prep_worker.drain_periodically`, the
     same posture as the prep module's ``_drain_attachment_queue'') so a
     test can drive the exact loop without spawning anything.
 
@@ -4208,11 +4571,44 @@ def _check_attachment_resume_waits(
             service,
             run_control,
             workspace_root=workspace_root,
+            receipts=receipts,
         ),
         stop_event,
         DrainCadence(check_interval_seconds),
         worker_logger=logger,
         log_label="attachment resume worker",
+    )
+
+
+def _build_attachment_resume_worker(
+    *,
+    graph: Any,
+    store: ThreadStore,
+    service: AttachmentPreparationService,
+    workspace_root: Path | None,
+    run_control: RunControl | None,
+    check_interval_seconds: float | None,
+    receipts: TurnReceiptProjector | None,
+) -> PeriodicDrainWorker:
+    control = run_control if run_control is not None else RunControl()
+    return PeriodicDrainWorker(
+        lambda: _resume_attachment_waits_once(
+            graph,
+            store,
+            service,
+            control,
+            workspace_root=workspace_root,
+            receipts=receipts,
+        ),
+        DrainCadence(
+            check_interval_seconds
+            if check_interval_seconds is not None
+            else ATTACHMENT_RESUME_WORKER_CHECK_INTERVAL_SECONDS
+        ),
+        thread_name=ATTACHMENT_RESUME_WORKER_THREAD_NAME,
+        stopping_error=AttachmentResumeWorkerStoppingError,
+        log_label="attachment resume worker",
+        worker_logger=logger,
     )
 
 
@@ -4224,13 +4620,14 @@ def start_attachment_resume_worker(
     workspace_root: Path | None = None,
     run_control: RunControl | None = None,
     check_interval_seconds: float | None = None,
+    receipts: TurnReceiptProjector | None = None,
 ) -> threading.Thread:
     """Start the process's single attachment auto-resumer (idempotent).
 
     The boot half of the durable gate's resume clause: runs paused on
     the preparation interrupt are driven by this sweep, never by an
     operator resend. The singleton guard is the shared
-    :class:`~fin.host.attachment_prep_worker.PeriodicDrainWorker`, the
+    :class:`~fin.host.attachment.attachment_prep_worker.PeriodicDrainWorker`, the
     same posture as :func:`start_attachment_prep_worker` above: a live
     thread is returned as-is, a start over a timed-out stop's dying
     thread raises :class:`AttachmentResumeWorkerStoppingError`, and the
@@ -4252,24 +4649,14 @@ def start_attachment_resume_worker(
     with _attachment_resume_worker_lock:
         worker = _attachment_resume_worker
         if worker is None or not worker.is_live():
-            control = run_control if run_control is not None else RunControl()
-            worker = PeriodicDrainWorker(
-                lambda: _resume_attachment_waits_once(
-                    graph,
-                    store,
-                    service,
-                    control,
-                    workspace_root=workspace_root,
-                ),
-                DrainCadence(
-                    check_interval_seconds
-                    if check_interval_seconds is not None
-                    else ATTACHMENT_RESUME_WORKER_CHECK_INTERVAL_SECONDS
-                ),
-                thread_name=ATTACHMENT_RESUME_WORKER_THREAD_NAME,
-                stopping_error=AttachmentResumeWorkerStoppingError,
-                log_label="attachment resume worker",
-                worker_logger=logger,
+            worker = _build_attachment_resume_worker(
+                graph=graph,
+                store=store,
+                service=service,
+                workspace_root=workspace_root,
+                run_control=run_control,
+                check_interval_seconds=check_interval_seconds,
+                receipts=receipts,
             )
             _attachment_resume_worker = worker
         return worker.start()
@@ -4290,6 +4677,30 @@ def stop_attachment_resume_worker(*, timeout: float = 60.0) -> None:
         worker = _attachment_resume_worker
     if worker is not None:
         worker.stop(timeout=timeout)
+
+
+def start_application_attachment_resume_worker(
+    *,
+    graph: Any,
+    store: ThreadStore,
+    service: AttachmentPreparationService,
+    workspace_root: Path | None = None,
+    run_control: RunControl | None = None,
+    check_interval_seconds: float | None = None,
+    receipts: TurnReceiptProjector | None = None,
+) -> Callable[[], None]:
+    """Start an app-owned auto-resumer bound to this app's graph/control."""
+    worker = _build_attachment_resume_worker(
+        graph=graph,
+        store=store,
+        service=service,
+        workspace_root=workspace_root,
+        run_control=run_control,
+        check_interval_seconds=check_interval_seconds,
+        receipts=receipts,
+    )
+    worker.start()
+    return worker.stop
 
 
 # The invalidation drain's cadence: the spec's "drains at least once per
@@ -4351,7 +4762,7 @@ def start_invalidation_drain_worker(
     ``cadence`` carries the interval and the loop's clock together, so a test
     drives the whole cadence contract — the period, not just the sleep — on a
     fake clock instead of a real minute. It defaults to
-    :func:`~fin.host.structured_evidence_drain_worker.default_cadence`: the
+    :func:`~fin.host.evidence.structured_evidence_drain_worker.default_cadence`: the
     spec's minute on the real clock.
 
     Rebuilt — honoring freshly passed seams — only once the previous thread's
@@ -4397,6 +4808,28 @@ def stop_invalidation_drain_worker(*, timeout: float = 60.0) -> None:
         worker.stop(timeout=timeout)
 
 
+def start_application_invalidation_drain_worker(
+    *,
+    store: ThreadStore,
+    consumer_id: str = INVALIDATION_DRAIN_CONSUMER_ID,
+    transport: InvalidationDrainTransport | None = None,
+    cadence: DrainCadence | None = None,
+) -> Callable[[], None]:
+    """Start this application's invalidation drain when transport exists."""
+    pair = transport if transport is not None else default_invalidation_drain_transport()
+    if pair is None:
+        # No transport means the legacy boot starts no polling worker either.
+        return lambda: None
+    worker = StructuredInvalidationDrainWorker(
+        store,
+        pair,
+        consumer_id=consumer_id,
+        cadence=cadence,
+    )
+    worker.start()
+    return worker.stop
+
+
 def build_router(
     *,
     get_graph,
@@ -4409,6 +4842,7 @@ def build_router(
     get_feedback_store=None,
     get_observability_collector=None,
     get_workspace_root=None,
+    run_control: RunControl | None = None,
 ) -> APIRouter:
     """Build the workspace APIRouter.
 
@@ -4427,14 +4861,31 @@ def build_router(
     the ``$HOME``-resolved default 工作区 and is the seam that
     injects ``configurable.workspace_root`` on every send / resume.
 
-    The stop registry (:class:`RunControl`) is created HERE rather than
-    at module level: one registry per mounted router means two apps in
-    one test session cannot stop each other's runs. The send gate's
+    ``run_control`` is the stop registry this router answers Stop
+    against. It is created HERE when absent, so a caller that mounts
+    directly keeps its own isolation; an application that ALSO runs
+    background work passes the one instance it owns, so the Stop door
+    and attachment auto-resume signal the same runs. The send gate's
     in-flight counter (:class:`AttachmentUploadInFlight`) is created HERE
     for the same reason.
     """
     router = APIRouter(prefix="/api")
-    run_control = RunControl()
+    if run_control is None:
+        run_control = RunControl()
+
+    def get_turn_receipts(
+        store: ThreadStore = Depends(get_thread_store),
+    ) -> TurnReceiptProjector:
+        """The turn-receipt projection paired with this router's store.
+
+        Derived from the same dependency the routes write their turns to
+        rather than selected again: a receipt beside a different thread
+        store would split one turn across two histories, and the
+        background auto-resumer — which has no route to ask — would be
+        reporting turns it could not read back.
+        """
+        return default_receipts(store)
+
     upload_in_flight = AttachmentUploadInFlight()
     if get_attachment_service is None:
         get_attachment_service = default_attachment_service
@@ -4560,6 +5011,7 @@ def build_router(
             "pending_turn": pending_projection["pending_turn"],
             "occupancy": occupancy,
             "task_runtime": _task_runtime_wire_projection(graph, thread_id),
+            "source_scope": _source_scope_wire_projection(graph, thread_id),
             "turns": [
                 _serialize_run(
                     r,
@@ -4575,6 +5027,7 @@ def build_router(
         thread_id: str,
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
+        receipts: TurnReceiptProjector = Depends(get_turn_receipts),
         attachments: AttachmentPreparationService = Depends(
             get_attachment_service
         ),
@@ -4584,56 +5037,94 @@ def build_router(
             return cast(dict, JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
             ))
-        # The thread's attachments are voided first, and their bytes are
-        # removed only behind that tombstone. An attachment that outlived its
-        # thread would keep searchable text a deleted research thread owned,
-        # so a cleanup failure stops the delete here — named, logged, and
-        # retryable — instead of acknowledging a thread whose bytes remain.
+        # A run in flight owns this thread's checkpoints and receipts, and
+        # it will write to them after this request returns. Deleting under
+        # it would be the race this claim exists to prevent, so the delete
+        # is refused outright rather than admitted and raced — the same 409
+        # a second send gets. The claim is the door's own registry, never
+        # the graph's non-reentrant lock; the occupancy probe below is what
+        # sees a run the graph is executing for a caller holding no claim.
+        admission = run_control.admit(thread_id)
         try:
-            attachments.delete_thread(thread_id)
-        except AttachmentCleanupError:
-            logger.exception(
-                "delete_thread: attachment cleanup failed for thread_id=%s",
-                thread_id,
-            )
-            return cast(dict, JSONResponse(
-                status_code=500,
-                content={"error": "attachment_cleanup_failed"},
-            ))
+            ensure_thread_occupancy(graph, thread_id)
+            # The thread's attachments are voided first, and their bytes are
+            # removed only behind that tombstone. An attachment that outlived its
+            # thread would keep searchable text a deleted research thread owned,
+            # so a cleanup failure stops the delete here — named, logged, and
+            # retryable — instead of acknowledging a thread whose bytes remain.
+            try:
+                attachments.delete_thread(thread_id)
+            except AttachmentCleanupError:
+                logger.exception(
+                    "delete_thread: attachment cleanup failed for thread_id=%s",
+                    thread_id,
+                )
+                return cast(dict, JSONResponse(
+                    status_code=500,
+                    content={"error": "attachment_cleanup_failed"},
+                ))
 
-        # Metadata next, then checkpointer. If the checkpointer
-        # delete raises we keep the metadata gone - that's the
-        # user-visible intent, and the next ``GET`` will not
-        # resurrect the turn table.
-        store.delete_thread(thread_id)
+            # Metadata, history and receipts next, in the ONE transaction
+            # that records why they are going: the cause is written while
+            # the receipts still exist, and the thread's removal takes them
+            # with it.
+            try:
+                receipts.delete_thread(thread_id)
+            except ThreadNotFoundError:
+                logger.warning(
+                    "delete_thread: thread %s was already gone", thread_id
+                )
+                return cast(dict, JSONResponse(
+                    status_code=404, content={"error": "thread_not_found"}
+                ))
+            # The thread this registry was counting is gone, so its run —
+            # a paused one nobody will ever resume — leaves the counts with
+            # it instead of reading as work still in flight.
+            run_control.forget(thread_id)
 
-        # WHY the narrow excepts: the previous ``except Exception:
-        # pass`` swallowed EVERY failure mode — including a saver
-        # outage that leaves orphaned checkpoint tuples behind —
-        # with no log trail. Now:
-        #
-        # * ``AttributeError`` = the graph proxy has neither a
-        #   ``delete_thread`` seam nor a reachable checkpointer.
-        #   That is a wiring bug, not a runtime failure; warn and
-        #   still return 200 (metadata row is already gone, which
-        #   is what the user asked for).
-        # * any OTHER exception (saver outage, DB down) means the
-        #   checkpoint tuples may STILL EXIST while metadata is
-        #   gone — an inconsistent state the operator must see.
-        #   Log with traceback AND surface 500 so a silent orphan
-        #   cannot hide behind a green UI.
-        try:
-            graph.delete_thread(thread_id)
-        except AttributeError:
-            logger.warning(
-                "delete_thread: no checkpointer on graph for thread_id=%s",
-                thread_id,
-            )
-        except Exception:
-            logger.exception(
-                "delete_thread: saver failed for thread_id=%s", thread_id
-            )
-            raise HTTPException(status_code=500, detail="delete failed") from None
+            # WHY the narrow excepts: the previous ``except Exception:
+            # pass`` swallowed EVERY failure mode — including a saver
+            # outage that leaves orphaned checkpoint tuples behind —
+            # with no log trail. Now:
+            #
+            # * ``AttributeError`` = the graph proxy has neither a
+            #   ``delete_thread`` seam nor a reachable checkpointer.
+            #   That is a wiring bug, not a runtime failure; warn and
+            #   still return 200 (metadata row is already gone, which
+            #   is what the user asked for).
+            # * any OTHER exception (saver outage, DB down) means the
+            #   checkpoint tuples may STILL EXIST while metadata is
+            #   gone — an inconsistent state the operator must see.
+            #   Log with traceback AND surface 500 so a silent orphan
+            #   cannot hide behind a green UI.
+            try:
+                graph.delete_thread(thread_id)
+            except AttributeError:
+                logger.warning(
+                    "delete_thread: no checkpointer on graph for thread_id=%s",
+                    thread_id,
+                )
+            except ConcurrentRunError:
+                # A run the graph is executing for a caller holding no
+                # claim took the per-thread lock between the probe above
+                # and this call. The thread is already gone, so this is
+                # the inconsistent state below rather than a refusal: the
+                # caller would retry and be told 404 about a thread it had
+                # in fact just deleted.
+                logger.exception(
+                    "delete_thread: saver contended for thread_id=%s", thread_id
+                )
+                raise HTTPException(status_code=500, detail="delete failed") from None
+            except Exception:
+                logger.exception(
+                    "delete_thread: saver failed for thread_id=%s", thread_id
+                )
+                raise HTTPException(status_code=500, detail="delete failed") from None
+        finally:
+            # Released here and not by the graph: this claim guards the
+            # retirement itself, and a late release would let a second
+            # delete or a send walk past a thread that is still going.
+            admission.release()
         return {"ok": True}
 
     @router.post("/threads/{thread_id}/messages")
@@ -4651,10 +5142,12 @@ def build_router(
             get_observability_collector
         ),
         workspace_root: Path = Depends(get_workspace_root),
+        receipts: TurnReceiptProjector = Depends(get_turn_receipts),
     ) -> Response:
-        """Run one v1 host-graph run on the thread over SSE (T1 #33).
+        """Run one v1 host-graph run on the thread over SSE (T1).
 
-        Wire shape (``_stream_run_frames`` drives the run):
+        Wire shape (the run is driven by ``RunExecutor``; this route
+        only encodes what it emits):
 
         * ``thinking`` / ``answer`` delta frames flow DURING each
           model step (``messages`` mode), before that step's
@@ -4750,6 +5243,7 @@ def build_router(
                 graph=graph,
                 store=store,
                 thread_id=thread_id,
+                run_control=run_control,
             )
 
         # ADR 0083/0088 + T2f: referenced attachments are resolved from this
@@ -4835,378 +5329,333 @@ def build_router(
                         content={"error": "thread_not_found"},
                     )
 
-        # Mint the run_id up front so the SSE ``status`` event can
-        # carry it before any graph work happens. The same id is
-        # persisted on the RunRecord, so the optimistic turn the
-        # client renders matches the stored turn row exactly.
-        run_id = str(uuid.uuid4())
 
-        # 409-before-headers (spec line 26): probe the lock HERE,
-        # synchronously. The typed exception handler translates it
-        # to 409 ``application/json``; a probe inside the
-        # StreamingResponse generator would surface mid-body once
-        # event-stream headers were already flushed.
-        if hasattr(graph, "is_locked") and graph.is_locked(thread_id):
-            raise ConcurrentRunError(
-                f"another run is already in flight on thread_id={thread_id!r}"
-            )
+        # 409-before-headers: RunControl owns admission and this claim is
+        # acquired HERE, synchronously, because the typed exception handler
+        # translates the refusal to 409 ``application/json``; a check
+        # inside the StreamingResponse generator would surface mid-body
+        # once event-stream headers were already flushed.
+        executor = RunExecutor(
+            graph=graph,
+            store=store,
+            run_control=run_control,
+            collector=collector,
+            receipts=receipts,
+            publication_warnings=_publication_warnings(attachments),
 
-        # search-mode host T2: a PAUSED choice window releases the
-        # per-thread lock (the run's stream ended on the interrupt), so
-        # the same-thread send needs this second probe to keep the 409
-        # semantics: the run is still in flight on the checkpoint,
-        # waiting for the operator's pick. Same typed 409
-        # ``concurrent_run`` answer — placed BEFORE the attachment
-        # consumption below, so a rejected send keeps its attachments.
-        if (
-            hasattr(graph, "interrupt_pending")
-            and graph.interrupt_pending(thread_id) is not None
-        ):
-            raise ConcurrentRunError(
-                f"a choice window is pending on thread_id={thread_id!r}"
-            )
-
-        # T2: the input state ALWAYS resets the run-scoped fields
-        # (``reset_input_state`` clears ``evidence`` — impossible
-        # with ``operator.add + []`` — and zeroes ``step_count`` /
-        # ``repair_count``) so a follow-up post starts a fresh run,
-        # not a continuation. ``messages`` keeps accumulating via
-        # ``add_messages``; the helper clears the six run-scoped
-        # fields per ADR 0016 / spec line 34.
-        config: dict[str, Any] = {
-            "configurable": {
-                "thread_id": thread_id,
-                # LangGraph persists configurable.run_id in checkpoint
-                # metadata. Keeping the HTTP run id there makes a later
-                # crash resume address the same canonical run.
-                "run_id": run_id,
-                # Wave A (spec SC8 / ADR 0049): the seam injects the
-                # one default 工作区 on every send — the graph reads
-                # it PER CALL and raises WorkspaceRootMissingError if
-                # a seam forgets.
-                "workspace_root": str(workspace_root),
-            }
-        }
-        # The existing ``tiers`` selector is the documented pin field —
-        # naming EXACTLY ONE open 档 pins it for this run (the rules tier
-        # assigns without opening the window; the audit records the pin). An
-        # unopened 档 was already the named 400 above; a multi-select names
-        # nothing (the ordinary cascade decides, same as an empty selector
-        # today). The pin rides the run CONFIG, never the checkpointed
-        # state, so a follow-up send cannot inherit it. The value is copied
-        # straight: the door's enum is the SSOT closed set, so what arrives
-        # here is already the exact token the port validates and there is no
-        # legacy spelling left to resolve on the way.
-        if len(body.tiers) == 1:
-            config["configurable"]["pinned_search_mode"] = body.tiers[0]
-        thinking_type = "adaptive" if body.thinking else "disabled"
-        if not body.thinking:
-            # T3 (#34): the operator's thinking preference rides the
-            # run config — ``model_node`` swaps to the pre-built
-            # no-thinking binding (``extra_body`` thinking.type=
-            # disabled, OpenAI/方舟; no MiniMax reasoning_split). Only the OFF
-            # preference is stamped; the default (on) keeps the boot
-            # binding untouched.
-            config["configurable"]["thinking_type"] = thinking_type
-
-        # search-mode host T4: the propose seed is a run STATE field, not
-        # a configurable (unlike the T2 pin above) — ``reset_input_state``
-        # zeroes ``extract_method_proposal`` on every run, so the seed is
-        # stamped ON TOP of the fresh reset dict here: the overwrite
-        # channel takes the input value, the next send's reset clears it
-        # (no checkpoint leak). Without the field the key stays the
-        # reset's ``{}`` — ``proposal_is_pending`` never fires.
-        input_state = reset_input_state(
-            body.question,
-            attachments=resolved_attachments,
         )
-        # Question/task runtime T2: the send door is the only place an
-        # ordinary message is durably accepted, and acceptance happens
-        # BEFORE the graph runs, so the original payload and provenance
-        # are already recoverable when any dependant work starts.
+        # ONE serialized admission section per thread: read pending state,
+        # decide what this send is, accept its input, and run — with no
+        # other caller able to read that state in between. The previous
+        # occupancy probe could not promise that: it sampled the graph's
+        # lock, which is taken LAZILY inside ``graph.stream``, so two
+        # callers could both pass it and both compute an acceptance from
+        # the same snapshot before either lost the race. The loser then
+        # discovered it one frame into its own stream, having already
+        # advanced an ``input_version`` nothing ever committed.
         #
-        # The accepted record rides the run CONFIG and the committed
-        # envelope rides the input state, because the two have opposite
-        # lifetimes: the config is per-invocation (a resume carries none,
-        # so a resumed execution never manufactures another accepted
-        # input), while the envelope is thread-scoped and must survive
-        # the run-scoped reset above.
-        runtime_state = _accepted_task_runtime_state(graph, thread_id)
-        accepted_kind = _accepted_input_kind(body)
-        runtime_state, accepted_task_input = _accept_at_send_door(
-            runtime_state,
-            body,
-            kind=accepted_kind,
-            run_id=run_id,
-        )
-        config["configurable"]["accepted_task_input"] = (
-            accepted_task_input.to_state_dict()
-        )
-        if body.restore_archive_id:
-            # The graph node reads the archive from run config, so an
-            # explicit restore reaches the same reconciliation boundary
-            # an ordinary message does.
-            config["configurable"]["restore_archive_id"] = body.restore_archive_id
-        input_state["task_runtime"] = runtime_state.to_state_dict()
-        if body.propose_extract_method is not None:
-            seed: dict[str, Any] = {"proposed": body.propose_extract_method}
-            # The apply target rides the SAME run-scoped channel; a
-            # named half is carried verbatim so the audit can say WHY
-            # nothing applied (missing_version_context).
-            if body.propose_document_id is not None:
-                seed["document_id"] = body.propose_document_id
-            if body.propose_version is not None:
-                seed["version"] = body.propose_version
-            input_state["extract_method_proposal"] = seed
 
-        def event_stream() -> Iterator[str]:
-            """Yield the delta wire for this run, then persist + close.
+        # NOT the graph's lock: that lock is non-reentrant and is taken
+        # exactly once, inside the single ``graph.stream`` call below.
+        # This claim is the door's own; Stop records its reason here until
+        # the token exists, without waiting on either lock.
+        admission = run_control.admit(thread_id, stop_pending=True)
+        try:
+            # The graph's own lock is the FOREIGN run detector: the
+            # attachment auto-resumer and the compaction command drive
+            # that same per-thread lock from registries this door holds
+            # no claim on, so their runs are visible only here. It stays
+            # a fast path on top of the claim, never a substitute for it —
+            # a probe answers "is anyone in the graph", while the claim is
+            # what makes the read-decide-run section below indivisible.
+            executor.assert_thread_occupancy(thread_id)
+            # A clarification reply is classified against the COMMITTED
+            # envelope before anything is minted: an exact repeat
+            # delivery is a no-op, and a reply that answers a paused run
+            # continues THAT run rather than starting a second one under
+            # a fresh identity.
+            runtime_state = _accepted_task_runtime_state(graph, thread_id)
+            reply_plan = (
+                _plan_reply(
 
-            ``_stream_run_frames`` owns the frame mapping and
-            returns the final state via ``yield from``. RunRecord
-            persistence is best-effort — if the thread was deleted
-            mid-stream the persistence is skipped rather than
-            resurrected (a row for a deleted thread is never
-            wanted) and a single refuse-status frame explains it.
-            """
-            # T9: the turn's wall-clock latency starts when the wire
-            # starts carrying the run (same anchor as thinking_ms —
-            # the streaming window IS the turn the operator sees).
-            turn_started = time.perf_counter()
-
-            def record_terminal(status: str) -> None:
-                """Record one terminal turn on the observability collector.
-
-                Counters only — the status enum plus elapsed
-                milliseconds; no question / answer / URL text ever
-                reaches the collector. A recording failure is a
-                WARNING, never a broken wire or a lost turn row
-                (same tolerance as the feedback store on GET-thread).
-                """
-                elapsed_ms = (time.perf_counter() - turn_started) * 1000.0
-                try:
-                    collector.record(status, latency_ms=elapsed_ms)
-                except ObservabilityError:
-                    logger.warning(
-                        "send: failed to record terminal status %r on the "
-                        "observability collector",
-                        status,
-                        exc_info=True,
+                    graph,
+                    thread_id,
+                    runtime_state,
+                    body,
+                    workspace_root=workspace_root,
+                )
+                if body.question_id
+                else _ReplyPlan()
+            )
+            if reply_plan.retry is not None:
+                admission.release()
+                return StreamingResponse(
+                    _retry_frames(store, thread_id, reply_plan.retry),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"},
+                )
+            # A terminal clarification has no paused run: its reply is a
+            # NEW turn that consumes the pending question. Captured before
+            # acceptance because acceptance advances the envelope and the
+            # question is the context this turn must answer under.
+            pending_clarify = _pending_terminal_clarification(
+                runtime_state, body
+            )
+            continued = reply_plan.continued
+            if continued is not None:
+                # The reply is already accepted by Task Runtime; this is
+                # the receipt's projection of that one acceptance, on the
+                # SAME turn the paused run already owns.
+                if continued.accepted_by_this_door:
+                    receipts.accepted_reply(
+                        thread_id=thread_id,
+                        turn_id=continued.run_id,
+                        input_version=continued.accepted_input_version,
                     )
 
-            seen_message_ids: set[str] = set()
-            # Seed the dedup set with the pre-run checkpoint's
-            # message ids: a follow-up send's first ``values`` frame
-            # replays the whole accumulated list, and prior runs'
-            # tool frames must not re-emit onto this stream
-            # (spec line 34).
-            if hasattr(graph, "checkpoint_message_ids"):
-                seen_message_ids |= graph.checkpoint_message_ids(thread_id)
-            # T4 workflow (the tracked change): register the run as stoppable BEFORE
-            # the first frame so a Stop pressed during the very first
-            # model call still lands. ``finally`` deregisters so a
-            # later Stop on an idle thread answers 204.
-            stop_token = run_control.begin(thread_id, run_id)
-            try:
-                outcome = yield from _stream_run_frames(
-                    graph,
-                    run_id=run_id,
-                    input_value=input_state,
-                    config=config,
-                    seen_message_ids=seen_message_ids,
-                    thread_id=thread_id,
-                    stop_token=stop_token,
+                # Minted at the door for the same reason as the send
+                # below: a disconnect observed before the first frame must
+                # still reach the run it started.
+                continued_token = run_control.begin(
+                    thread_id, continued.run_id, admission=admission
                 )
-            finally:
-                run_control.end(stop_token)
 
-            if outcome.stopped:
-                # A stop is a terminal turn (persisted as ``refuse`` /
-                # stopped), so it counts on the observability wire too.
-                record_terminal("refuse")
-                yield from _persist_and_close_stopped_run(
-                    graph,
-                    store=store,
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    question=body.question,
-                    thinking_ms=outcome.thinking_ms,
-                )
-                return
+                def event_stream() -> Iterator[str]:
+                    """The answered run's remainder on the SAME wire.
 
-            if outcome.choice_window is not None:
-                # search-mode host T2: the run PAUSED on the choice
-                # window — the engine already emitted the frame. Persist
-                # NOTHING and emit no terminal frames: a paused run is
-                # not a finished turn (the resumed remainder's
-                # completion writes the row under the SAME checkpoint
-                # run_id). The stream close is the SPA's cue to paint
-                # the window.
-                return
 
-            if outcome.attachment_wait is not None:
-                # T2f: the run PAUSED on the attachment preparation gate
-                # — the engine already emitted the ``attachment_wait``
-                # frame with the run id. Same pause posture as the
-                # choice window: persist NOTHING and close; the
-                # auto-resumer drives the SAME checkpoint run_id to
-                # completion once the durable job settles, and that
-                # resumed remainder writes the one turn row.
-                return
+                    A continuation keeps the resume column's history
+                    rules verbatim: a stop or a mid-flight failure
+                    writes no turn row, and a completed remainder writes
+                    exactly one — under the ORIGINAL run id.
+                    """
+                    yield from _sse_frames(
+                        executor.resume(
+                            ResumeRunRequest(
+                                thread_id=thread_id,
+                                run_id=continued.run_id,
+                                resume_input=continued.resume_input,
+                                resume_config=continued.resume_config,
+                                admission=admission,
+                                stop_token=continued_token,
+                            )
 
-            if outcome.final_state is None:
-                if outcome.refuse_reason is None:
-                    # Exit condition: empty stream WITHOUT an
-                    # exception — the engine emitted no values frame
-                    # and no terminal frames; there is no failure to
-                    # persist, so exit without touching the store.
-                    return
-                # Mid-flight raise: the engine already emitted the
-                # terminal refuse frames itself. Persist the refusal
-                # so the turn table keeps the user's question and the
-                # ordinary-person copy (spec line 67: GET history
-                # shows empty sources plus non-empty assistant copy)
-                # — without the row, the SPA's openThread reconcile
-                # replaces its optimistic turn with the server's
-                # empty list and the failed exchange vanishes.
-                record_terminal("refuse")
-                try:
-                    store.append_run(
-                        RunRecord(
-                            id=run_id,
-                            thread_id=thread_id,
-                            question=body.question,
-                            status="refuse",
-                            status_reason=outcome.refuse_reason,
-                            answer="",
-                            citations=[],
-                            thinking_text="",
-                            thinking_duration_ms=outcome.thinking_ms,
-                            tool_summaries=[],
-                            assistant_message=outcome.refuse_copy or "",
-                            # Stream error taxonomy (auth / network /
-                            # ...). ``None`` when the run did not end
-                            # on the refuse branch; the field default
-                            # (``""``) carries the same meaning so the
-                            # SPA never sees an unexpected ``None``.
-                            status_classified=outcome.refuse_kind or "",
                         )
                     )
-                except ThreadNotFoundError:
-                    # No extra frame here — the engine's terminal
-                    # frames already closed the wire (the normal
-                    # branch below can still add one because its
-                    # frames have not been emitted yet).
-                    return
-                # Mid-flight refuse persisted a terminal row but the
-                # LangGraph checkpoint may still list pending next
-                # nodes. Finalize via the graph seam so GET does not
-                # report ``pending_checkpoint: true`` above a terminal
-                # turn (the tracked change). Defensive ``hasattr`` mirrors
-                # ``delete_thread`` / ``pending_nodes`` wiring tolerance.
-                if hasattr(graph, "finalize_abandoned_run"):
-                    graph.finalize_abandoned_run(
-                        thread_id,
-                        status="refuse",
-                        status_reason=outcome.refuse_reason,
-                    )
-                return
-            payload = _run_to_response_payload(outcome.final_state)
-            # ADR 0089: the visual-claim channel is read straight off the
-            # final state (it is NOT part of the citation payload),
-            # normalised ONCE here so the persisted row and the live frame
-            # carry the identical rows. Run-scoped, copied before the next
-            # send resets the state channel (ADR 0016). Malformed live
-            # rows are NAMED on the evidence_refusals frame, never
-            # dropped (spec §8-R4).
-            visual_claims, visual_refusals = _visual_claims_wire_payload(
-                outcome.final_state.get("visual_claims")
-            )
-            # T9: the turn's terminal status (done / refuse / step_cap)
-            # and wall-clock latency land on the observability collector
-            # exactly where the turn row is built.
-            record_terminal(payload["status"])
-            # Persist the run record so the GET turn table surfaces
-            # it without re-invoking the graph. T4 (#37): the
-            # thinking duration rides the row so a reload restores
-            # the collapsed one-line duration label.
-            try:
-                store.append_run(
-                    RunRecord(
-                        id=run_id,
-                        thread_id=thread_id,
-                        question=body.question,
-                        status=payload["status"],
-                        status_reason=payload["reason"],
-                        answer=payload["answer"],
-                        citations=payload["citations"],
-                        thinking_text=payload["thinking_text"],
-                        thinking_duration_ms=outcome.thinking_ms,
-                        tool_summaries=payload["tool_summaries"],
-                        assistant_message=payload["assistant_message"],
-                        track_decision=dict(payload.get("track_decision") or {}),
-                        # T3: the structured table the turn renders.
-                        # Persisted on refuse rows too — see TurnRow.
-                        comparisons=list(payload.get("comparisons") or []),
-                        analysis_results=list(
-                            payload.get("analysis_results") or []
-                        ),
-                        # SC8: this run's retrieved / read locators,
-                        # taken from the final state BEFORE the next
-                        # send resets the evidence channel.
-                        evidence_locators=list(payload["evidence_locators"]),
-                        # ADR 0089: this run's visual claims, their own
-                        # channel (never merged into ``citations``).
-                        visual_claims=visual_claims,
-                        # EP6: this turn's admitted structured snapshots,
-                        # read from the final state BEFORE the next send
-                        # resets the additive channel (T29).
-                        structured_evidence=list(
-                            outcome.final_state.get("structured_evidence") or []
-                        ),
-                    )
-                )
-            except ThreadNotFoundError:
-                # The thread was deleted mid-stream; do NOT
-                # resurrect metadata. Yield a single error frame
-                # so the SPA surfaces the state, then stop. The
-                # turn still ended on a terminal refuse.
-                record_terminal("refuse")
-                yield _format_sse(
-                    "status",
-                    {
-                        "run_id": run_id,
-                        "status": "refuse",
-                        "reason": "thread_not_found",
-                        "assistant_message": "Thread was deleted while the run was in flight.",
-                        "evidence_schema": CITATION_CHANNEL_SCHEMA,
-                        EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
-                    },
-                )
-                return
-            # Terminal frames per spec line 30: status -> answer ->
-            # citations. Shared with the T4 resume route so the two
-            # emitters cannot drift. T4 (#37): the status frame
-            # carries the thinking duration for the live collapse
-            # label.
-            yield from _terminal_sse_frames(
-                run_id=run_id,
-                payload=payload,
-                thinking_type=thinking_type,
-                thinking_ms=outcome.thinking_ms,
-                answer_reset=outcome.answer_reset,
-                visual_claims=visual_claims,
-                visual_refusals=visual_refusals,
-            )
 
-        # Dream runs AFTER the stream is exhausted, never inside a graph
-        # node (CONTEXT.md:46); see ``_register_dream_background``.
-        _register_dream_background(background, memory_port, thread_id)
-        return StreamingResponse(
-            event_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache"},
-        )
+                _register_dream_background(background, memory_port, thread_id)
+                return _ClaimedStreamingResponse(
+                    event_stream(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"},
+                    admission=admission,
+                    on_disconnect=_disconnect_stop(continued_token),
+                    abandonment=_abandoned_stream(
+                        receipts, thread_id=thread_id, turn_id=continued.run_id
+                    ),
+                )
+
+            # Mint the run_id up front so the SSE ``status`` event can
+            # carry it before any graph work happens. The same id is
+            # persisted on the RunRecord, so the optimistic turn the
+            # client renders matches the stored turn row exactly.
+            run_id = str(uuid.uuid4())
+
+            # A PAUSED choice window releases the per-thread lock (the run's
+            # stream ended on the interrupt), so the same-thread send needs this
+            # second probe to keep the 409 semantics: the run is still in flight
+            # on the checkpoint, waiting for the operator's pick. Same typed 409
+            # ``concurrent_run`` answer — placed BEFORE the attachment
+            # consumption below, so a rejected send keeps its attachments.
+            executor.assert_no_pending_choice(thread_id)
+
+            # T2: the input state ALWAYS resets the run-scoped fields
+            # (``reset_input_state`` clears ``evidence`` — impossible
+            # with ``operator.add + []`` — and zeroes ``step_count`` /
+            # ``repair_count``) so a follow-up post starts a fresh run,
+            # not a continuation. ``messages`` keeps accumulating via
+            # ``add_messages``; the helper clears the six run-scoped
+            # fields per ADR 0016 / spec line 34.
+            config: dict[str, Any] = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    # LangGraph persists configurable.run_id in checkpoint
+                    # metadata. Keeping the HTTP run id there makes a later
+                    # crash resume address the same canonical run.
+                    "run_id": run_id,
+                    # Wave A (spec SC8 / ADR 0049): the seam injects the
+                    # one default 工作区 on every send — the graph reads
+                    # it PER CALL and raises WorkspaceRootMissingError if
+                    # a seam forgets.
+                    "workspace_root": str(workspace_root),
+                }
+            }
+            # The existing ``tiers`` selector is the documented pin field —
+            # naming EXACTLY ONE open 档 pins it for this run (the rules tier
+            # assigns without opening the window; the audit records the pin). An
+            # unopened 档 was already the named 400 above; a multi-select names
+            # nothing (the ordinary cascade decides, same as an empty selector
+            # today). The pin rides the run CONFIG, never the checkpointed
+            # state, so a follow-up send cannot inherit it. The value is copied
+            # straight: the door's enum is the SSOT closed set, so what arrives
+            # here is already the exact token the port validates and there is no
+            # legacy spelling left to resolve on the way.
+            if len(body.tiers) == 1:
+                config["configurable"]["pinned_search_mode"] = body.tiers[0]
+            thinking_type = "adaptive" if body.thinking else "disabled"
+            if not body.thinking:
+                # T3: the operator's thinking preference rides the
+                # run config — ``model_node`` swaps to the pre-built
+                # no-thinking binding (``extra_body`` thinking.type=
+                # disabled, OpenAI/方舟; no MiniMax reasoning_split). Only the OFF
+                # preference is stamped; the default (on) keeps the boot
+                # binding untouched.
+                config["configurable"]["thinking_type"] = thinking_type
+
+            # search-mode host T4: the propose seed is a run STATE field, not
+            # a configurable (unlike the T2 pin above) — ``reset_input_state``
+            # zeroes ``extract_method_proposal`` on every run, so the seed is
+            # stamped ON TOP of the fresh reset dict here: the overwrite
+            # channel takes the input value, the next send's reset clears it
+            # (no checkpoint leak). Without the field the key stays the
+            # reset's ``{}`` — ``proposal_is_pending`` never fires.
+            # Question/task runtime T2: the send door is the only place an
+            # ordinary message is durably accepted, and acceptance happens
+            # BEFORE the graph runs, so the original payload and provenance
+            # are already recoverable when any dependant work starts.
+            #
+            # The accepted record rides the run CONFIG and the committed
+            # envelope rides the input state, because the two have opposite
+            # lifetimes: the config is per-invocation (a resume carries none,
+            # so a resumed execution never manufactures another accepted
+            # input), while the envelope is thread-scoped and must survive
+            # the run-scoped reset below.
+            stale_hint = _question_hint_is_ordinary(runtime_state, body)
+            accepted_kind = (
+                INPUT_MESSAGE
+                if stale_hint
+                else _accepted_input_kind(body)
+            )
+            runtime_state, accepted_task_input = _accept_at_send_door(
+                runtime_state,
+                body,
+                kind=accepted_kind,
+                run_id=run_id,
+                graph=graph,
+                thread_id=thread_id,
+            )
+            committed_runtime = runtime_state
+            # A stale hint never contributes prose: the message is the
+            # operator's own text, which for a free-text-only send can
+            # live in ``free_text`` rather than ``question``.
+            turn_question = (
+                (body.question or body.free_text or "")
+                if stale_hint
+                else body.question
+            )
+            if (
+                pending_clarify is not None
+                and accepted_task_input.kind == INPUT_REPLY
+            ):
+                # Consume the question on THIS checkpoint write and carry
+                # the original task question into the new turn's message.
+                # Decided BEFORE the receipt exists, so a refused reply
+                # leaves no begun turn behind.
+                committed_runtime = _decide_continued_reply(
+                    runtime_state, accepted_task_input
+                )
+                turn_question = _clarify_reply_turn_question(
+                    pending_clarify, accepted_task_input, committed_runtime
+                )
+            receipts.begin(
+                thread_id=thread_id,
+                turn_id=run_id,
+                # Task Runtime's own version, not a count this door keeps:
+                # the receipt projects it and Task Runtime stays the one
+                # authority for which input was accepted.
+                accepted_input_version=accepted_task_input.input_version,
+            )
+            config["configurable"]["accepted_task_input"] = (
+                accepted_task_input.to_state_dict()
+            )
+            if body.restore_archive_id:
+                # The graph node reads the archive from run config, so an
+                # explicit restore reaches the same reconciliation boundary
+                # an ordinary message does.
+                config["configurable"]["restore_archive_id"] = body.restore_archive_id
+            input_state = reset_input_state(
+                turn_question,
+                attachments=resolved_attachments,
+            )
+            input_state["task_runtime"] = committed_runtime.to_state_dict()
+            if body.propose_extract_method is not None:
+                seed: dict[str, Any] = {"proposed": body.propose_extract_method}
+                # The apply target rides the SAME run-scoped channel; a
+                # named half is carried verbatim so the audit can say WHY
+                # nothing applied (missing_version_context).
+                if body.propose_document_id is not None:
+                    seed["document_id"] = body.propose_document_id
+                if body.propose_version is not None:
+                    seed["version"] = body.propose_version
+                input_state["extract_method_proposal"] = seed
+
+            def event_stream() -> Iterator[str]:
+                """Encode this run's events as the SSE wire.
+
+                The run itself — the graph consumption, the stop token, the
+                iterator release and the one turn row — belongs to the
+                executor, so a RunRecord is best-effort by construction: if the
+                thread was deleted mid-stream the row is skipped rather than
+                resurrected (a row for a deleted thread is never wanted) and a
+                single refuse status says why.
+                """
+                yield from _sse_frames(
+                    executor.send(
+                        RunRequest(
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            # The turn's ONE question, exactly what the
+                            # checkpoint input state carries: a reply turn
+                            # persists the composed original+answer text,
+                            # never the raw answer (or "" for a click).
+                            question=turn_question,
+                            input_value=input_state,
+                            config=config,
+                            thinking_type=thinking_type,
+                            admission=admission,
+                            stop_token=stop_token,
+                        )
+                    )
+                )
+
+            # The stop token is minted AT THE DOOR, before the first byte,
+            # and handed to the request. Minted here it exists before the
+            # stream starts, so a client that disconnects between the
+            # headers and the first frame still has something to stop;
+            # minted inside the executor it would not. The executor
+            # reuses this exact token rather than beginning a second one.
+            stop_token: StopToken = run_control.begin(
+                thread_id, run_id, admission=admission
+            )
+            # Dream runs AFTER the stream is exhausted, never inside a graph
+            # node (CONTEXT.md:46); see ``_register_dream_background``.
+            _register_dream_background(background, memory_port, thread_id)
+            return _ClaimedStreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+                admission=admission,
+                on_disconnect=_disconnect_stop(stop_token),
+                abandonment=_abandoned_stream(
+                    receipts, thread_id=thread_id, turn_id=run_id
+                ),
+            )
+        except BaseException:
+            # Every refusal between here and the stream is a claim nobody
+            # will ever release: no run started, so no ``finally`` frees it,
+            # and the thread would refuse every later send forever.
+            admission.release()
+            raise
 
     @router.post("/threads/{thread_id}/attachments")
     async def attach_to_thread(
@@ -5249,7 +5698,7 @@ def build_router(
           next send could reference, and never ingest vocabulary here)
 
         The byte cap is the deployed
-        :attr:`~fin.host.attachment_budgets.AttachmentBudgets.max_upload_bytes`,
+        :attr:`~fin.host.attachment.attachment_budgets.AttachmentBudgets.max_upload_bytes`,
         read through the ``get_attachment_budgets`` dependency — not a
         constant this module carries, so the door cannot drift from the
         bound the operator configured. The 413 is decided at the ROUTE
@@ -5507,6 +5956,10 @@ def build_router(
         store: ThreadStore = Depends(get_thread_store),
         memory_port: Any = Depends(get_memory_port),
         workspace_root: Path = Depends(get_workspace_root),
+        receipts: TurnReceiptProjector = Depends(get_turn_receipts),
+        attachments: AttachmentPreparationService = Depends(
+            get_attachment_service
+        ),
     ) -> Response:
         """T4 crash resume (spec line 39 / ADR 0026 / ADR 0018) +
         search-mode host T2 choice-window pick.
@@ -5553,17 +6006,64 @@ def build_router(
 
         # Concurrent-run guard BEFORE StreamingResponse headers, same
         # shape as send_message's T3 fix: raising here lets the typed
-        # exception handler emit 409 with application/json.
-        if hasattr(graph, "is_locked") and graph.is_locked(thread_id):
-            raise ConcurrentRunError(
-                f"another run is already in flight on thread_id={thread_id!r}"
+        # exception handler emit 409 with application/json. The same
+        # serialized claim the send door takes, so a resume cannot be
+        # admitted where a send would be refused.
+        executor = RunExecutor(
+            graph=graph,
+            store=store,
+            run_control=run_control,
+            receipts=receipts,
+            publication_warnings=_publication_warnings(attachments),
+        )
+        admission = run_control.admit(thread_id, stop_pending=True)
+        try:
+            # As on the send door: the graph lock still reports runs this
+            # registry did not admit (the auto-resumer, compaction), and
+            # the claim is what makes the decision below indivisible.
+            executor.assert_thread_occupancy(thread_id)
+            return _resume_route(
+                thread_id=thread_id,
+                background=background,
+                graph=graph,
+                store=store,
+                memory_port=memory_port,
+                workspace_root=workspace_root,
+                body=body,
+                executor=executor,
+                admission=admission,
+                receipts=receipts,
             )
+        except BaseException:
+            admission.release()
+            raise
+
+    def _resume_route(
+        *,
+        thread_id: str,
+        background: BackgroundTasks,
+        graph: Any,
+        store: ThreadStore,
+        memory_port: Any,
+        workspace_root: Path,
+        body: ResumeRequest | None,
+        executor: RunExecutor,
+        admission: RunAdmission,
+        receipts: TurnReceiptProjector,
+    ) -> Response:
+        """The resumed run itself, under the claim the route already took."""
+
+        def refuse(response: Response) -> Response:
+            """Answer without a run — so nothing else will release the claim."""
+            admission.release()
+            return response
 
         # search-mode host T2: a pick answers a PENDING window — with
         # none open it is a typed 400 (never a hijacked crash resume,
         # never a silently dropped field). A body-less resume is the
         # pre-T2 crash path unchanged.
         pick = body.pick if body is not None else None
+        document_choice_pending = False
         if pick is not None:
             pending_choice = (
                 graph.interrupt_pending(thread_id)
@@ -5571,9 +6071,15 @@ def build_router(
                 else None
             )
             if pending_choice is None:
-                return JSONResponse(
-                    status_code=400, content={"error": "choice_not_pending"}
+                return refuse(
+                    JSONResponse(
+                        status_code=400, content={"error": "choice_not_pending"}
+                    )
                 )
+            document_choice_pending = (
+                isinstance(pending_choice, Mapping)
+                and pending_choice.get("kind") == DOCUMENT_CHOICE_INTERRUPT_KIND
+            )
 
         # Nothing to resume -> 204 No Content. A terminal checkpoint
         # (``pending_nodes() == ()``) means the prior run finished;
@@ -5581,7 +6087,7 @@ def build_router(
         # forbids that path. Also covers a never-sent thread (no
         # checkpoint at all).
         if not hasattr(graph, "pending_nodes") or not graph.pending_nodes(thread_id):
-            return Response(status_code=204)
+            return refuse(Response(status_code=204))
 
         # Reuse the id attached to the recoverable checkpoint. A resume
         # continues the in-flight run; minting here would split the SSE
@@ -5592,9 +6098,11 @@ def build_router(
             else None
         )
         if not run_id:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "resume_run_id_unavailable"},
+            return refuse(
+                JSONResponse(
+                    status_code=500,
+                    content={"error": "resume_run_id_unavailable"},
+                )
             )
         resume_config: dict[str, Any] = {
             "configurable": {
@@ -5611,30 +6119,61 @@ def build_router(
         # LangGraph's ``Command(resume=pick)``; without one it stays the
         # crash-resume ``None`` (or, against a pending window, redraws
         # the window frame).
-        resume_input: Any = Command(resume=pick) if pick is not None else None
+        #
+        # QA-chain T9: on the DOCUMENT CHOICE interrupt the resume value
+        # carries the pick AND the operator's ``other`` free text (contract
+        # line 90) — the paused node accepts the reply from the resume
+        # value alone, so this route would otherwise discard the rephrase
+        # exactly as the send door did. A 检索档 pick has no question and
+        # no free text, so it keeps the plain string it always sent.
+        resume_input: Any = (
+            Command(
+                resume=document_choice_resume_value(
+                    pick, body.free_text if body is not None else None
+                )
+            )
+            if document_choice_pending and pick is not None
+            else (Command(resume=pick) if pick is not None else None)
+        )
+
+        resume_token = run_control.begin(
+            thread_id, run_id, admission=admission
+        )
 
         def event_stream() -> Iterator[str]:
             """Yield the resumed remainder on the SAME delta wire.
 
-            Delegates to :func:`_resume_run_stream` — the one resume
-            path shared with the T2f auto-resumer, so the two surfaces
-            cannot drift on persistence or terminal frames.
+            Drives :meth:`RunExecutor.resume` — the one resume path the
+            attachment auto-resumer also uses — so the two surfaces
+            cannot drift on persistence or terminal frames. This route
+            builds its own executor rather than calling
+            :func:`_resume_run_stream`, because it already holds the
+            admission claim and the claim has to reach the executor that
+            releases it.
             """
-            yield from _resume_run_stream(
-                graph,
-                store,
-                run_control=run_control,
-                thread_id=thread_id,
-                run_id=run_id,
-                resume_input=resume_input,
-                resume_config=resume_config,
+            yield from _sse_frames(
+                executor.resume(
+                    ResumeRunRequest(
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        resume_input=resume_input,
+                        resume_config=resume_config,
+                        admission=admission,
+                        stop_token=resume_token,
+                    )
+                )
             )
 
         _register_dream_background(background, memory_port, thread_id)
-        return StreamingResponse(
+        return _ClaimedStreamingResponse(
             event_stream(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
+            admission=admission,
+            on_disconnect=_disconnect_stop(resume_token),
+            abandonment=_abandoned_stream(
+                receipts, thread_id=thread_id, turn_id=run_id
+            ),
         )
 
     @router.post("/threads/{thread_id}/stop")
@@ -5642,30 +6181,45 @@ def build_router(
         thread_id: str,
         store: ThreadStore = Depends(get_thread_store),
     ) -> Response:
-        """Stop the in-flight run on this thread (T4 workflow, the tracked change).
+        """Stop the in-flight run on this thread (T4 workflow).
 
         Rejection order mirrors send / resume:
 
         * 404 — unknown thread metadata row;
-        * 204 — nothing in flight (a Stop the operator pressed just
-          after the run ended is a no-op, not a failure);
-        * 200 ``{"stopped": true, "run_id": ...}`` — the flag is set.
+        * 204 — no run or send/resume admission is in flight;
+        * 202 ``{"stopped": true, "pending": true, "run_id": null}``
+          — an admitted send/resume has not created its token yet;
+        * 200 ``{"stopped": true, "run_id": ...}`` — a live token is set.
 
         This route deliberately does NOT touch the graph: the run owns
         the per-thread lock, so acquiring it here would deadlock the
-        one moment a stop matters. It flips the token and returns; the
-        SSE generator does the ending.
+        one moment a stop matters. It stops the current token or latches
+        onto its admission and returns; the SSE generator does the ending.
+
+        Target selection and stop are one registry operation, so a run
+        cannot end between observation and cancellation and leave a stale
+        snapshot to target its successor. ``user_stop`` is stated rather
+        than defaulted so the receipt preserves the operator's cause.
         """
         if store.get_thread(thread_id) is None:
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
             )
-        stopped_run_id = run_control.request_stop(thread_id)
-        if stopped_run_id is None:
+        stop = run_control.stop_current(thread_id, reason="user_stop")
+        if stop is None:
             return Response(status_code=204)
+        if stop.pending:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "stopped": True,
+                    "pending": True,
+                    "run_id": stop.run_id,
+                },
+            )
         return JSONResponse(
             status_code=200,
-            content={"stopped": True, "run_id": stopped_run_id},
+            content={"stopped": True, "run_id": stop.run_id},
         )
 
     @router.get("/threads/{thread_id}/export")
@@ -5887,6 +6441,36 @@ def build_router(
         """
         return list_filings()
 
+    @router.get("/corpus/overview")
+    def corpus_overview() -> dict:
+        """The GENERIC catalog surface: documents plus their presentation grouping.
+
+        ``GET /api/corpus`` is deliberately NOT reused: that route is the
+        FINANCIAL compatibility projection with a fixed six-key shape, and
+        an ordinary document has no ``company`` / ``period`` / ``form`` at
+        all (T6). This mouth carries the generic read model — one entry per
+        physical row with its title, type and any PRESENT company / period
+        — plus the grouping the operator actually reads: only dimensions
+        with at least two distinct non-empty values, missing values under
+        未分类, and a flat title list when no dimension qualifies.
+
+        Both projections read the same table, so a corrupt table is the
+        same typed ``CatalogCorruptError`` (→ 503 ``ingest_missing``) and a
+        missing one is the same empty success. The grouping lives in
+        :func:`fin.corpus.catalog.catalog_grouping` so this route stays a
+        projection and the rule stays unit-tested beside the row contract.
+        """
+        entries = list_catalog_entries()
+        grouping = catalog_grouping(entries)
+        return {
+            # The read model already omits absent company / period, so the
+            # documents list is that projection verbatim: "claims no
+            # company" and "company is blank" stay different facts.
+            "documents": entries,
+            "dimensions": grouping["dimensions"],
+            "flat_titles": grouping["flat_titles"],
+        }
+
     @router.get("/status", response_model=WorkspaceStatusResponse)
     def workspace_status() -> dict:
         """The left corner's boot-scoped surface (ADR 0033, amended).
@@ -5899,10 +6483,19 @@ def build_router(
         ``fin-serve`` boot.
 
         Every state is a 200 with all five fields populated. A process
-        that never probed (plain ``TestClient`` tests) reports 缺 —
-        this process has no confirmed reachable MCP — while the
-        conversation gate stays open for that same hermetic case (see
-        ``fin.host.knowledge_mcp``).
+        that never probed (plain ``TestClient`` tests) reports 未探测
+        (``not_probed``), NOT 缺 — 缺 asserts a probe established the
+        absence, and this process never looked — while the conversation
+        gate stays open for that same hermetic case (see
+        ``fin.host.knowledge_mcp``). The three probed states are echoed
+        verbatim; ``not_probed`` is display-only, so no probe can
+        publish it.
+
+        ``knowledge_mcp`` is resolved by the ONE function
+        ``fin.host.knowledge_mcp.knowledge_mcp_status_value`` owns, so
+        this route cannot drift back to coercing ``None`` into 缺 and so
+        a value outside the probed set still fails closed (→ 坏, logged)
+        instead of being echoed unvouched.
 
         ``retrieve_adapter_kind`` publishes the BOUND port, not the
         configured string: the (adapter, state) pair this payload
@@ -5916,17 +6509,34 @@ def build_router(
         extra call, no catalog) and reports ``unbound`` whenever the
         process is not bound to a live iknow 资料集合; see
         :mod:`fin.host.collection_bind`.
+
+        ``run_counts`` is the one run-aware field here, and it is counts
+        alone: this router's own run registry, read without touching the
+        graph, the MCP client or the checkpoint. A status answer that had
+        to wait for any of those is the one surface that must stay
+        answerable during the stall it exists to report — and a
+        suspected-stuck count is only honest if answering it costs
+        nothing that can itself be stuck. ``active`` counts the runs this
+        process is executing, ``paused`` the ones waiting on the operator,
+        and ``suspected_stuck`` the active runs whose executing phase has
+        gone past its deadline plus the cleanup grace without producing
+        anything. A deliberate clarification or attachment wait is never
+        suspected-stuck: nobody bounds the operator's thinking time.
         """
         published = knowledge_mcp_state()
-        knowledge_mcp = (
-            published if published in KNOWLEDGE_MCP_STATES else "missing"
-        )
+        knowledge_mcp = knowledge_mcp_status_value(published)
+        counts = run_control.counts()
         return {
             "knowledge_mcp": knowledge_mcp,
             "retrieve_adapter_kind": resolve_bound_retrieve_adapter_kind(),
             "model_identity": _model_identity(),
             "corpus_filing_count": _corpus_filing_count(),
             "bound_collection_name": resolve_bound_collection_name(),
+            "run_counts": {
+                "active": counts.active,
+                "paused": counts.paused,
+                "suspected_stuck": counts.suspected_stuck,
+            },
         }
 
     @router.post("/corpus/ingest")
@@ -5937,38 +6547,49 @@ def build_router(
         company: str | None = Form(default=None),
         period: str | None = Form(default=None),
         doc_type: str | None = Form(default=None),
+        title: str | None = Form(default=None),
         format: str | None = Form(default=None),
         service: IngestEndpoint = Depends(get_ingest_service),
     ) -> Response:
         """Corpus-ingest door: accept one upload durably and return its job.
 
-        The ONLY product surface that takes a company document into the
-        permanent corpus (ADR 0047). It is **accept-and-persist**: parse,
-        切分 and push run asynchronously off the request (drained by the
-        boot worker, :func:`start_ingest_worker`), so a 200 here says the
-        upload is durable and queued,
-        never that anything was ingested — ``accepted`` replaced the old
-        ``ingested`` token, and the outcome is polled at
-        ``GET /api/corpus/ingest/{job_id}``.
+        The ONLY product surface that takes a document into the permanent
+        corpus (ADR 0047). It is **accept-and-persist**: parse, 切分 and
+        push run asynchronously off the request (drained by the boot
+        worker, :func:`start_ingest_worker`), so a 200 here says the upload
+        is durable and queued, never that anything was ingested —
+        ``accepted`` replaced the old ``ingested`` token, and the outcome
+        is polled at ``GET /api/corpus/ingest/{job_id}``.
 
-        Multipart upload + optional metadata form fields: ``format``
-        (explicit declaration; otherwise the filename extension names the
-        format), ``document_id`` (wins verbatim) or ``company`` +
-        ``period`` (the ``"{TICKER}-{FYQ}"`` identity; the filename is
-        metadata only and never names the document), ``doc_type`` (optional
-        params-table scene override).
+        Multipart upload; the file is the only required input. The
+        document identity is derived from the trusted corpus scope and the
+        content digest, so ``document_id`` is refused. ``title``,
+        ``company``, ``period`` and ``doc_type`` are optional display
+        metadata subject to their existing validation; without a title the
+        sanitized filename basename names the document. ``format`` is an
+        optional explicit declaration (otherwise the filename extension
+        names the format). An old client's multipart ``generic`` field is
+        ignored for compatibility.
 
-        Accepted means all four accept-time items are durable: the raw
-        object, its metadata pointer, the ``pending`` job record and the
-        ``(document_id, version)`` identity. Every validation that needs no
-        bytes runs before the first write, so a refused upload leaves
-        nothing behind; a persistence failure is a typed 5xx with no
-        accepted job. The exception -> answer mapping lives in
-        :func:`_ingest_error_response` (table-driven).
+        Accepted means every accept-time item is durable: the raw object,
+        its metadata pointer, the ``pending`` job record, the
+        ``(document_id, version)`` identity and the accepted-metadata
+        audit row. Every validation that needs no bytes runs before the
+        first write, so a refused upload leaves nothing behind; a
+        persistence failure is a typed 5xx with no accepted job. The
+        exception -> answer mapping lives in :func:`_ingest_error_response`
+        (table-driven).
         """
         if file is None:
             return JSONResponse(
                 status_code=422, content={"error": "missing_file"}
+            )
+        # The public door never lets a caller choose identity. The
+        # module keeps a trusted explicit-ID seam for internal imports;
+        # this field is refused here, before any store access.
+        if document_id is not None and document_id.strip():
+            return _ingest_error_response(
+                IngestDocumentIdNotAllowedError(PUBLIC_DOCUMENT_ID_REFUSAL)
             )
         # Route-layer upload gate (input boundary): refuse a declared
         # oversize body BEFORE the spooled upload is read into memory,
@@ -6000,6 +6621,7 @@ def build_router(
                 company=company,
                 period=period,
                 doc_type=doc_type,
+                title=title,
             )
         except Exception as exc:
             return _ingest_error_response(exc)
@@ -6075,6 +6697,8 @@ def build_router(
                 "error_message": status.error_message,
                 "text_ready": status.text_ready,
                 "graph": graph,
+                "catalog_warning": _catalog_warning_body(status.catalog_warning),
+                "catalog_warning_count": status.catalog_warning_count,
             },
         )
 
@@ -6122,7 +6746,7 @@ def build_router(
         ``consumer_id`` is REQUIRED rather than defaulted to
         ``INVALIDATION_DRAIN_CONSUMER_ID``. That constant is a contract,
         not a configuration surface (see
-        :mod:`fin.host.structured_evidence_drain_worker`), so a copy
+        :mod:`fin.host.evidence.structured_evidence_drain_worker`), so a copy
         of it here would be a second identity that goes quietly stale
         and answers for a consumer nothing drains.
 
@@ -6191,6 +6815,7 @@ def mount(
     get_feedback_store=None,
     get_observability_collector=None,
     get_workspace_root=None,
+    run_control: RunControl | None = None,
 ) -> None:
     """Mount the workspace routes onto an existing FastAPI app."""
     app.include_router(
@@ -6205,6 +6830,7 @@ def mount(
             get_feedback_store=get_feedback_store,
             get_observability_collector=get_observability_collector,
             get_workspace_root=get_workspace_root,
+            run_control=run_control,
         )
     )
 

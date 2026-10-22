@@ -40,8 +40,10 @@ from typing import Any
 
 import pytest
 
+from fin.corpus.doc_type import classify_page
 from fin.corpus.errors import (
     EmptySourceParseError,
+    ParseError,
     UnsupportedFormatParseError,
 )
 from fin.corpus.extracted import Locator
@@ -72,6 +74,10 @@ from fin.corpus.object_store_errors import ObjectStoreUnavailableError
 from fin.corpus.params import DOC_TYPES
 from fin.corpus.parsers import SUPPORTED_FORMATS
 from fin.corpus.push import REQUIRED_PUSH_METADATA_FIELDS
+from fin.corpus.upload_metadata import (
+    UNKNOWN_DOC_TYPE,
+    derive_document_identity,
+)
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.iknow_identity import compute_iknow_content_identity
@@ -154,6 +160,51 @@ class _FailingPointerStore(InMemoryMetadataStore):
 
     def put_pointer(self, document_id: str, pointer: ObjectPointer) -> None:
         raise MetadataStoreError("pointer table is unavailable")
+
+
+class _FailingPointerDeleteStore(InMemoryMetadataStore):
+    """Pointer store whose delete fails (metadata outage on the cleanup)."""
+
+    def delete_pointer(self, document_id: str, *, object_key: str) -> None:
+        raise MetadataStoreError("pointer table is unavailable")
+
+
+class _UnavailablePointerStore(InMemoryMetadataStore):
+    """Pointer store whose put and delete both fail (metadata outage)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delete_calls = 0
+
+    def put_pointer(self, document_id: str, pointer: ObjectPointer) -> None:
+        raise MetadataStoreError("pointer table is unavailable")
+
+    def delete_pointer(self, document_id: str, *, object_key: str) -> None:
+        self.delete_calls += 1
+        raise MetadataStoreError("pointer table is unavailable")
+
+
+class _ConcurrentWinnerPointerStore(InMemoryMetadataStore):
+    """Pointer store where a concurrent winner commits its own row.
+
+    The accept writes its pointer, then the winner commits a different
+    object for the same document before the refusal lands: the loser's
+    cleanup must leave the winner's row alone.
+    """
+
+    WINNER_KEY = "filings/DOC-1/winner"
+
+    def put_pointer(self, document_id: str, pointer: ObjectPointer) -> None:
+        super().put_pointer(document_id, pointer)
+        super().put_pointer(
+            document_id,
+            ObjectPointer(
+                key=self.WINNER_KEY,
+                size_bytes=pointer.size_bytes,
+                sha256=pointer.sha256,
+                content_type=pointer.content_type,
+            ),
+        )
 
 
 class _HidingPointerStore(InMemoryMetadataStore):
@@ -606,6 +657,140 @@ def test_default_doc_type_is_deterministic_per_unit_classification() -> None:
     assert result.doc_type in DOC_TYPES
 
 
+# ----- doc_type: the ONE document-level rollup this module owns -----
+#
+# The frozen contract (specs/qa-chain-corpus-retrieval.md §"Metadata-free
+# ingest and document identity") says a document publishes under an
+# accepted ``doc_type`` override when it has one, else fin's own
+# deterministic classification, else the literal ``unknown``. That rollup
+# lives here and only here — ``_split`` is the single implementation, it
+# is wired to the real splitter, and the value it returns is what lands in
+# the catalog row. It is pinned at this seam rather than at a pure
+# metadata helper, so a second implementation cannot reappear beside it.
+
+
+def _split_result(text: bytes, *, doc_type: str | None = None):
+    """Run the endpoint's real chain far enough to reach the rollup."""
+    endpoint = _endpoint(FakePushPort())
+    return endpoint.ingest(
+        text, declared_format="txt", document_id="ROLL-2024Q1", doc_type=doc_type
+    )
+
+
+_TABLE_UNIT = "Revenue 2022 2023\n100 200 300\n400 500 600"
+_NARRATIVE_UNIT = "Board members discussed the outlook at length in prose."
+
+
+def test_an_accepted_override_is_used_verbatim_for_every_unit() -> None:
+    """An override the params table knows is not re-classified.
+
+    Every unit splits under it AND the document-level value is that same
+    override, so the splitter's type and the catalog row's ``doc_type``
+    cannot disagree.
+    """
+    result = _split_result(_V1_TEXT, doc_type="table_dense")
+
+    assert result.doc_type == "table_dense"
+    assert {record.metadata["doc_type"] for record in result.records} == {
+        "table_dense"
+    }
+
+
+def test_an_override_outside_the_vocabulary_is_refused_before_any_push() -> None:
+    """Closed vocabulary, decided before a parse or a push.
+
+    ``unknown`` is a member of the table, not a loophole; anything else
+    outside the table would silently land on the global default row,
+    because the caller clearly meant a specific scene.
+    """
+    fake = FakePushPort()
+
+    with pytest.raises(IngestInvalidDocTypeError) as excinfo:
+        _endpoint(fake).ingest(
+            _V1_TEXT,
+            document_id="ROLL-2024Q1",
+            declared_format="txt",
+            doc_type="invoice",
+        )
+
+    assert excinfo.value.code == "invalid_doc_type"
+    assert fake.block_total() == 0
+
+
+def test_unknown_is_an_accepted_override() -> None:
+    """The uploader may type ``unknown`` deliberately.
+
+    The synchronous path honours it verbatim; the durable path's audit
+    round trip cannot distinguish it from "no override" — a gap
+    ``tests/corpus/test_ingest_generic_upload.py`` names explicitly.
+    """
+    assert _split_result(_V1_TEXT, doc_type="unknown").doc_type == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("units", "expected"),
+    [
+        # Majority verdict, ties broken by the fixed DOC_TYPES order.
+        ((_NARRATIVE_UNIT, _NARRATIVE_UNIT, _TABLE_UNIT), "narrative"),
+        ((_TABLE_UNIT, _TABLE_UNIT, _NARRATIVE_UNIT), "table_dense"),
+        ((_TABLE_UNIT, _NARRATIVE_UNIT), "narrative"),
+        ((_NARRATIVE_UNIT,), "narrative"),
+        ((_TABLE_UNIT,), "table_dense"),
+    ],
+)
+def test_without_an_override_the_classifier_majority_decides(
+    units: tuple[str, ...], expected: str
+) -> None:
+    """The document-level value is the majority ``classify_page`` verdict.
+
+    The tie case is pinned because it is a real decision, not an
+    accident: two units of different kinds are the first document shape
+    where a rule change would silently move the catalog row's
+    ``doc_type``.
+    """
+    result = _split_result(("\n\n".join(units) + "\n\n").encode("utf-8"))
+
+    assert result.doc_type == expected
+    # The rollup is a DOCUMENT-level value over per-unit verdicts that
+    # are kept: a mixed document still pushes each unit under its own
+    # classification, so the rollup is not a rewrite of the split.
+    assert expected in {record.metadata["doc_type"] for record in result.records}
+
+
+def test_a_document_with_no_parseable_text_never_reaches_the_rollup() -> None:
+    """The spec's "no reliable type is detected" boundary, pinned as it
+    ACTUALLY behaves rather than as the contract wished it behaved.
+
+    A source with no parseable text is refused by the parser with the
+    typed ``empty_source`` / ``no_units`` failure long before any rollup
+    runs, so no published row can claim a type for a document that has
+    no text. The literal ``unknown`` therefore survives in the system as
+    the ACCEPT-TIME marker for "the uploader named no override" (see
+    ``_accepted_for_run``) and as a value the uploader may type — not as
+    a rollup outcome the classifier cannot reach.
+
+    That is a real narrowing of the spec sentence "use the literal
+    ``unknown`` when no reliable type is detected": the honest reading of
+    a textless document is a refusal to publish it at all, and the
+    refusal is stronger. Reported, not papered over.
+    """
+    endpoint = _endpoint(FakePushPort())
+
+    with pytest.raises(ParseError) as excinfo:
+        endpoint.ingest(
+            b"",
+            declared_format="txt",
+            document_id="ROLL-2024Q1",
+        )
+
+    assert excinfo.value.code in ("empty_source", "no_units")
+    # And the classification of the empty string itself is not
+    # ``unknown``: ``classify_page`` reads a page with no lines as
+    # having no counter-evidence, so it says ``narrative``.
+    assert classify_page("") == "narrative"
+    assert classify_page("") not in (UNKNOWN_DOC_TYPE,)
+
+
 # ----- push unavailable (SC8: typed, nothing recorded as written) -----
 
 
@@ -816,10 +1001,36 @@ def test_an_incomplete_metadata_pair_is_document_id_missing(
 
 
 def test_filename_never_participates_in_identity() -> None:
-    stack = _durable_stack()
-    with pytest.raises(IngestDocumentIdMissingError):
-        stack.endpoint.submit_durable(_V1_TEXT, filename="AAPL-2022Q3.md")
-    _assert_nothing_persisted(stack)
+    """A public upload's identity is the content digest; the name is display only.
+
+    The filename decides what a document is CALLED (the sanitized title),
+    never what it IS. So the same bytes under two different names resolve
+    to ONE identity, and no part of the name appears in it — otherwise a
+    rename would land a second logical document.
+    """
+    stack = _durable_stack(corpus_scope_id="fin-endpoint-identity")
+    expected = derive_document_identity(
+        _V1_TEXT,
+        corpus_scope_id="fin-endpoint-identity",
+        filename="AAPL-2022Q3.md",
+    ).document_id
+
+    submission = stack.endpoint.submit_durable(
+        _V1_TEXT, filename="AAPL-2022Q3.md", declared_format="txt"
+    )
+
+    assert submission.document_id == expected
+    assert submission.version == hashlib.sha256(_V1_TEXT).hexdigest()
+    assert submission.state is IngestState.PENDING
+    # The name reached no identity: a differently-named upload of the same
+    # bytes joins the same document, and no fragment of either name is in
+    # the id.
+    renamed = stack.endpoint.submit_durable(
+        _V1_TEXT, filename="renamed-by-the-uploader.md", declared_format="txt"
+    )
+    assert renamed.document_id == submission.document_id
+    assert "AAPL" not in submission.document_id
+    assert "renamed" not in submission.document_id
 
 
 def test_acceptance_requires_the_four_durable_items_and_pushes_nothing() -> None:
@@ -1134,9 +1345,8 @@ def test_pointer_commit_failure_leaves_no_accepted_job() -> None:
 
 
 def test_a_rejected_replacement_restores_the_previous_pointer() -> None:
-    # The job stage fails AFTER the pointer overwrite, so the compensating
-    # cleanup has to put the prior pointer back: the pointer store has no
-    # delete, and leaving the new one would advertise an unaccepted version.
+    # The job stage fails AFTER the pointer overwrite; a replacement has a
+    # prior pointer, so the cleanup restores it instead of deleting the row.
     stack = _durable_stack(states=_FailingCreateStateStore(fail_after=1))
     first = _submit(stack, _V1_TEXT)
     stack.states.transition("DOC-1", IngestState.FAILED)
@@ -1166,6 +1376,61 @@ def test_a_failing_compensating_delete_is_observable_not_swallowed() -> None:
     # as its cause, with the delete's own failure as the context
     assert isinstance(excinfo.value.__cause__, MetadataStoreError)
     assert isinstance(excinfo.value.__context__, ObjectStoreUnavailableError)
+
+
+def test_a_failing_pointer_delete_is_observable_not_swallowed() -> None:
+    # A first accept has no prior pointer, so the cleanup deletes the row
+    # this attempt wrote; a failing delete is a cleanup failure, not a skip.
+    pointers = _FailingPointerDeleteStore()
+    stack = _durable_stack(
+        pointers=pointers,
+        states=_FailingCreateStateStore(),
+    )
+    key = f"filings/DOC-1/{hashlib.sha256(_V1_TEXT).hexdigest()}"
+    with pytest.raises(IngestObjectCleanupError) as excinfo:
+        _submit(stack, _V1_TEXT)
+    assert excinfo.value.code == "object_cleanup_failed"
+    assert excinfo.value.key == key
+    assert isinstance(excinfo.value.__cause__, MetadataStoreError)
+    # the raw object is gone: the pointer row is what the cleanup could not
+    # remove, so this is not a skipped compensation
+    assert stack.objects.deletes == [stack.objects.puts[0]]
+    # the residue is the row that still names the deleted object, and the
+    # refusal accepted no job
+    assert pointers.get_pointer("DOC-1").pointer.key == key
+    with pytest.raises(UnknownJobError):
+        stack.states.get_job("DOC-1")
+
+
+def test_a_failed_pointer_write_does_not_compensate_the_pointer() -> None:
+    # A failed put owns no confirmed row, so the refusal stays the typed
+    # pointer_write failure: attempting the delete would turn a metadata
+    # outage into a cleanup failure and claim a row that may not exist.
+    pointers = _UnavailablePointerStore()
+    stack = _durable_stack(pointers=pointers)
+
+    with pytest.raises(IngestDurableCommitError) as excinfo:
+        _submit(stack, _V1_TEXT)
+
+    assert excinfo.value.stage == "pointer_write"
+    assert pointers.delete_calls == 0
+    assert stack.objects.deletes == [stack.objects.puts[0]]
+
+
+def test_a_refused_accept_leaves_a_concurrent_winner_pointer_alone() -> None:
+    # A concurrent winner commits its own row for the same document after
+    # this attempt wrote its pointer; the cleanup deletes only a row that
+    # names the object this attempt wrote, so a winner's row for another
+    # object is left alone (a same-bytes winner shares the key and object).
+    pointers = _ConcurrentWinnerPointerStore()
+    stack = _durable_stack(pointers=pointers, states=_FailingCreateStateStore())
+
+    with pytest.raises(IngestDurableCommitError) as excinfo:
+        _submit(stack, _V1_TEXT)
+
+    assert excinfo.value.stage == "job_record"
+    assert pointers.get_pointer("DOC-1").pointer.key == pointers.WINNER_KEY
+    assert stack.objects.deletes == [stack.objects.puts[0]]
 
 
 def test_durable_accept_without_wired_stores_is_a_typed_failure() -> None:
@@ -1343,6 +1608,7 @@ def test_a_derived_identity_recovers_its_company_and_period() -> None:
         "AAPL-",           # no period half
         "-2022Q3",         # no ticker half
         "aapl-2022Q3",     # lower-case ticker: ids are upper-cased at derive
+        "AAPL-2022Q5",     # no such quarter
         "AAPL-2022Q3-EXTRA",  # trailing content is not a fiscal label
     ],
 )
@@ -1360,12 +1626,16 @@ def test_the_durable_run_hands_the_catalog_hook_a_company(
 ) -> None:
     """The end-to-end claim: the recovered pair reaches `record_filings`.
 
-    Driven through the REAL durable landing — ``submit_durable`` then
-    ``run_durable`` — so the assertion is on what the catalog hook is
-    actually handed by the worker. A test that called ``ingest()`` with an
-    already-split pair would stay green if the recovery in
-    ``_complete_and_land`` were deleted, which is exactly the regression
-    this fix exists to prevent.
+    The job is a PRE-CONTRACT accept, seeded directly in the stores (raw
+    object + pointer + ``pending`` job row, and no
+    ``upload_metadata_accepted`` event), then driven through the REAL
+    ``run_durable`` worker. With no accepted row, ``_accepted_for_run``
+    returns ``None`` and the run recovers ``(company, period)`` from the
+    ``{TICKER}-{PERIOD}`` id it was derived from. The assertion is on what
+    the catalog hook is actually handed, so a test that called ``ingest()``
+    with an already-split pair would stay green if the recovery in
+    ``_complete_and_land`` were deleted — exactly the regression this fix
+    exists to prevent.
 
     The catalog is redirected to ``tmp_path`` so the run leaves the
     committed ``data/corpus/catalog.json`` untouched.
@@ -1396,6 +1666,8 @@ def test_the_durable_run_hands_the_catalog_hook_a_company(
             document_id=doc.document_id,
             company=doc.company,
             period=doc.period,
+            title=doc.title,
+            doc_type=doc.doc_type,
         )
         catalog_mod.record_filings(
             [
@@ -1405,6 +1677,8 @@ def test_the_durable_run_hands_the_catalog_hook_a_company(
                     "period": doc.period,
                     "version": doc.version,
                     "page_count": doc.page_count,
+                    "title": doc.title,
+                    "doc_type": doc.doc_type,
                 }
             ]
         )
@@ -1433,14 +1707,22 @@ def test_the_durable_run_hands_the_catalog_hook_a_company(
         on_ingested=hook,
     )
 
-    # No company / period is supplied anywhere on this path: the worker has
-    # only the document id, exactly as in production.
-    accepted = endpoint.submit_durable(
-        pdf.read_bytes(),
-        document_id="MSFT-2023Q1",
-        declared_format="pdf",
+    # A pre-contract accept: the bytes, the pointer and the ``pending`` job
+    # row are durable, but no accepted-metadata event was written. The
+    # worker therefore has only the document id, exactly as in production
+    # for a job accepted before this contract existed.
+    document_id = "MSFT-2023Q1"
+    payload = pdf.read_bytes()
+    version = hashlib.sha256(payload).hexdigest()
+    pointer = ports.objects.put(
+        f"filings/{document_id}/{version}",
+        payload,
+        content_type="application/pdf",
     )
-    outcome = endpoint.run_durable(accepted.document_id)
+    ports.pointers.put_pointer(document_id, pointer)
+    ports.states.create_job(document_id)
+
+    outcome = endpoint.run_durable(document_id)
 
     assert outcome.state.value == "ready"
     assert seen["document_id"] == "MSFT-2023Q1"

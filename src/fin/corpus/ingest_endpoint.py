@@ -9,8 +9,9 @@ This module owns three ingest entry points on one endpoint:
   pushing, since those run off the request. :meth:`IngestEndpoint.job_status`
   reads back what the machine has persisted.
 * **the synchronous chain** — :meth:`IngestEndpoint.ingest` is the
-  programmatic path that parses, chunks and pushes in one call. This is
-  the entry where company documents reach the retrieval backend, and the
+  programmatic path that parses, chunks and pushes in one call. The
+  public upload reaches it through :meth:`IngestEndpoint.run_durable`;
+  trusted explicit-ID and replay callers may also call it directly. The
   chain is fully deterministic — no model participates in any split
   decision:
 
@@ -62,6 +63,12 @@ This module owns three ingest entry points on one endpoint:
   a typed ``failed`` job the retry edge can pick up. A job another live
   worker owns is never failed: every busy the run's transitions can
   raise — claim, adoption, or landing — reports the typed busy join.
+  A run that finds its ``push_succeeded`` already durable is a
+  RECOVERY, not a re-run: it skips the push and redoes only the catalog
+  upsert, from the row the pending event recorded. And a terminal
+  publication event that could not be appended keeps the job
+  ``cataloging`` rather than failing it, because its pending row is
+  durable and recovery is exactly the redo that row exists for.
 
 The HTTP surface (``fin.host.workspace_http``) and a future CLI both
 construct :class:`IngestEndpoint` with their own ports; this module
@@ -71,6 +78,7 @@ never reads the environment and never imports FastAPI.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import threading
 from collections import Counter
@@ -78,6 +86,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Final,
     Literal,
@@ -85,10 +94,35 @@ from typing import (
     Sequence,
 )
 
+from fin.corpus.catalog_publication import (
+    CATALOG_PUBLICATION_FAILED,
+    CATALOG_PUBLICATION_PENDING,
+    CATALOG_PUBLICATION_SUCCEEDED,
+    PUSH_SUCCEEDED,
+    UPLOAD_METADATA_ACCEPTED,
+    PublicationWarning,
+    accepted_metadata_payload,
+    classify_catalog_failure,
+    failed_payload,
+    pending_payload,
+    publication_warning,
+    push_succeeded_payload,
+    read_accepted_metadata,
+    read_pending_publication,
+    read_push_identities,
+    read_push_succeeded,
+    succeeded_payload,
+)
 from fin.corpus.chunking import (
     DocumentChunking,
     split_document,
     split_unit,
+)
+from fin.corpus.document_identity import (
+    CORPUS_DOCUMENT_ID_PREFIX,
+    DocumentIdentityError,
+    DocumentIdentityStore,
+    default_document_identity_store,
 )
 from fin.corpus.doc_type import classify_page
 from fin.corpus.errors import UnsupportedFormatParseError
@@ -112,6 +146,13 @@ from fin.corpus.push import (
     document_push_records,
     envelopes_of_document,
 )
+from fin.corpus.upload_metadata import (
+    UNKNOWN_DOC_TYPE,
+    InvalidUploadMetadataError,
+    derive_document_identity,
+    resolve_explicit_metadata,
+    sanitize_upload_title,
+)
 from fin.retrieve.invalidation_port.errors import (
     InvalidationOutcome,
     InvalidationPort,
@@ -126,6 +167,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from fin.corpus.ingest_state import IngestStateStore
     from fin.corpus.metadata_store import MetadataStore
     from fin.corpus.object_store import ObjectPointer, ObjectStore
+
+logger = logging.getLogger(__name__)
 
 # Overflow class (§B2 第 5 条 / test allocation): the largest upload the
 # endpoint accepts. Oversize is a named 413-class failure, never a
@@ -219,6 +262,27 @@ class IngestDocumentIdMissingError(IngestEndpointError):
     code = "document_id_missing"
 
 
+#: One wording for the public refusal, shared by the HTTP door (which
+#: rejects the form field) and the identity leg (which refuses the same
+#: value should it reach the endpoint). The two must not drift apart.
+PUBLIC_DOCUMENT_ID_REFUSAL = (
+    "a public upload's identity is derived from the trusted corpus scope "
+    "and the content digest; a caller-chosen document_id is not accepted"
+)
+
+
+class IngestDocumentIdNotAllowedError(IngestEndpointError):
+    """A caller-chosen ``document_id`` reached the public upload path.
+
+    The public identity contract derives the id from the trusted corpus
+    scope plus the content digest; honoring a caller-chosen id there
+    would let an upload choose its own identity and split one document
+    into many, so the boundary refuses it instead of ignoring it.
+    """
+
+    code = "document_id_not_allowed"
+
+
 class IngestInvalidDocTypeError(IngestEndpointError):
     """An explicit ``doc_type`` outside the params-table vocabulary.
 
@@ -229,6 +293,14 @@ class IngestInvalidDocTypeError(IngestEndpointError):
     """
 
     code = "invalid_doc_type"
+
+
+# The endpoint's named family for out-of-bounds explicit upload
+# metadata. The bounds and the raise live in
+# :mod:`fin.corpus.upload_metadata`; the alias here is so the HTTP error
+# table dispatches it by ``isinstance`` like every other accept-time
+# family, and so callers can catch it without importing two names.
+IngestInvalidUploadMetadataError = InvalidUploadMetadataError
 
 
 class IngestConcurrentRunError(IngestEndpointError):
@@ -249,6 +321,9 @@ IngestDurableStage = Literal[
     "pointer_write",
     "job_record",
     "pointer_read",
+    "accepted_metadata",
+    "identity_record",
+    "publication_audit",
 ]
 
 
@@ -268,11 +343,12 @@ class IngestDurableCommitError(IngestEndpointError):
 
 
 class IngestObjectCleanupError(IngestEndpointError):
-    """The compensating delete of a rejected upload's raw object failed.
+    """A compensating cleanup of a rejected upload failed.
 
-    The orphan object is the residue of a persistence failure, so losing
-    it silently would leave an unaudited write; the original failure is
-    kept as ``__cause__`` and this one names the key.
+    The cleanup is the raw object's delete, or the pointer's restore or
+    delete. Whatever it left behind is the residue of a failed accept, so
+    losing it silently would leave an unaudited write; the original failure
+    is kept as ``__cause__`` and this one names the key.
     """
 
     code = "object_cleanup_failed"
@@ -289,6 +365,11 @@ class IngestedDocument:
     ``page_count`` is the frozen-unit count (the physical granularity
     of the parse: pages for PDF/PPT, row blocks for Excel, structure
     blocks for HTML/Markdown/Word, paragraphs for text).
+
+    ``title`` is the display title (explicit or sanitized filename
+    fallback) and ``source_sha256`` the content digest a public upload
+    row records — both default to ``None`` so the legacy replay caller
+    that builds this row without them keeps its existing shape.
     """
 
     document_id: str
@@ -298,6 +379,37 @@ class IngestedDocument:
     page_count: int
     fmt: str
     doc_type: str
+    title: str | None = None
+    source_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class AcceptedUpload:
+    """What one accept validated, handed to the durable accept record.
+
+    On the public upload path this is the ONLY source of a run's
+    display metadata: it is persisted once, at accept time, as the
+    ``upload_metadata_accepted`` audit event, and the run reads it back
+    from there instead of from the caller's request, so a resumed run
+    publishes the metadata that was accepted rather than whatever a
+    retry happened to resend. The synchronous trusted explicit-ID
+    caller (:meth:`ingest`) produces the same shape in memory but
+    persists nothing (its audit sequence predates this contract): such
+    a run keeps its own resolution — the pair its derived id encodes —
+    through the ``None`` leg of ``_accepted_for_run``.
+
+    ``doc_type`` is the accepted OVERRIDE, or ``""`` when the upload
+    named none and the run will classify the document itself. It is
+    recorded as ``unknown`` in that case: the accepted row is a
+    redo input for the fields an accept can know, and the run's own
+    classified type reaches the catalog on the pending-publication row,
+    which is the row recovery actually upserts.
+    """
+
+    title: str
+    doc_type: str
+    company: str | None = None
+    period: str | None = None
 
 
 @dataclass(frozen=True)
@@ -369,6 +481,11 @@ class IngestJobStatus:
 
     ``version`` is read back from the durable pointer, never recomputed
     from a re-supplied upload, so what a poller sees is what was accepted.
+
+    ``catalog_warning`` is the audit-derived publication state (a typed
+    code plus safe copies, never raw exception text) or ``None`` once a
+    success is recorded. ``catalog_warning_count`` is the number of
+    DOCUMENTS with an unresolved publication, not the number of attempts.
     """
 
     document_id: str
@@ -376,6 +493,8 @@ class IngestJobStatus:
     state: IngestState
     error_type: str | None
     error_message: str | None
+    catalog_warning: PublicationWarning | None = None
+    catalog_warning_count: int = 0
 
     @property
     def job_id(self) -> str:
@@ -468,9 +587,8 @@ def resolve_document_id(
     if ticker and fiscal_period:
         return f"{ticker.upper()}-{fiscal_period.upper()}"
     raise IngestDocumentIdMissingError(
-        "no document_id was supplied and none is derivable: both company "
-        "and period are required (e.g. company='aapl', period='2022q3' -> "
-        "'AAPL-2022Q3')"
+        "no document_id was supplied and this trusted explicit-ID seam "
+        "has no complete company/period pair to derive one from"
     )
 
 
@@ -511,7 +629,9 @@ def split_company_period_from_document_id(
     halves: the ticker must be all-uppercase-alphanumeric (a filing's
     ticker is), and the period must be a fiscal label (``2022Q3`` /
     ``2023FY``). An SEC accession id like ``0000320193-24-000006`` fails
-    the ticker test rather than being read as company ``0000320193``.
+    the ticker test rather than being read as company ``0000320193``. A
+    corpus-owned id (``doc_...``) is never split at all: it carries no
+    company and no period to recover.
 
     KNOWN LIMIT — the explicit-``document_id`` branch of
     ``specs/corpus-serve-ingest.md`` Decision 1.1 (an EDGAR accession
@@ -523,6 +643,11 @@ def split_company_period_from_document_id(
     migration this fix deliberately does not carry. Until then such a
     filing is pushed and, like before this fix, not catalog-visible.
     """
+    if document_id.startswith(CORPUS_DOCUMENT_ID_PREFIX):
+        # A corpus-owned id carries no company and no period: it is derived
+        # from the scope and the bytes, so there is nothing to split back out
+        # and a split would invent a pair the id never encoded.
+        return None, None
     ticker, separator, period = document_id.partition("-")
     if not separator:
         return None, None
@@ -567,6 +692,96 @@ def _split(
         ),
     )
     return chunking, resolved
+
+
+#: The display title a row gets when no explicit or filename fallback
+#: title is available. Only the trusted explicit-ID replay leg lands
+#: here: it predates the title-bearing public upload path and carries
+#: its title in the ``company``/``period`` pair it derives its id from,
+#: so it records that pair rather than inventing one. A public upload
+#: always resolves its own title at accept time and never lands here.
+_LEGACY_REPLAY_ROW_TITLE = "Filing"
+
+
+def _physical_catalog_row(document: IngestedDocument) -> dict[str, Any]:
+    """The COMPLETE physical catalog row for one landed run.
+
+    Optional descriptive fields are OMITTED when the run carries none —
+    never written as ``""``, which would invent a company the document
+    does not have. This dict is the redo input a restart upserts
+    verbatim, so it is built once and travels unchanged.
+    """
+    row: dict[str, Any] = {
+        "document_id": document.document_id,
+        "version": document.version,
+        "title": document.title,
+        "doc_type": document.doc_type,
+        "page_count": document.page_count,
+    }
+    if document.company:
+        row["company"] = document.company
+    if document.period:
+        row["period"] = document.period
+    if document.source_sha256:
+        row["source_sha256"] = document.source_sha256
+    return row
+
+
+def _row_optional(row: Mapping[str, Any], key: str) -> str | None:
+    """Read an optional physical row field without inventing a value."""
+    value = row.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _ingested_document(
+    *,
+    doc_id: str,
+    company: str | None,
+    period: str | None,
+    version: str,
+    page_count: int,
+    fmt: str,
+    doc_type: str,
+    title: str | None,
+    content_identity: bool,
+) -> IngestedDocument:
+    """The hook's view of one finished run.
+
+    A run on the content-identity leg carries the title it resolved at
+    accept and its own digest as ``source_sha256``; the trusted
+    explicit-ID replay leg keeps the pair it derived its id from and
+    gets the fallback title the catalog's required ``title`` field
+    needs.
+    """
+    return IngestedDocument(
+        document_id=doc_id,
+        company=company,
+        period=period,
+        version=version,
+        page_count=page_count,
+        fmt=fmt,
+        doc_type=doc_type,
+        title=title if content_identity else (title or _LEGACY_REPLAY_ROW_TITLE),
+        source_sha256=version if content_identity else None,
+    )
+
+
+@dataclass(frozen=True)
+class IngestIdentityRecord:
+    """One accepted upload's identity record, and the writes it can undo.
+
+    The values travel together: the accept path hands the record over as
+    one argument, so what a refused identity record has to undo is stated
+    in one place instead of being spread over a call that grows with
+    every new value.
+    """
+
+    objects: ObjectStore
+    pointers: MetadataStore
+    key: str
+    document_id: str
+    version: str
+    prior_pointer: ObjectPointer | None
 
 
 class IngestEndpoint:
@@ -622,6 +837,12 @@ class IngestEndpoint:
         :class:`~fin.corpus.ingest_state.IngestStateStore` carrying the
         job's persisted state; ``document_id`` is the job id, so
         ``job_id == document_id``.
+    corpus_scope_id:
+        The TRUSTED corpus scope id the public upload identity is
+        derived from (host configuration, injected here — never read
+        from a request, a filename or a model argument). Required for
+        the public accept; the trusted explicit-ID replay leg keeps its
+        own ``{TICKER}-{FYQ}`` locator and never consults it.
     """
 
     def __init__(
@@ -638,6 +859,8 @@ class IngestEndpoint:
         object_store: ObjectStore | None = None,
         metadata_store: MetadataStore | None = None,
         state_store: IngestStateStore | None = None,
+        identity_store: DocumentIdentityStore | None = None,
+        corpus_scope_id: str = "",
     ) -> None:
         self._push_port = push_port
         self._invalidation_port = invalidation_port
@@ -654,6 +877,8 @@ class IngestEndpoint:
         self._object_store = object_store
         self._metadata_store = metadata_store
         self._state_store = state_store
+        self._identity_store = identity_store
+        self._corpus_scope_id = corpus_scope_id
         # A per-document submit lock serializes the check-write-read of
         # submit_durable so two identical uploads cannot both pass the
         # "no prior job" read and race on the durable write. The guard
@@ -680,6 +905,28 @@ class IngestEndpoint:
         """
         return self._max_bytes
 
+    def _validate_upload_bytes(
+        self,
+        data: bytes,
+        *,
+        filename: str | None,
+        declared_format: str | None,
+    ) -> None:
+        """The two pre-parse refusals that need the bytes themselves.
+
+        Split out of :meth:`_validate_upload` because a RESUMING run
+        carries already-accepted identity and metadata: those are not
+        re-validated, but an oversize upload and an unrecognized format
+        are properties of the bytes and must still be refused here
+        rather than handed to a parser.
+        """
+        if self._max_bytes > 0 and len(data) > self._max_bytes:
+            raise IngestUploadTooLargeError(
+                f"upload of {len(data)} bytes exceeds the ingest cap of "
+                f"{self._max_bytes} bytes"
+            )
+        resolve_format(filename=filename, declared_format=declared_format)
+
     def _validate_upload(
         self,
         data: bytes,
@@ -690,6 +937,7 @@ class IngestEndpoint:
         company: str | None,
         period: str | None,
         doc_type: str | None,
+        content_identity: bool = False,
     ) -> tuple[str, str, str | None, str | None]:
         """Run every pre-parse named validation; resolve the locator.
 
@@ -701,19 +949,54 @@ class IngestEndpoint:
         (``document_id_missing``) and the doc_type vocabulary
         (``invalid_doc_type``).
 
-        Returns ``(fmt, doc_id, company, period)`` with the metadata
-        fields normalized (``None`` when blank) so the whole chain —
-        including the ``on_ingested`` row — shares one value.
+        With ``content_identity=True`` — the public upload contract and
+        the accepted durable run — the locator is NOT derived from
+        company/period: the identity is the scope-bound digest
+        (:func:`derive_document_identity`) over the injected trusted
+        corpus scope, an explicit caller ``document_id`` is refused, and
+        the explicit metadata fields are validated against the shared
+        bounds (``invalid_upload_metadata``). ``company`` / ``period``
+        stay optional display metadata.
+
+        The default leg is the trusted internal sync seam for
+        explicit-ID and replay callers: an explicit id is honored and a
+        company/period pair may derive one. It is not a public upload
+        mode.
+
+        Returns ``(fmt, doc_id, company, period)``. On the content leg
+        the metadata is normalized (``None`` when blank) so the whole
+        chain — including the ``on_ingested`` row — shares one value;
+        the trusted leg returns the pair as given (blank becomes
+        ``None``), and a caller that persists it normalizes explicitly.
         """
-        if self._max_bytes > 0 and len(data) > self._max_bytes:
-            raise IngestUploadTooLargeError(
-                f"upload of {len(data)} bytes exceeds the ingest cap of "
-                f"{self._max_bytes} bytes"
-            )
+        self._validate_upload_bytes(
+            data, filename=filename, declared_format=declared_format
+        )
 
         fmt = resolve_format(
             filename=filename, declared_format=declared_format
         )
+        if content_identity:
+            identity = derive_document_identity(
+                data, corpus_scope_id=self._corpus_scope_id, filename=filename
+            )
+            # The scope-bound id IS the locator. An explicit caller id
+            # cannot be honored here without breaking the identity
+            # contract, so it is refused rather than ignored.
+            if document_id is not None and document_id.strip():
+                raise IngestDocumentIdNotAllowedError(
+                    PUBLIC_DOCUMENT_ID_REFUSAL
+                )
+            company_value = resolve_explicit_metadata(
+                company, field="company"
+            )
+            period_value = resolve_explicit_metadata(period, field="period")
+            if doc_type is not None and doc_type not in DOC_TYPES:
+                raise IngestInvalidDocTypeError(
+                    f"unknown doc_type {doc_type!r}; the params table's "
+                    f"document types are: {', '.join(DOC_TYPES)}"
+                )
+            return fmt, identity.document_id, company_value, period_value
         doc_id = resolve_document_id(
             document_id=document_id,
             company=company,
@@ -738,6 +1021,10 @@ class IngestEndpoint:
         doc_type: str | None = None,
         previous_records: Callable[[], Sequence[PushRecord]] | None = None,
         journal: PushJournal | None = None,
+        content_identity: bool = False,
+        title: str | None = None,
+        accepted: AcceptedUpload | None = None,
+        emit: Callable[[IngestedDocument], None] | None = None,
     ) -> IngestEndpointResult:
         """Run the full chain on one upload (see module docstring).
 
@@ -749,20 +1036,70 @@ class IngestEndpoint:
         signal to retry. The pre-parse validations live in
         :meth:`_validate_upload`.
 
+        ``content_identity`` selects the content-derived locator of the
+        public upload contract. It is an INTERNAL leg, not a public
+        mode: trusted explicit-ID/replay callers leave it off and pass
+        the id they already own.
+
         ``journal`` overrides the endpoint's push journal for this run
         only — the durable worker hands in a per-document journal whose
         completed batches survive a restart, so a replay skips exactly
         the batches that already landed.
+
+        ``accepted`` is the durable accept's already-validated,
+        already-persisted metadata, handed back by
+        :meth:`run_durable`. When it is given, the identity and the
+        display metadata are taken from it verbatim instead of being
+        re-derived: re-deriving would be the reconstruction the audit
+        trail exists to prevent, and the run would publish whatever a
+        retry happened to resend instead of what was accepted.
+
+        ``emit`` REPLACES the ``on_ingested`` hook for this run. The
+        durable run needs the row as data — it has to persist the row
+        as redo input before the write, not merely observe it — so it
+        captures the document and publishes it in the ordered sequence
+        the audit contract fixes.
         """
-        fmt, doc_id, company, period = self._validate_upload(
-            data,
-            filename=filename,
-            declared_format=declared_format,
-            document_id=document_id,
-            company=company,
-            period=period,
-            doc_type=doc_type,
-        )
+        if accepted is not None:
+            # The accept already validated the identity and the metadata
+            # bounds and persisted them; re-deriving here would both
+            # duplicate that work and let a retry change what lands.
+            # Only the checks that need the BYTES still apply: the size
+            # cap and format recognition.
+            self._validate_upload_bytes(
+                data,
+                filename=filename,
+                declared_format=declared_format,
+            )
+            fmt = resolve_format(
+                filename=filename, declared_format=declared_format
+            )
+            doc_id = document_id or ""
+            company, period = accepted.company, accepted.period
+            resolved_title: str | None = accepted.title
+            # The accepted override is the one the run splits under;
+            # leaving the raw argument would silently re-classify a
+            # document the uploader already typed.
+            doc_type = accepted.doc_type or None
+            content_identity = True
+        else:
+            fmt, doc_id, company, period = self._validate_upload(
+                data,
+                filename=filename,
+                declared_format=declared_format,
+                document_id=document_id,
+                company=company,
+                period=period,
+                doc_type=doc_type,
+                content_identity=content_identity,
+            )
+            # The sanitized title is computed before any write so a
+            # non-string ``title`` is part of the same pre-parse refusal.
+            resolved_title = (
+                None
+                if not content_identity
+                else sanitize_upload_title(title, filename=filename)
+            )
 
         version = hashlib.sha256(data).hexdigest()
         parsed = parse_document(
@@ -797,18 +1134,20 @@ class IngestEndpoint:
             ),
         )
 
-        if self._on_ingested is not None:
-            self._on_ingested(
-                IngestedDocument(
-                    document_id=doc_id,
-                    company=company,
-                    period=period,
-                    version=version,
-                    page_count=len(parsed.units),
-                    fmt=fmt,
-                    doc_type=resolved_doc_type,
-                )
-            )
+        landed = _ingested_document(
+            doc_id=doc_id,
+            company=company,
+            period=period,
+            version=version,
+            page_count=len(parsed.units),
+            fmt=fmt,
+            doc_type=resolved_doc_type,
+            title=resolved_title,
+            content_identity=content_identity,
+        )
+        emit = emit if emit is not None else self._on_ingested
+        if emit is not None:
+            emit(landed)
 
         return IngestEndpointResult(
             document_id=doc_id,
@@ -880,16 +1219,27 @@ class IngestEndpoint:
         company: str | None = None,
         period: str | None = None,
         doc_type: str | None = None,
+        title: str | None = None,
     ) -> IngestSubmission:
         """Persist one upload durably and report the job that owns it.
 
-        This is the HTTP ingest contract: nothing is parsed, chunked or
-        pushed here. The upload is accepted only once all four
-        accept-time items are durable — the raw object, the metadata
-        pointer, the job record and the ``(document_id, version)``
-        identity — and every validation that needs no bytes (size, format,
-        identity, doc_type) is decided BEFORE the first write, so a
-        rejected upload leaves nothing behind.
+        The public contract has one flow: the file is the only required
+        input, the identity is derived from the trusted corpus scope and
+        the content digest, and ``company`` / ``period`` / ``doc_type`` /
+        ``title`` are optional display metadata. The public HTTP door
+        rejects a multipart ``document_id`` before calling this method.
+
+        ``document_id`` is the TRUSTED explicit-ID seam for internal
+        imports and replay: a non-blank value is honored as the identity
+        (never derived from company/period), and it is not a public
+        upload option. Nothing is parsed, chunked or pushed here.
+
+        The upload is accepted only once every accept-time item is
+        durable — the raw object, the metadata pointer, the job record,
+        the ``(document_id, version)`` identity and the accepted
+        metadata audit row — and every validation that needs no bytes
+        (size, format, identity, metadata, doc_type) is decided BEFORE
+        the first write, so a rejected upload leaves nothing behind.
 
         A submission of the bytes the document already points at idempotently
         joins that job. A different version while the job is in flight is the
@@ -906,15 +1256,31 @@ class IngestEndpoint:
         for this attempt is deleted again, and a delete that itself fails is
         the typed :class:`IngestObjectCleanupError`, never a swallow.
         """
-        fmt, doc_id, _company, _period = self._validate_upload(
+        trusted_id = (
+            document_id.strip()
+            if document_id is not None and document_id.strip()
+            else None
+        )
+        fmt, doc_id, resolved_company, resolved_period = self._validate_upload(
             data,
             filename=filename,
             declared_format=declared_format,
-            document_id=document_id,
+            document_id=trusted_id,
             company=company,
             period=period,
             doc_type=doc_type,
+            content_identity=trusted_id is None,
         )
+        if trusted_id is not None:
+            resolved_company = resolve_explicit_metadata(
+                company, field="company"
+            )
+            resolved_period = resolve_explicit_metadata(period, field="period")
+        # The title is resolved (and validated) BEFORE the first durable
+        # write: a control-bearing or over-long explicit title refuses
+        # here, and the value that lands in the accepted-metadata audit
+        # row is the very one the run will publish.
+        resolved_title = sanitize_upload_title(title, filename=filename)
         objects, pointers, states = self._durable_stores()
         version = hashlib.sha256(data).hexdigest()
         # The key is identity-derived, so re-submitting the same bytes can
@@ -952,6 +1318,15 @@ class IngestEndpoint:
             if not replacing:
                 self._raise_if_conflict(prior_job, doc_id)
 
+            # Every public accept persists its redo input: the run reads
+            # the accepted metadata back from the audit row instead of
+            # re-deriving it on retry.
+            accepted_metadata = AcceptedUpload(
+                title=resolved_title,
+                doc_type=doc_type or "",
+                company=resolved_company,
+                period=resolved_period,
+            )
             job = self._persist_accept(
                 objects,
                 pointers,
@@ -962,6 +1337,7 @@ class IngestEndpoint:
                 doc_id=doc_id,
                 version=version,
                 prior_pointer=prior_pointer,
+                accepted_metadata=accepted_metadata,
                 superseded_version=(
                     prior_pointer.sha256
                     if replacing and prior_pointer is not None
@@ -1057,11 +1433,12 @@ class IngestEndpoint:
         doc_id: str,
         version: str,
         prior_pointer: ObjectPointer | None,
+        accepted_metadata: AcceptedUpload,
         superseded_version: str | None = None,
     ) -> IngestJob:
-        """Write the object, pointer and job in order, compensating on failure.
+        """Write the object, pointer, job, accepted metadata and identity in order.
 
-        Nothing is reported accepted until all three are durable. A failure at
+        Nothing is reported accepted until all five are durable. A failure at
         any step deletes the object written this attempt (and restores the
         overwritten pointer), so a rejected upload leaves the document exactly
         as it was; a compensation that itself fails is the typed cleanup error.
@@ -1072,6 +1449,13 @@ class IngestEndpoint:
         undo here — a failure must still leave the superseded version's
         pointer and ``ready`` job untouched, and a retry converges because the
         invalidation request is idempotent.
+
+        ``accepted_metadata`` is persisted once the job record exists to
+        own it: it is the public upload's worker redo input, so a run
+        that started without it durable could publish a row it can no
+        longer rebuild, and a refusal here rejects the whole accept rather
+        than admitting a worker that cannot finish. The identity record
+        follows as the last accepting step.
         """
         try:
             pointer = objects.put(key, data, content_type=content_type)
@@ -1114,6 +1498,7 @@ class IngestEndpoint:
                 key=key,
                 document_id=doc_id,
                 restore=prior_pointer,
+                pointer_written=False,
                 cause=exc,
             )
             raise IngestDurableCommitError(
@@ -1123,7 +1508,7 @@ class IngestEndpoint:
             ) from exc
 
         try:
-            return self._record_job(
+            job = self._record_job(
                 states,
                 doc_id,
                 version=version,
@@ -1146,6 +1531,110 @@ class IngestEndpoint:
                 stage="job_record",
             ) from exc
 
+        try:
+            self._record_accepted_metadata(
+                states, doc_id, version=version, accepted=accepted_metadata
+            )
+        except Exception as exc:
+            # The object and pointer are already written; a rejected
+            # accept must not leave them, or the document would point at
+            # bytes no worker will ever publish.
+            self._discard_rejected_upload(
+                objects=objects,
+                pointers=pointers,
+                key=key,
+                document_id=doc_id,
+                restore=prior_pointer,
+                cause=exc,
+            )
+            raise IngestDurableCommitError(
+                f"the accepted metadata for {doc_id!r} could not be "
+                f"recorded durably ({type(exc).__name__})",
+                stage="accepted_metadata",
+            ) from exc
+        self._record_identity_or_fail(
+            IngestIdentityRecord(
+                objects=objects,
+                pointers=pointers,
+                key=key,
+                document_id=doc_id,
+                version=version,
+                prior_pointer=prior_pointer,
+            )
+        )
+        return job
+
+    def _record_identity(self, doc_id: str, *, version: str) -> None:
+        """Record the accepted document's place in the corpus identity mapping.
+
+        The mapping only ADDS resolution: it says which id a second
+        identifier resolves to, and never renames an identifier or a
+        document. A deployment that named no identity store records nothing
+        and the corpus behaves exactly as it did before the mapping existed.
+        """
+        store = (
+            self._identity_store
+            if self._identity_store is not None
+            else default_document_identity_store()
+        )
+        if store is None:
+            # EXIT: no identity store configured — nothing is recorded.
+            return
+        store.record_document(document_id=doc_id, version=version)
+
+    def _record_identity_or_fail(self, record: IngestIdentityRecord) -> None:
+        """Record the document's place in the identity mapping, or refuse the accept.
+
+        The document is already durable, so the mapping is the last thing
+        that can refuse the accept: a document accepted without its place in
+        the mapping would resolve under one id only, which is the hole this
+        mapping exists to close. Only a typed identity failure is a data
+        failure; a programming error must not be dressed up as one.
+        """
+        try:
+            self._record_identity(record.document_id, version=record.version)
+        except DocumentIdentityError as exc:
+            self._discard_rejected_upload(
+                objects=record.objects,
+                pointers=record.pointers,
+                key=record.key,
+                document_id=record.document_id,
+                restore=record.prior_pointer,
+                cause=exc,
+            )
+            raise IngestDurableCommitError(
+                f"the document identity for {record.document_id!r} could not be "
+                f"recorded ({type(exc).__name__})",
+                stage="identity_record",
+            ) from exc
+
+    def _record_accepted_metadata(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        version: str,
+        accepted: "AcceptedUpload",
+    ) -> None:
+        """Persist the accepted metadata so a restart can redo the publish.
+
+        The ``doc_type`` written here is the run's FINAL resolved type
+        when one is already known and an override otherwise; a run that
+        classifies the document itself records the classified type on its
+        own pending-publication row, which is the row recovery upserts.
+        """
+        states.append_audit(
+            document_id,
+            UPLOAD_METADATA_ACCEPTED,
+            accepted_metadata_payload(
+                version=version,
+                title=accepted.title,
+                doc_type=accepted.doc_type or UNKNOWN_DOC_TYPE,
+                company=accepted.company,
+                period=accepted.period,
+            ),
+        )
+
     def job_status(self, job_id: str) -> IngestJobStatus:
         """Report the persisted state of one ingest job.
 
@@ -1154,6 +1643,12 @@ class IngestEndpoint:
         a re-supplied upload, so a poller sees what was accepted. An unknown
         id stays the store's typed :class:`UnknownJobError` — never an empty
         success.
+
+        ``catalog_warning`` is DERIVED FROM THE AUDIT TRAIL on every poll,
+        never carried through thread-local state. That is what makes it
+        survive a process restart: a poller that reconnects sees the same
+        unresolved publication the crashed process left behind, and a
+        recorded success clears it.
         """
         states = self._state_store
         if states is None or self._metadata_store is None:
@@ -1175,7 +1670,27 @@ class IngestEndpoint:
             state=job.state,
             error_type=job.error_type,
             error_message=job.error_message,
+            catalog_warning=publication_warning(
+                states.list_audit(job.document_id)
+            ),
+            catalog_warning_count=self.catalog_warning_count(),
         )
+
+    def catalog_warning_count(self) -> int:
+        """How many DOCUMENTS have an unresolved publication.
+
+        A COUNT of documents, not of attempts: one document retried five
+        times is one warning, because the operator has one row to fix.
+        """
+        states = self._state_store
+        if states is None:
+            return 0
+        count = 0
+        for job in states.list_jobs():
+            if publication_warning(states.list_audit(job.document_id)) is None:
+                continue
+            count += 1
+        return count
 
     def run_durable(
         self,
@@ -1375,40 +1890,421 @@ class IngestEndpoint:
         journal: PushJournal | None,
         actor: str | None,
     ) -> DurableRunOutcome:
-        """Run the chain and land the finished run on the job.
+        """Run the chain, publish the row, and land the job on ``ready``.
 
-        The authoritative push identities are completed before the
-        ``cataloging -> ready`` edge carries the job to ``ready``.
+        The publication is a RECOVERABLE multi-step effect, so every step
+        is durable before the next depends on it: push, then
+        ``push_succeeded``, then ``catalog_publication_pending`` carrying
+        the complete physical row, then the idempotent upsert, then
+        ``catalog_publication_succeeded``, and only then the
+        ``cataloging -> ready`` edge.
+
+        The accepted metadata is read from the audit trail, never
+        re-derived. When the accept persisted no row — the trusted
+        explicit-ID replay leg, or a job accepted before this contract
+        existed — the run keeps its own resolution and recovers the pair
+        from the derived ``{TICKER}-{PERIOD}`` id it came from
+        (:func:`split_company_period_from_document_id`), the pre-T6
+        contract; the public upload always leaves a row, so nothing is
+        ever guessed for it.
+
+        A catalog failure is NOT a job failure. The typed failure is
+        appended, the job stays ``cataloging`` — pushed and searchable,
+        unpublished — and the run returns without claiming ``ready``.
+        Recovery redoes the idempotent upsert from the durable pending
+        row and records success, which is what clears the warning.
+
+        A restart whose ``push_succeeded`` is already durable is the
+        other recovery leg: the push completed once, so re-running the
+        chain would deliver it a SECOND time. That run skips the push
+        entirely and goes straight to the catalog upsert, from the
+        ``catalog_row`` the pending event recorded and with the identity
+        map that same event's push persisted
+        (:meth:`_recover_publication`). When that recorded row is not
+        there to be read, the durable proof still stands: the run
+        reports a typed failure and the job stays ``cataloging`` rather
+        than falling through to a chain that would push again.
         """
-        # The durable accept persisted the bytes and the identity but not
-        # company/period (no columns exist for them), so they are recovered
-        # from the id `resolve_document_id` derived from them. Without this
-        # the catalog hook receives company=None and every DERIVED-identity
-        # upload is pushed-but-invisible: searchable in the store, absent
-        # from fin's own catalog. The explicit-id branch of Decision 1.1 is
-        # not served here — see the splitter's KNOWN LIMIT.
-        recovered_company, recovered_period = (
+        recovered = self._recover_publication(
+            states,
+            document_id,
+            version=version,
+            actor=actor,
+        )
+        if recovered is not None:
+            return recovered
+        accepted = self._accepted_for_run(states, document_id)
+        captured: list[IngestedDocument] = []
+
+        def capture(document: IngestedDocument) -> None:
+            """Take the row the run produced; publication happens below.
+
+            The hook cannot run here: the row must be durable as redo
+            input BEFORE the catalog is touched, and that ordering is
+            exactly what this method owns.
+            """
+            captured.append(document)
+
+        # The legacy leg keeps its own resolution: the id is DERIVED from
+        # company+period, so splitting it back apart reads that encoding
+        # rather than guessing (baseline contract). The content-identity
+        # leg carries its accepted row instead and never splits. Split
+        # once: the two halves are one decode of one string.
+        legacy_company, legacy_period = (
             split_company_period_from_document_id(document_id)
+            if accepted is None
+            else (None, None)
         )
         result = self.ingest(
             data,
             declared_format=declared_format,
             document_id=document_id,
-            company=recovered_company,
-            period=recovered_period,
             journal=journal,
+            company=legacy_company,
+            period=legacy_period,
+            content_identity=accepted is not None,
+            title=accepted.title if accepted is not None else None,
+            accepted=accepted,
+            emit=capture,
         )
         identities = self._complete_content_identities(result)
-        try:
-            self._drive_to_ready(
-                states, document_id, identities, actor=actor
+        self._append_publication_event(
+            states,
+            document_id,
+            PUSH_SUCCEEDED,
+            push_succeeded_payload(version=version, content_identities=identities),
+            actor=actor,
+        )
+        # Enter ``cataloging`` BEFORE the publication: that is the state
+        # the job must hold while the row is being written, so a crash
+        # or a failed upsert leaves it there — the state recovery acts
+        # on. Transitioning afterwards would leave a failed publication
+        # looking like an interrupted extraction.
+        self._enter_cataloging(states, document_id, actor=actor)
+
+        row = captured[0] if captured else None
+        if row is None:
+            # No ``emit`` was configured, so this run has no catalog row
+            # to publish. The push identities are still durable; there is
+            # no publication to record and no warning to raise.
+            return self._land_ready(
+                states, document_id, version, identities, result, actor=actor
             )
+        return self._publish_and_land(
+            states,
+            document_id,
+            version=version,
+            row=row,
+            identities=identities,
+            result=result,
+            actor=actor,
+        )
+
+    def _recover_publication(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        version: str,
+        actor: str | None,
+    ) -> DurableRunOutcome | None:
+        """Retry ONLY the catalog upsert when the push is already durable.
+
+        The spec's redo boundary: ``push_succeeded`` is the durable proof
+        that every required envelope landed, so a run that finds one for
+        this version has nothing left to push. Re-running the chain would
+        deliver the same envelopes a second time — which the spec
+        explicitly refuses to call a recovery — so this run goes straight
+        to the upsert.
+
+        Everything it needs is read back from the audit trail, never
+        recomputed:
+
+        * the row to upsert is the ``catalog_row`` of the LATEST
+          ``catalog_publication_pending`` row. It is the row the
+          accepted run produced; rebuilding one from the id would be the
+          reconstruction the contract forbids, and would invent a
+          ``company`` / ``period`` the document does not have;
+        * the identity map on the ``cataloging -> ready`` edge is the one
+          the completing push persisted, read off the same
+          ``push_succeeded`` event. A pair is never invented here.
+
+        ``None`` means this is NOT that recovery: the push is not
+        durable, so there is no proof the envelopes landed and the
+        caller runs the full chain — the pre-T6 behaviour, and the only
+        correct answer when nothing is known.
+
+        A durable push with NO usable redo row is a third answer, and
+        deliberately not ``None``: the proof exists, so the chain must
+        not run again, and the row is gone, so nothing can be upserted.
+        Spec line 131 covers exactly this shape — "if reconciliation
+        cannot prove the push result, keep the job unready and return a
+        typed failure" — and the job must not be FAILED, because its
+        push already landed and ``failed`` would route the retry edge
+        back through a second delivery. The typed failure travels on the
+        outcome; the job stays ``cataloging``.
+        """
+        rows = states.list_audit(document_id)
+        if not read_push_succeeded(rows, version=version):
+            return None
+        pending = read_pending_publication(rows)
+        if pending is None or pending.version != version:
+            # The push IS durable but the redo input is not, so there is
+            # no catalog row to write. Refusing to invent one is right,
+            # but falling through to the full chain is not: the durable
+            # ``push_succeeded`` above already proved every envelope
+            # landed, and running the chain again would deliver them a
+            # SECOND time — spec line 131 says a recovery retries only
+            # the catalog upsert, never a second push. The row is not
+            # recoverable by re-pushing, so the run reports the typed
+            # failure line 131 asks for and leaves the job where the
+            # next reconciliation can find it.
+            return self._hold_cataloging(
+                states,
+                document_id,
+                version=version,
+                cause=IngestDurableCommitError(
+                    f"the catalog publication for {document_id!r} is "
+                    f"unrecoverable: push_succeeded is durable but no "
+                    f"catalog_publication_pending row exists for version "
+                    f"{version!r}, so there is no recorded catalog_row to "
+                    f"upsert",
+                    stage="publication_audit",
+                ),
+                step="recover_publication",
+            )
+        identities = read_push_identities(rows, version=version)
+        # The job may still be before the publication edge (a crash
+        # between the push record and the pending row's caller); the
+        # publication owns entering cataloging, so make sure the state
+        # recovery acts on is the one that holds the pending row.
+        self._enter_cataloging(states, document_id, actor=actor)
+        return self._publish_and_land(
+            states,
+            document_id,
+            version=version,
+            row=_ingested_document(
+                doc_id=document_id,
+                company=_row_optional(pending.catalog_row, "company"),
+                period=_row_optional(pending.catalog_row, "period"),
+                version=str(pending.catalog_row["version"]),
+                page_count=int(pending.catalog_row["page_count"]),
+                fmt="",
+                doc_type=str(pending.catalog_row["doc_type"]),
+                title=_row_optional(pending.catalog_row, "title"),
+                content_identity=True,
+            ),
+            identities=identities,
+            result=None,
+            actor=actor,
+        )
+
+    def _accepted_for_run(
+        self, states: IngestStateStore, document_id: str
+    ) -> AcceptedUpload | None:
+        """The accepted metadata for this run, from the audit trail only.
+
+        The recorded ``doc_type`` is an OVERRIDE only when the uploader
+        named one. An accept cannot classify — that needs the parse —
+        so it records ``unknown`` for "no override", and feeding that
+        back as an override would pin every document to ``unknown``
+        instead of classifying it. The run's own classified type reaches
+        the catalog on the pending-publication row, which is the row
+        recovery upserts.
+
+        ``None`` means the accept predates this contract and persisted
+        nothing — the run then keeps its own resolution rather than
+        refusing, because the pushed data still deserves a catalog row.
+        """
+        accepted = read_accepted_metadata(states.list_audit(document_id))
+        if accepted is None:
+            return None
+        return AcceptedUpload(
+            title=accepted.title,
+            doc_type=(
+                "" if accepted.doc_type == UNKNOWN_DOC_TYPE else accepted.doc_type
+            ),
+            company=accepted.company,
+            period=accepted.period,
+        )
+
+    def _publish_and_land(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        version: str,
+        row: IngestedDocument,
+        identities: Mapping[str, str],
+        result: IngestEndpointResult | None,
+        actor: str | None,
+    ) -> DurableRunOutcome:
+        """Persist the pending row, upsert, record the terminal event.
+
+        ``result`` is ``None`` on a recovery run, which has no live chain
+        to report — its push is already durable — so the outcome carries
+        no in-memory result rather than a fabricated one.
+
+        The attempt number is the newest one already recorded plus one,
+        so a retry names the attempt it is rather than reusing ``1`` and
+        a poller reading ``attempts`` sees the real generation.
+        """
+        previous = read_pending_publication(states.list_audit(document_id))
+        attempt = previous.attempt + 1 if previous is not None else 1
+        catalog_row = _physical_catalog_row(row)
+        self._append_publication_event(
+            states,
+            document_id,
+            CATALOG_PUBLICATION_PENDING,
+            pending_payload(
+                version=version,
+                document_id=document_id,
+                attempt=attempt,
+                catalog_row=catalog_row,
+            ),
+            actor=actor,
+        )
+        try:
+            self._upsert_catalog_row(catalog_row)
+        except Exception as exc:
+            return self._record_publication_failure(
+                states,
+                document_id,
+                version=version,
+                attempt=attempt,
+                cause=exc,
+                actor=actor,
+            )
+        self._append_publication_event(
+            states,
+            document_id,
+            CATALOG_PUBLICATION_SUCCEEDED,
+            succeeded_payload(
+                version=version, document_id=document_id, attempt=attempt
+            ),
+            actor=actor,
+        )
+        return self._land_ready(
+            states, document_id, version, identities, result, actor=actor
+        )
+
+    def _upsert_catalog_row(self, catalog_row: Mapping[str, Any]) -> None:
+        """Write one physical row through the endpoint's catalog hook.
+
+        The hook IS the write: the host wires ``on_ingested`` to the
+        catalog table, so a run without one has no catalog to write to
+        and reports no publication rather than inventing one.
+        """
+        if self._on_ingested is None:
+            return
+        self._on_ingested(
+            IngestedDocument(
+                document_id=str(catalog_row["document_id"]),
+                company=_row_optional(catalog_row, "company"),
+                period=_row_optional(catalog_row, "period"),
+                version=str(catalog_row["version"]),
+                page_count=int(catalog_row["page_count"]),
+                fmt="",
+                doc_type=str(catalog_row["doc_type"]),
+                title=str(catalog_row["title"]),
+                source_sha256=_row_optional(catalog_row, "source_sha256"),
+            )
+        )
+
+    def _record_publication_failure(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        version: str,
+        attempt: int,
+        cause: BaseException,
+        actor: str | None,
+    ) -> DurableRunOutcome:
+        """Record a typed publication failure; keep the job in cataloging.
+
+        The classification is what makes the warning actionable without
+        leaking anything: a row that fails the row contract, a table
+        that will not read, and a filesystem that will not cooperate are
+        three different operator problems. An exception that is none of
+        those is a bug and propagates through the existing typed job
+        failure path instead of being filed as a catalog warning.
+        """
+        failure_code, failure_stage = classify_catalog_failure(cause)
+        self._append_publication_event(
+            states,
+            document_id,
+            CATALOG_PUBLICATION_FAILED,
+            failed_payload(
+                version=version,
+                document_id=document_id,
+                attempt=attempt,
+                failure_code=failure_code,
+                failure_stage=failure_stage,
+            ),
+            actor=actor,
+        )
+        logger.warning(
+            "ingest: catalog publication failed for %s (%s/%s); the job "
+            "stays cataloging and recovery retries the upsert",
+            document_id,
+            failure_code,
+            failure_stage,
+        )
+        # The job keeps ``cataloging``: the push stands, the row does not.
+        # Reporting a job failure here would be a lie about the pipeline
+        # and would let a retry re-push what already landed.
+        return DurableRunOutcome(
+            document_id=document_id,
+            version=version,
+            state=IngestState.CATALOGING,
+            ran=True,
+            busy=False,
+        )
+
+    def _append_publication_event(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        action: str,
+        metadata: Mapping[str, Any],
+        *,
+        actor: str | None,
+    ) -> None:
+        """Append one publication event, or refuse the step that needs it.
+
+        A pending row that did not land means the redo input is not
+        durable, so the upsert must not run: raising here is what stops
+        a write no restart could repeat.
+        """
+        try:
+            states.append_audit(document_id, action, metadata, actor=actor)
+        except Exception as exc:
+            raise IngestDurableCommitError(
+                f"the publication event {action!r} for {document_id!r} could "
+                f"not be recorded durably ({type(exc).__name__})",
+                stage="publication_audit",
+            ) from exc
+
+    def _land_ready(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        version: str,
+        identities: Mapping[str, str],
+        result: IngestEndpointResult | None,
+        *,
+        actor: str | None,
+    ) -> DurableRunOutcome:
+        """Walk to ``ready`` once the publication is durable.
+
+        A concurrent holder that landed first wins the CAS; this run's
+        re-pushed chain was made harmless by the push's idempotency, and
+        the busy join is the contract's typed outcome, not a failure.
+        """
+        try:
+            self._drive_to_ready(states, document_id, identities, actor=actor)
         except IngestBusyError:
-            # A concurrent holder landed the job while this run was
-            # in flight: its re-ran chain was made harmless by the
-            # push's idempotency, and the landing edge is the store's
-            # CAS that says which run owns the ``ready`` generation.
-            # The join is the contract's typed outcome, not a failure.
             return self._busy_outcome(states, document_id, version)
         return DurableRunOutcome(
             document_id=document_id,
@@ -1437,9 +2333,37 @@ class IngestEndpoint:
         ``fail_step`` always raises its own typed step error (the
         store's return type is ``NoReturn``); the failed outcome is
         built from that error.
+
+        ONE exception family is not a job failure, and only in the state
+        that makes it one. A TERMINAL publication event that could not
+        be appended is the spec's case: the job is already
+        ``cataloging`` and its pending row is already durable, so the
+        run is recoverable and recovery is exactly the redo those rows
+        were written for. Moving the job to ``failed`` there would send
+        the retry edge back through the fetch and the push of work that
+        already landed. So the job stays where it is and the typed audit
+        failure travels in the outcome instead of on the job.
+
+        The scoping is the pair, not the exception alone: an append
+        failure BEFORE the job owns a durable pending row (the
+        ``push_succeeded`` event, and the pending row itself) has no
+        redo input, so it is a genuine failure and lands ``failed`` as
+        before — as does every parse, push and hook failure.
         """
-        if states.get_job(document_id).state is IngestState.READY:
+        job = states.get_job(document_id)
+        if job.state is IngestState.READY:
             raise cause
+        if (
+            job.state is IngestState.CATALOGING
+            and _is_publication_audit_failure(cause)
+        ):
+            return self._hold_cataloging(
+                states,
+                document_id,
+                version=version,
+                cause=cause,
+                step=step,
+            )
         try:
             states.fail_step(
                 document_id, step=step, cause=cause, actor=actor
@@ -1453,6 +2377,46 @@ class IngestEndpoint:
                 busy=False,
                 error=step_error,
             )
+
+    def _hold_cataloging(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        version: str,
+        cause: BaseException,
+        step: str,
+    ) -> DurableRunOutcome:
+        """Report a recoverable publication failure as ``cataloging``.
+
+        Nothing is written to the job: the pending row already carries
+        the redo input, so the machine's own state — the state the
+        warning is derived from — is the whole record of the failure.
+        Writing a ``failed`` here would be the one thing that cannot be
+        recovered, because it discards the state recovery acts on.
+
+        The typed audit failure still travels, on the outcome's
+        ``error``, in the same :class:`IngestStepError` shape the job's
+        ``error_type`` / ``error_message`` would have carried had the
+        failure been allowed to land. So a caller watching the outcome
+        sees the refusal it needs to see; only the job's own claim that
+        the whole run failed is withheld.
+        """
+        logger.warning(
+            "ingest: the publication audit for %s could not be recorded "
+            "(%s); the job stays cataloging and recovery redoes the "
+            "upsert from the durable pending row",
+            document_id,
+            type(cause).__name__,
+        )
+        return DurableRunOutcome(
+            document_id=document_id,
+            version=version,
+            state=IngestState.CATALOGING,
+            ran=True,
+            busy=False,
+            error=IngestStepError(document_id, step, cause),
+        )
 
     def _complete_content_identities(
         self, result: IngestEndpointResult
@@ -1495,17 +2459,32 @@ class IngestEndpoint:
         so the machine's ``extracting -> cataloging`` skip edge is the
         honest path and no state is invented.
         """
-        current = states.get_job(document_id).state
-        if current in (IngestState.EXTRACTING, IngestState.OCR):
-            states.transition(
-                document_id, IngestState.CATALOGING, actor=actor
-            )
+        self._enter_cataloging(states, document_id, actor=actor)
         states.transition(
             document_id,
             IngestState.READY,
             actor=actor,
             metadata={"content_identities": dict(identities)},
         )
+
+    def _enter_cataloging(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        actor: str | None,
+    ) -> None:
+        """Move an extracting (or OCR) job into ``cataloging``, once.
+
+        A job already past the edge is left alone: the publication path
+        enters ``cataloging`` before writing the row, so landing must
+        not try to re-enter a state the job already holds.
+        """
+        current = states.get_job(document_id).state
+        if current in (IngestState.EXTRACTING, IngestState.OCR):
+            states.transition(
+                document_id, IngestState.CATALOGING, actor=actor
+            )
 
     def _invalidate_replaced(
         self, document_id: str, *, version: str
@@ -1591,13 +2570,19 @@ class IngestEndpoint:
         key: str,
         document_id: str = "",
         restore: ObjectPointer | None = None,
+        pointer_written: bool = True,
         cause: BaseException | None = None,
     ) -> None:
         """Undo the writes a rejected accept already made; never silently.
 
-        The pointer store has no delete, so a replacement that fails after
-        its pointer overwrite puts the previous pointer back — otherwise the
-        document would keep pointing at bytes that were never accepted.
+        A replacement that fails after its pointer overwrite puts the
+        previous pointer back — otherwise the document would keep pointing
+        at bytes that were never accepted. A first accept has no previous
+        pointer, so the row a successful pointer write left is deleted
+        instead; the delete is idempotent and scoped to the object key this
+        attempt wrote, so a winner's row that names a different object is
+        left alone (a same-bytes winner shares the key and its object). A
+        failed pointer write leaves no confirmed row, so it skips this step.
         """
         try:
             objects.delete(key)
@@ -1620,14 +2605,16 @@ class IngestEndpoint:
                 ),
                 key=key,
             ) from chained
-        if restore is not None:
+        if pointer_written:
             try:
-                pointers.put_pointer(document_id, restore)
+                if restore is not None:
+                    pointers.put_pointer(document_id, restore)
+                elif document_id:
+                    pointers.delete_pointer(document_id, object_key=key)
             except Exception as exc:
                 raise IngestObjectCleanupError(
-                    f"the pointer of {document_id!r} still names the deleted "
-                    "object of a rejected upload: the prior pointer could not "
-                    "be restored",
+                    f"the pointer of {document_id!r} still names the deleted object of a "
+                    "rejected upload: the pointer could not be restored or deleted",
                     key=key,
                 ) from exc
 
@@ -1654,11 +2641,27 @@ class IngestEndpoint:
             return None
 
 
+def _is_publication_audit_failure(cause: BaseException) -> bool:
+    """Whether this run died appending a publication audit event.
+
+    The durable-stage vocabulary is the discriminator, so the check
+    names no action and cannot drift from the set
+    :meth:`IngestEndpoint._append_publication_event` actually raises it
+    for.
+    """
+    return (
+        isinstance(cause, IngestDurableCommitError)
+        and cause.stage == "publication_audit"
+    )
+
+
 __all__ = [
     "MAX_INGEST_BYTES",
+    "PUBLIC_DOCUMENT_ID_REFUSAL",
     "DurableRunOutcome",
     "IngestConcurrentRunError",
     "IngestDocumentIdMissingError",
+    "IngestDocumentIdNotAllowedError",
     "IngestDurableCommitError",
     "IngestDurableStage",
     "IngestEndpoint",
@@ -1666,6 +2669,7 @@ __all__ = [
     "IngestEndpointResult",
     "IngestFormatUnspecifiedError",
     "IngestInvalidDocTypeError",
+    "IngestInvalidUploadMetadataError",
     "IngestJobStatus",
     "IngestObjectCleanupError",
     "IngestSubmission",

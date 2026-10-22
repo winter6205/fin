@@ -19,7 +19,7 @@ from typing import Iterator
 
 import pytest
 
-from fin.host.attachment_job_store import (
+from fin.host.attachment.attachment_job_store import (
     PostgresThreadAttachmentJobStore,
     ThreadAttachmentJob,
 )

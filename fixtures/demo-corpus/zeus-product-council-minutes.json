@@ -1,0 +1,20 @@
+{
+  "source_ref": "zeus-product-council-minutes",
+  "title": "ZEUS Product Council Minutes",
+  "content": "ZEUS Product Council Minutes · Page 1\nSection 1: Decision record\nThe Product Council met on 2024-08-06 at 14:00 UTC, chaired by Ravi Chandrasekhar. Four of five members attended. The Council approved the HELIOS export redesign for a staged release beginning 2024-09-02, with a 10-customer pilot and a rollback check after 48 hours. Nia Okafor owns the release checklist. The Council deferred the mobile dashboard proposal to the next meeting pending accessibility review. The next meeting is scheduled for 2024-09-03.",
+  "chunks": [
+    {
+      "content": "ZEUS Product Council Minutes · Page 1\nSection 1: Decision record\nThe Product Council met on 2024-08-06 at 14:00 UTC, chaired by Ravi Chandrasekhar. Four of five members attended. The Council approved the HELIOS export redesign for a staged release beginning 2024-09-02, with a 10-customer pilot and a rollback check after 48 hours. Nia Okafor owns the release checklist. The Council deferred the mobile dashboard proposal to the next meeting pending accessibility review. The next meeting is scheduled for 2024-09-03.",
+      "index": 0
+    }
+  ],
+  "metadata": {
+    "document_type": "meeting_minutes",
+    "page_count": 1,
+    "company": "ZEUS",
+    "form": "8-K",
+    "period": "2024-08-06",
+    "filing_date": "2024-08-06"
+  },
+  "valid_from": "2024-08-06T00:00:00Z"
+}

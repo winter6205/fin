@@ -45,6 +45,12 @@ from fin.retrieve.mcp_adapter import (
     MCPRetrieveAdapter,
     RetrieveUnavailableError,
 )
+from fin.retrieve.port import (
+    DATABASE_ROWS_KEY,
+    STRUCTURED_RESULT_KEY,
+    DocumentScopeEntry,
+    UNSUPPORTED_SOURCE_SCOPE_CODE,
+)
 from fin.retrieve.source_read import (
     INVALID_LOCATOR,
     INVALID_POSITION,
@@ -842,7 +848,7 @@ def test_mapper_drop_when_map_empty_returns_empty_chunks() -> None:
         locator_map={},
     )
     result = adapter.retrieve("foo")
-    assert result == {"chunks": []}
+    assert result == {"chunks": [], "distribution": "zero"}
 
 
 # ----- boundary 4: exception (MCP down) -----
@@ -920,7 +926,10 @@ def test_overlapping_retrieve_calls_independent() -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(lambda _: _go(), range(8)))
 
-    expected = {"chunks": [_chunk("hit", "DOC-2023Q1", score=1.0)]}
+    expected = {
+        "chunks": [_chunk("hit", "DOC-2023Q1", score=1.0)],
+        "distribution": "hit",
+    }
     for i, r in enumerate(results):
         assert r == expected, (
             f"overlapping call #{i} returned {r!r}, expected {expected!r}"
@@ -956,7 +965,10 @@ def test_overlapping_retrieve_calls_with_mixed_outcomes() -> None:
         )
 
     assert {"error": "retrieve_unavailable"} in results
-    assert {"chunks": [_chunk("h", "DOC-2023Q1")]} in results
+    assert {
+        "chunks": [_chunk("h", "DOC-2023Q1")],
+        "distribution": "hit",
+    } in results
 
 
 # ----- typed exception -----
@@ -1040,7 +1052,33 @@ def test_supplied_filters_are_forwarded_in_the_request() -> None:
     adapter.retrieve("revenue", cik="0000320193", form="10-Q")
     arguments = adapter.payloads[0]["params"]["arguments"]
     assert "filter" not in arguments
-    assert arguments["filters"] == {"cik": "0000320193", "form": "10-Q"}
+    assert arguments["filters"] == {
+        "metadata.cik": "0000320193",
+        "metadata.form": "10-Q",
+    }
+
+
+def test_legacy_financial_filters_translate_and_conjoin_with_generic_metadata() -> None:
+    adapter = _CapturingAdapter()
+    adapter.retrieve(
+        "revenue",
+        cik="0000320193",
+        form="10-Q",
+        ticker="AAPL",
+        filing_date="2023-09-30",
+        filters={"company": "Apple Inc.", "period": "2023 Q3"},
+    )
+
+    arguments = adapter.payloads[0]["params"]["arguments"]
+
+    assert arguments["filters"] == {
+        "metadata.cik": "0000320193",
+        "metadata.form": "10-Q",
+        "metadata.ticker": "AAPL",
+        "metadata.filing_date": "2023-09-30",
+        "metadata.company": "Apple Inc.",
+        "metadata.period": "2023 Q3",
+    }
 
 
 def test_retrieve_payload_uses_limit_not_top_k() -> None:
@@ -1081,11 +1119,110 @@ def test_retrieve_payload_filters_is_plural_record() -> None:
     assert "document_id" not in arguments, arguments
     assert arguments.get("filters") == {
         "document_id": "DOC-2023Q1",
-        "cik": "0000320193",
-        "form": "10-Q",
-        "ticker": "AAPL",
-        "filing_date": "2023-09-30",
+        "metadata.cik": "0000320193",
+        "metadata.form": "10-Q",
+        "metadata.ticker": "AAPL",
+        "metadata.filing_date": "2023-09-30",
     }
+
+
+def test_trusted_document_scope_is_top_level_and_intersects_explicit_id() -> None:
+    adapter = _CapturingAdapter()
+    adapter.retrieve(
+        "revenue",
+        document_id="DOC-2023Q1",
+        document_scope=(
+            DocumentScopeEntry("DOC-2023Q1", "v-" + "a" * 60),
+            DocumentScopeEntry("DOC-2023Q2", "v-" + "b" * 60),
+        ),
+    )
+
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert arguments["document_scope"] == [
+        {"document_id": "DOC-2023Q1", "version": "v-" + "a" * 60}
+    ]
+    assert arguments["filters"]["document_id"] == "DOC-2023Q1"
+
+
+def test_blank_document_id_with_trusted_scope_keeps_the_miss_shape() -> None:
+    adapter = _CapturingAdapter()
+
+    result = adapter.retrieve(
+        "revenue",
+        document_id="  ",
+        document_scope=(DocumentScopeEntry("DOC-2023Q1", "v-" + "a" * 60),),
+    )
+
+    assert result == {"chunks": []}
+    assert adapter.payloads == []
+
+
+@pytest.mark.parametrize(
+    "sibling",
+    [
+        pytest.param(
+            (DATABASE_ROWS_KEY, {"rows": [{"amount": 123}]}),
+            id="database-facts",
+        ),
+        pytest.param(
+            (STRUCTURED_RESULT_KEY, {"rows": [{"name": "Apple Inc."}]}),
+            id="structured-report",
+        ),
+    ],
+)
+def test_trusted_document_scope_refuses_unscoped_fact_siblings(
+    sibling: tuple[str, dict[str, object]],
+) -> None:
+    adapter = _CapturingAdapter()
+    key, value = sibling
+    adapter._scripted_response = {"result": {"chunks": [], key: value}}
+
+    result = adapter.retrieve(
+        "revenue",
+        document_scope=(DocumentScopeEntry("DOC-2023Q1", "v-" + "a" * 60),),
+    )
+
+    assert result == {"error": UNSUPPORTED_SOURCE_SCOPE_CODE}
+    assert adapter.payloads[0]["params"]["arguments"]["document_scope"] == [
+        {"document_id": "DOC-2023Q1", "version": "v-" + "a" * 60}
+    ]
+
+
+@pytest.mark.parametrize(
+    "document_scope",
+    [
+        pytest.param((), id="empty"),
+        pytest.param(
+            (DocumentScopeEntry("DOC-2023Q1", "v-" + "a" * 257),),
+            id="version-overflow",
+        ),
+        pytest.param(
+            (DocumentScopeEntry("DOC-2023Q1\n", "v-" + "a" * 60),),
+            id="control-character",
+        ),
+    ],
+)
+def test_invalid_document_scope_is_named_before_transport(document_scope) -> None:
+    adapter = _CapturingAdapter()
+
+    result = adapter.retrieve("revenue", document_scope=document_scope)
+
+    assert result == {"error": UNSUPPORTED_SOURCE_SCOPE_CODE}
+    assert adapter.payloads == []
+
+
+@pytest.mark.parametrize("search_mode", ["global", "sql"])
+def test_global_and_sql_document_scope_refuse_before_transport(search_mode: str) -> None:
+    adapter = _CapturingAdapter()
+
+    result = adapter.retrieve(
+        "revenue",
+        search_mode=search_mode,
+        document_scope=(DocumentScopeEntry("DOC-2023Q1", "v-" + "a" * 60),),
+    )
+
+    assert result == {"error": UNSUPPORTED_SOURCE_SCOPE_CODE}
+    assert adapter.payloads == []
 
 
 # ----- search_mode forwarding + named 档 exits (search-mode-retrieve T2) -----
@@ -1156,7 +1293,7 @@ _SQL_WINDOW = {"sql_window_start": "2026-01-01", "sql_window_end": "2026-12-31"}
 
 
 def test_sql_is_an_open_tier_forwarded_to_the_wire() -> None:
-    """A2 (the tracked change T7) retired the routing-time sql refusal: a ledger
+    """A2 (T7) retired the routing-time sql refusal: a ledger
     request with a bindable window now RUNS — it reaches the transport
     and carries its 档 token beside the bound window pair. This is the
     old 「档未开」pin turned into its acceptance mirror (spec §4: opening a
@@ -1199,7 +1336,10 @@ def test_global_is_an_open_tier_forwarded_to_the_wire() -> None:
     token to the server (it reaches the transport) rather than answering
     「档未开」without a call."""
     adapter = _CapturingAdapter()
-    assert adapter.retrieve("revenue", search_mode="global") == {"chunks": []}
+    assert adapter.retrieve("revenue", search_mode="global") == {
+        "chunks": [],
+        "distribution": "zero",
+    }
     assert len(adapter.payloads) == 1
     assert (
         adapter.payloads[0]["params"]["arguments"]["filters"]
@@ -1274,7 +1414,10 @@ def test_an_open_tier_with_an_empty_wire_answer_is_the_legal_miss() -> None:
     lexical, nothing there" from a named failure that never spent a
     round trip (an out-of-set token, or an unbindable sql window)."""
     adapter = _CapturingAdapter()
-    assert adapter.retrieve("foo", search_mode="lexical") == {"chunks": []}
+    assert adapter.retrieve("foo", search_mode="lexical") == {
+        "chunks": [],
+        "distribution": "zero",
+    }
     assert len(adapter.payloads) == 1
     assert (
         adapter.payloads[0]["params"]["arguments"]["filters"]
@@ -1602,7 +1745,10 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         results = list(ex.map(_go, range(12)))
 
-    expected_chunks = {"chunks": [_chunk("hit", "DOC-2023Q1", score=1.0)]}
+    expected_chunks = {
+        "chunks": [_chunk("hit", "DOC-2023Q1", score=1.0)],
+        "distribution": "hit",
+    }
     modes = [("lexical", "graph", "global")[i % 3] for i in range(12)]
     for mode, result in zip(modes, results):
         assert result == expected_chunks, mode
@@ -1633,7 +1779,7 @@ def test_default_locator_map_is_empty() -> None:
         locator_map=None,
     )
     result = adapter.retrieve("foo")
-    assert result == {"chunks": []}
+    assert result == {"chunks": [], "distribution": "zero"}
 
 
 # ----- empty-hit envelope: a miss, never an error, never a raise -----
@@ -1671,7 +1817,7 @@ def test_empty_hit_envelope_maps_to_empty_chunks(envelope: dict) -> None:
         scripted_response=envelope,
         locator_map={"id-A": _loc("DOC-2023Q1")},
     )
-    assert adapter.retrieve("foo") == {"chunks": []}
+    assert adapter.retrieve("foo") == {"chunks": [], "distribution": "zero"}
 
 
 def test_content_block_degraded_empty_envelope_is_named_failure() -> None:
@@ -1686,7 +1832,7 @@ def test_content_block_degraded_empty_envelope_is_named_failure() -> None:
     adapter = _ScriptedAdapter(scripted_response=envelope)
 
     assert adapter.retrieve("foo") == {
-        "error": "retrieve_degraded_failure",
+        "error": "retrieve_degraded",
         "degraded": True,
         "degraded_reasons": ["vector:unavailable"],
     }
@@ -1696,7 +1842,10 @@ def test_empty_hit_envelope_does_not_raise_on_the_async_path() -> None:
     """The async seam agrees with the sync one: an empty hit list
     resolves, it does not raise ``RetrieveUnavailableError``."""
     adapter = _ScriptedAdapter(scripted_response={"result": {"hits": []}})
-    assert asyncio.run(adapter.aretrieve("foo")) == {"chunks": []}
+    assert asyncio.run(adapter.aretrieve("foo")) == {
+        "chunks": [],
+        "distribution": "zero",
+    }
 
 
 # ----- no configured transport: typed EXIT, not a crash -----
@@ -1779,7 +1928,8 @@ def test_populated_envelope_variants_map_to_chunks(envelope: dict) -> None:
         locator_map={"id-A": _loc("DOC-2023Q1")},
     )
     assert adapter.retrieve("foo") == {
-        "chunks": [_chunk("hit", "DOC-2023Q1", score=2.5)]
+        "chunks": [_chunk("hit", "DOC-2023Q1", score=2.5)],
+        "distribution": "hit",
     }
 
 
@@ -1974,7 +2124,10 @@ def test_response_without_applied_arguments_stays_undegraded() -> None:
         limit=5,
     )
 
-    assert result == {"chunks": [_chunk("hit", "DOC-2023Q1")]}
+    assert result == {
+        "chunks": [_chunk("hit", "DOC-2023Q1")],
+        "distribution": "hit",
+    }
 
 
 def test_all_adapter_fields_applied_stays_undegraded(
@@ -2014,7 +2167,10 @@ def test_all_adapter_fields_applied_stays_undegraded(
             limit=5,
         )
 
-    assert result == {"chunks": [_chunk("hit", "DOC-2023Q1")]}
+    assert result == {
+        "chunks": [_chunk("hit", "DOC-2023Q1")],
+        "distribution": "hit",
+    }
     assert [
         record
         for record in caplog.records

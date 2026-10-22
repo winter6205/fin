@@ -20,9 +20,10 @@ the environment for test / tooling entry points.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Literal
+
+from fin.host.fin_home import profile_path
 
 # Same filename on both layers per spec SC13.
 GLOBAL_FILENAME = "user.md"
@@ -141,17 +142,19 @@ class UserProfileStore:
         test convenience — the PRODUCT path no longer routes through this
         helper: Wave A / ADR 0049 builds the store directly in
         ``compile_graph`` with both layers at ``$HOME/.fin/user.md``).
-        ``home`` defaults to ``$HOME``; tests pass an explicit
-        ``tmp_path`` to keep the real home directory out of the suite.
+        ``home`` when passed keeps ``<home>/.fin/user.md``. Omitted, the
+        global file is ``<FIN_HOME>/user.md`` so a worktree does not read
+        the operator home.
         """
-        resolved_home = Path(home) if home is not None else Path(
-            os.environ.get("HOME") or str(Path.home())
-        )
         resolved_workspace = (
             Path(workspace_root) if workspace_root is not None else Path.cwd()
         )
+        if home is not None:
+            global_path = Path(home) / _LAYER_DIR / GLOBAL_FILENAME
+        else:
+            global_path = profile_path()
         return cls(
-            global_path=resolved_home / _LAYER_DIR / GLOBAL_FILENAME,
+            global_path=global_path,
             workspace_path=resolved_workspace / _LAYER_DIR / WORKSPACE_FILENAME,
         )
 

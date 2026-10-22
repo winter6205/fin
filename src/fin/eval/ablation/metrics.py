@@ -12,7 +12,7 @@ latency label is one §B1 entry and three fields);
 and refuses to agree when the two sides differ.
 
 引用门通过率 is produced **by fin, on the same run results** — the gate
-(``fin.host.citation_gate.verify_citations``, unchanged by this ticket)
+(``fin.host.grounded.citation_gate.verify_citations``, unchanged by this ticket)
 runs over the chunks this configuration actually retrieved. It is not a
 second retrieval and not a number the retrieval service hands over.
 """
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from fin.corpus.extracted import Locator
-from fin.host.citation_gate import DoneResult, EvidenceItem, verify_citations
+from fin.host.grounded.citation_gate import DoneResult, EvidenceItem, verify_citations
 from fin.retrieve.capabilities import published_spec_path
 
 
@@ -336,7 +336,7 @@ METRIC_DEFINITIONS: dict[str, str] = {
     "mrr": "mean reciprocal rank of the first relevant hit",
     "citation_gate_pass_rate": (
         "share of queries whose citable answer passes "
-        "fin.host.citation_gate.verify_citations over THIS run's retrieved "
+        "fin.host.grounded.citation_gate.verify_citations over THIS run's retrieved "
         "chunks (produced by fin, ADR 0008 / 0021)"
     ),
     "graph_arm_hit_rate": (

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from fin.host.structured_evidence_identity import (
+from fin.host.evidence.structured_evidence_identity import (
     FIN_EVIDENCE_IDENTITY_ACTOR_ID_ENV,
     FIN_EVIDENCE_IDENTITY_AUTH_REVISION_ENV,
     FIN_EVIDENCE_IDENTITY_CONSUMER_ID_ENV,
@@ -238,7 +238,7 @@ def test_resolver_hands_out_the_identity_only_inside_its_deadline() -> None:
     """A host that outlives its own deadline refuses the read, not the caller.
 
     ``None`` is what the registry refuses by name
-    (:class:`~fin.host.evidence_session_registry.EvidenceBindingRefusal`), so
+    (:class:`~fin.host.evidence.evidence_session_registry.EvidenceBindingRefusal`), so
     this is a refusal rather than a read under some other identity.
     """
 

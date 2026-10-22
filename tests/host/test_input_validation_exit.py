@@ -106,7 +106,7 @@ def test_a_legal_empty_result_keeps_the_miss_shape() -> None:
     filter answers with the empty contract and no error key."""
     _, payload = _invoke(_port(), query="revenue", ticker="ZZZZ")
 
-    assert payload == {"chunks": []}
+    assert payload == {"chunks": [], "distribution": "zero"}
     assert "error" not in payload
 
 

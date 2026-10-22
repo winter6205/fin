@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-supplier-agreement-template",
+  "title": "ZEUS Supplier Agreement Template",
+  "content": "ZEUS Supplier Agreement Template · Page 1\nSection 1: Commercial terms\nThis fictional template is for demonstration and requires legal review before use. Invoices are payable within 30 calendar days after receipt of an undisputed invoice. The supplier gives ZEUS a 90-day warranty that delivered goods conform to the written specification. Late undisputed amounts accrue simple interest at 0.5% per month, capped at the amount permitted by applicable law. Prices exclude tax unless an order form says otherwise. Delivery dates are stated in the applicable purchase order.\n\nZEUS Supplier Agreement Template · Page 2\nSection 2: Review and termination\nEither party may terminate for a material breach that remains uncured 30 calendar days after written notice. ZEUS may terminate an order for convenience with 15 calendar days' notice and pays for accepted goods delivered before the effective date. The supplier protects ZEUS confidential information using at least the same care it applies to its own restricted business information. The parties name one operational contact and one notice address in the signature schedule. The approval workflow follows zeus-change-process only for production changes; it does not replace contract review.",
+  "chunks": [
+    {
+      "content": "ZEUS Supplier Agreement Template · Page 1\nSection 1: Commercial terms\nThis fictional template is for demonstration and requires legal review before use. Invoices are payable within 30 calendar days after receipt of an undisputed invoice. The supplier gives ZEUS a 90-day warranty that delivered goods conform to the written specification. Late undisputed amounts accrue simple interest at 0.5% per month, capped at the amount permitted by applicable law. Prices exclude tax unless an order form says otherwise. Delivery dates are stated in the applicable purchase order.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Supplier Agreement Template · Page 2\nSection 2: Review and termination\nEither party may terminate for a material breach that remains uncured 30 calendar days after written notice. ZEUS may terminate an order for convenience with 15 calendar days' notice and pays for accepted goods delivered before the effective date. The supplier protects ZEUS confidential information using at least the same care it applies to its own restricted business information. The parties name one operational contact and one notice address in the signature schedule. The approval workflow follows zeus-change-process only for production changes; it does not replace contract review.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "contract_template",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "10-K",
+    "period": "Template 2024",
+    "filing_date": "2024-09-02"
+  },
+  "valid_from": "2024-09-02T00:00:00Z"
+}

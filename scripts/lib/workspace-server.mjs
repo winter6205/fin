@@ -70,21 +70,16 @@ export async function ensureSpaBuild({ log } = {}) {
   return null;
 }
 
-// The provider a lane boots when the operator sets no `FIN_MODEL` /
-// `FIN_BASE_URL` is `compile.py`'s pair of constants, and a lane that
-// reports which provider answered must read them rather than restate
-// them: ADR 0022 has already been re-pointed once (local proxy ->
-// official MiniMax Chat Completions), and a hardcoded copy would have
-// gone on naming the retired proxy in the evidence.
+// The endpoint may still use compile.py's independent base-URL default.
+// A model id is operator configuration and is resolved from settings/env by
+// the live lane; no compiled model value is read here.
 //
-// Returns `{ model: null, baseUrl: null }` when the interpreter cannot
-// be reached; the caller degrades to naming the variables instead of
-// their values, which is honest, so this never aborts a lane.
-export async function readCompileDefaults() {
+// Returns null when the interpreter cannot be reached; the caller can name
+// FIN_BASE_URL without claiming an unobserved endpoint.
+export async function readDefaultBaseUrl() {
   const uv = process.env.FIN_E2E_UV || "uv";
   const source =
-    "from fin.host.compile import DEFAULT_MODEL, DEFAULT_BASE_URL;" +
-    "print(DEFAULT_MODEL);print(DEFAULT_BASE_URL)";
+    "from fin.host.compile import DEFAULT_BASE_URL;print(DEFAULT_BASE_URL)";
   const printed = await new Promise((resolve) => {
     const child = spawn(uv, ["run", "--quiet", "python", "-c", source], {
       cwd: REPO_ROOT,
@@ -98,8 +93,7 @@ export async function readCompileDefaults() {
     child.on("error", () => resolve(""));
     child.on("close", (code) => resolve(code === 0 ? out : ""));
   });
-  const [model, baseUrl] = printed.trim().split("\n");
-  return { model: model || null, baseUrl: baseUrl || null };
+  return printed.trim() || null;
 }
 
 // Starts uvicorn as a process GROUP leader so `stopWorkspace` can

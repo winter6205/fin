@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-platform-weekly-report",
+  "title": "ZEUS Platform Project Weekly Report",
+  "content": "ZEUS Platform Project Weekly Report · Page 1\nSection 1: Delivery status\nWeek ending 2024-09-27. The platform team completed the staging migration and passed 18 of 20 planned integration checks. Release readiness is AMBER. The two open checks cover restore validation and delayed audit-event delivery. The team expects to rerun both checks on 2024-09-30. Project lead: Mei Tan. The staged HELIOS export redesign follows the Product Council decision in zeus-product-council-minutes, Section 1.\n\nZEUS Platform Project Weekly Report · Page 2\nSection 2: Risks and next checkpoint\nThe current blocker is a 40-minute delay in audit events from the secondary region; the team has isolated the queue consumer as the likely cause and is comparing its retry settings with the primary region. No customer data was lost in the test. Platform Operations owns the correction, due 2024-09-30 at 16:00 UTC. The next checkpoint is the release review on 2024-10-01 at 13:30 UTC. If restore validation remains open, the team will move the pilot by one week and publish a revised customer schedule. The report's risk definitions use the response roles in zeus-incident-response, Section 2.",
+  "chunks": [
+    {
+      "content": "ZEUS Platform Project Weekly Report · Page 1\nSection 1: Delivery status\nWeek ending 2024-09-27. The platform team completed the staging migration and passed 18 of 20 planned integration checks. Release readiness is AMBER. The two open checks cover restore validation and delayed audit-event delivery. The team expects to rerun both checks on 2024-09-30. Project lead: Mei Tan. The staged HELIOS export redesign follows the Product Council decision in zeus-product-council-minutes, Section 1.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Platform Project Weekly Report · Page 2\nSection 2: Risks and next checkpoint\nThe current blocker is a 40-minute delay in audit events from the secondary region; the team has isolated the queue consumer as the likely cause and is comparing its retry settings with the primary region. No customer data was lost in the test. Platform Operations owns the correction, due 2024-09-30 at 16:00 UTC. The next checkpoint is the release review on 2024-10-01 at 13:30 UTC. If restore validation remains open, the team will move the pilot by one week and publish a revised customer schedule. The report's risk definitions use the response roles in zeus-incident-response, Section 2.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "project_weekly_report",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "10-Q",
+    "period": "Week ending 2024-09-27",
+    "filing_date": "2024-09-27"
+  },
+  "valid_from": "2024-09-27T00:00:00Z"
+}

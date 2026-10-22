@@ -108,7 +108,7 @@ docs/research/
 docs/cross-repo/
 docs/design-references/
 docs/verify/
-plans/archive/
+plans/
 docs/guides/knowledge-agent.md
 
 # A session transcript kept beside the docs, not a product artifact. Same
@@ -149,6 +149,12 @@ docs/会话备份.txt
 # They stay in the private source checkout. Do not force-add them here.
 # Ignore rules do not untrack files already in history.
 docs/validation/
+docs/verification/
+docs/qa-chain-t1-disconnect-baseline.md
+docs/qa-chain-t2-real-upstream-finding.md
+docs/qa-chain-t3-reset-boundary.md
+docs/qa-chain-t3-seed-acceptance.md
+docs/qa-chain-t3-seed-non-persistent-store.md
 data/grounded_assessment/
 data/conformance/journey_acceptance/
 tests/acceptance/

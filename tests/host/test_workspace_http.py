@@ -1,4 +1,4 @@
-"""Tests for the workspace HTTP surface (T1, #28).
+"""Tests for the workspace HTTP surface (T1).
 
 The workspace routes sit on the same FastAPI app as the v1
 ``/ask`` route (one process, one compiled graph - ADR 0013 / ADR
@@ -42,6 +42,14 @@ from fin.host.collection_bind import (
     BOUND_COLLECTION_NAME,
     BOUND_COLLECTION_UNBOUND,
 )
+from fin.host.knowledge_mcp import (
+    KNOWLEDGE_MCP_MISSING,
+    KNOWLEDGE_MCP_NOT_PROBED,
+)
+from fin.host.grounded.readable_projection import (
+    STEP_CAP_COPY,
+)
+from fin.host.run_payload import ORDINARY_PERSON_COPY
 from fin.host.state import reset_input_state
 from fin.retrieve import FakeRetrievePort
 
@@ -420,7 +428,7 @@ def test_send_message_done_emits_status_then_citations_then_answer_events(
     assert "status" in event_types
     assert "citations" in event_types
     assert "answer" in event_types
-    # Wire order per spec line 30 + T1 (#33): token deltas (answer)
+    # Wire order per spec line 30 + T1: token deltas (answer)
     # stream BEFORE ``status``; the TERMINAL frames keep the fixed
     # ``status`` -> ``answer`` -> ``citations`` order with citations
     # TERMINAL so the client can close its reader.
@@ -515,7 +523,7 @@ def test_citations_wire_projection_refuses_an_attachment_row_without_display() -
     """A stored attachment row that lost ``display`` is refused by
     name: it must never be published as a page-labelled attachment
     citation, and never vanish from the stream silently either."""
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _attachment_wire_row()
@@ -530,7 +538,7 @@ def test_citations_wire_projection_refuses_an_attachment_row_without_display() -
 def test_citations_wire_projection_refuses_a_row_without_kind() -> None:
     """A stored row with no ``kind`` is refused by name, never
     silently labelled ``company``."""
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     attachment = _attachment_wire_row()
@@ -551,7 +559,7 @@ def test_citations_wire_projection_refuses_a_malformed_identity() -> None:
     """An out-of-closed-set ``kind`` or ``display`` is a row that lost
     its identity: the closed-set break is the named unsupported code,
     every wrong-type or broken-identity row the named malformed code."""
-    from fin.host.evidence_contract import (
+    from fin.host.evidence.evidence_contract import (
         MALFORMED_EVIDENCE_CONTRACT,
         UNSUPPORTED_EVIDENCE_CONTRACT,
     )
@@ -607,8 +615,8 @@ def test_citations_wire_projection_dict_and_dataclass_answer_identically() -> No
     ``display`` is the named contract refusal for either of them."""
     from dataclasses import replace
 
-    from fin.host.citation_gate import Citation
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.grounded.citation_gate import Citation
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _attachment_wire_row()
@@ -762,7 +770,7 @@ def test_citations_wire_projection_refuses_a_row_without_its_snapshot() -> None:
     would leave a citation the client cannot open without re-querying the
     ledger, which is the one thing opening a row may never do
     (spec 8.1)."""
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     for source in (
@@ -778,7 +786,7 @@ def test_citations_wire_projection_refuses_a_row_with_an_empty_record_key() -> N
     """A snapshot with a source but no record key names a view without
     naming a record, so the citation opens nothing — the named malformed
     failure, never a silent drop."""
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _database_row_wire_row(
@@ -801,7 +809,7 @@ def test_citations_wire_projection_refuses_a_document_row_wearing_a_snapshot() -
     """A company row carrying a ledger snapshot would show one source's
     provenance under another's label, so it is refused rather than
     published — the two identities must not be mixed on one row."""
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _company_wire_row(
@@ -823,7 +831,7 @@ def test_citations_wire_projection_never_defaults_an_unknown_kind() -> None:
     a kind the host had not heard of would have been published as a
     company citation pointing at a document id it does not have.
     """
-    from fin.host.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     for source in (
@@ -839,7 +847,7 @@ def test_citations_wire_projection_refuses_a_row_with_a_document_display() -> No
     """A row presents as a record. A row claiming ``page`` or ``unit``
     would read as a document unit, which is the confusion the third
     display value exists to prevent — named, never dropped."""
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     rows, refusals = _citations_wire_projection(
@@ -859,7 +867,7 @@ def test_citations_wire_projection_dict_and_dataclass_answer_identically_for_a_r
     its snapshot would be a citation no client could open. The fresh
     frame carries the v1 snapshot token on both paths.
     """
-    from fin.host.citation_gate import Citation, DatabaseRow
+    from fin.host.grounded.citation_gate import Citation, DatabaseRow
     from fin.host.workspace_http import _citations_wire_projection
 
     row = DatabaseRow.from_wire(
@@ -916,7 +924,7 @@ def test_citations_wire_projection_logs_a_refused_row_without_the_snapshot(
     ledger material that must not reach a log line."""
     import logging
 
-    from fin.host.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _database_row_wire_row()
@@ -947,7 +955,7 @@ def test_citations_wire_projection_keeps_an_empty_array_empty() -> None:
 def test_citations_wire_projection_refuses_an_oversize_frame_without_truncating() -> None:
     """A frame beyond the §3 count bound is refused whole by name: the
     wire never silently publishes a truncated head of the list."""
-    from fin.host.evidence_contract import CITATION_OVERFLOW, MAX_CITATIONS_PER_RUN
+    from fin.host.evidence.evidence_contract import CITATION_OVERFLOW, MAX_CITATIONS_PER_RUN
     from fin.host.workspace_http import _citations_wire_projection
 
     frame = [_company_wire_row() for _ in range(MAX_CITATIONS_PER_RUN + 1)]
@@ -962,7 +970,7 @@ def test_citations_wire_projection_names_an_unserializable_row_and_serves_the_re
     """A serialization failure is a named contract error, never an empty
     success: a snapshot value the home cannot read as a JSON scalar is
     refused, and the well-formed rows still reach the wire."""
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     broken = _database_row_wire_row(
@@ -998,7 +1006,7 @@ def test_citations_wire_projection_refuses_a_frame_with_an_unknown_schema_token(
     the missing key before the token is ever read. The three legs below
     pin the ordering this premise depends on.
     """
-    from fin.host.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _database_row_wire_row(
@@ -1035,7 +1043,7 @@ def test_citations_wire_projection_refuses_an_unknown_token_before_the_version_c
     would be told to fix a version skew instead (ADR 0093 decision 6:
     neither is repaired by a guess).
     """
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _database_row_wire_row(
@@ -1066,7 +1074,7 @@ def test_citations_wire_projection_refuses_a_known_token_whose_version_is_absent
     ACTIVE frame may not borrow the §7 legacy rule, which is keyed on
     the ABSENCE of ``schema`` and does not apply here.
     """
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _database_row_wire_row(
@@ -1098,7 +1106,7 @@ def test_citations_wire_projection_refuses_a_known_token_at_an_unsupported_versi
     a wrong TYPE gets — so a frame defective only in its version integer
     must not be filed as malformed.
     """
-    from fin.host.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
+    from fin.host.evidence.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
     from fin.host.workspace_http import _citations_wire_projection
 
     row = _database_row_wire_row(
@@ -1241,8 +1249,8 @@ def test_send_message_refused_citation_rides_its_own_named_frame(
     The frame is NEW vocabulary, so today's web reader skips it (its
     switch defaults on unknown events); E6 gives it a decoder.
     """
-    from fin.host.citation_gate import Citation
-    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.grounded.citation_gate import Citation
+    from fin.host.evidence.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
     from fin.host.http import get_graph
 
     answer = f"Per the filing: {aapl_page1_text[:80]}"
@@ -1286,9 +1294,9 @@ def test_committed_http_sse_conformance_example_matches_the_emitter() -> None:
     reproduce the published ``emitted_frames`` exactly (rows, snapshot
     schema mint, terminal status envelope, mid-stream refusal frame).
 
-    the tracked change consumes this example without copying an independently defined
-    schema; a test that only re-reads the JSON would let the emitter
-    drift, so the fixture's payload IS the projection input here.
+    The committed example is consumed without copying an independently
+    defined schema; a test that only re-reads the JSON would let the
+    emitter drift, so the fixture's payload IS the projection input here.
     """
     case = json.loads(
         (_HTTP_SSE_CONFORMANCE / "valid-terminal-frames.json").read_text(
@@ -1343,12 +1351,9 @@ def test_send_message_refuse_unknown_locator_emits_status_refuse_and_empty_citat
 
     events = _parse_sse_events(body)
     event_types = [name for name, _ in events]
-    # T1 (#33) wire contract: the refused attempt's prose streams as
-    # ``answer`` DELTAS while the run is live; the TERMINAL frames
-    # after ``status`` are the fixed ``status`` -> ``answer`` ("") ->
-    # ``citations`` ([]) with citations terminal. A refuse therefore
-    # shows [answer-delta, ..., status, answer(""), citations([])].
-    assert event_types[0] == "answer"
+    # QA-04 admission supersedes live publication of rejected drafts.
+    assert event_types == ["status", "answer", "citations"]
+    assert "ZZZZ-9999Q1" not in body
     assert event_types[-1] == "citations"
     status_i = event_types.index("status")
     assert event_types[status_i + 1] == "answer"
@@ -1638,7 +1643,7 @@ def test_send_message_streaming_emits_thinking_and_tool_call_frames(
 def test_send_message_tool_result_summary_matches_get_history(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
-    """turn-trace-folds T1 (the tracked change): the SSE ``tool_result`` summary
+    """turn-trace-folds T1: the SSE ``tool_result`` summary
     passes the same args the graph persist path passes, so a
     ``retrieve`` one-liner shows its query live AND the GET
     ``tool_summaries`` entry for the same ``tool_call_id`` matches."""
@@ -1982,9 +1987,14 @@ def test_get_corpus_shows_each_form_the_corpus_actually_holds(
 ) -> None:
     """SC3: the card reports the form, not a hard-coded 10-Q.
 
-    Pointed at a corpus of one 10-K, one 8-K and one 10-Q, the route
-    reports all three — this is the surface the operator reads to see
-    what is in the library.
+    Pointed at the demo corpus -- which declares a 10-K, an 8-K and a 10-Q --
+    the route reports every form the corpus actually holds, per row, from the
+    fixture rather than a hard-coded answer. This is the surface the operator
+    reads to see what is in the library.
+
+    The expected mapping is derived from ``fixtures/demo-corpus/`` at call time
+    so it tracks the corpus instead of rotting against literals the way the
+    removed ``ZEUS-2023-*`` rows did.
     """
     monkeypatch.setattr(
         "fin.corpus.catalog.DEFAULT_CATALOG_PATH",
@@ -1993,11 +2003,18 @@ def test_get_corpus_shows_each_form_the_corpus_actually_holds(
 
     filings = client.get("/api/corpus").json()["filings"]
 
-    assert {f["document_id"]: f["form"] for f in filings} == {
-        "ZEUS-2023-10K": "10-K",
-        "ZEUS-2023-8K": "8-K",
-        "ZEUS-2023Q1": "10-Q",
+    fixture_corpus = Path(__file__).resolve().parents[2] / "fixtures" / "demo-corpus"
+    expected = {
+        path.name[: -len(".json")]: str(
+            json.loads(path.read_text(encoding="utf-8"))["metadata"]["form"]
+        )
+        for path in sorted(fixture_corpus.glob("zeus-*.json"))
     }
+    assert {f["document_id"]: f["form"] for f in filings} == expected
+    # The property SC3 exists to protect: more than one form is reported, so
+    # the route is reading the corpus and not echoing a single default.
+    assert len(set(expected.values())) > 1
+    assert {"10-K", "8-K", "10-Q"} <= set(expected.values())
 
 
 def test_get_corpus_with_missing_catalog_table_is_empty_filings(
@@ -2168,7 +2185,7 @@ def _build_fake_checkout(root: Path) -> Path:
 
 
 @pytest.fixture
-def spa_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def spa_client(tmp_path: Path) -> TestClient:
     """A client over a fresh app whose SPA is mounted from a
     ``tmp_path`` dist.
 
@@ -2180,16 +2197,13 @@ def spa_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     ``tmp_path`` dist makes these cases depend only on
     ``mount_spa``.
 
-    ``_spa_mounted`` is the module-level once-guard that makes the
-    import-time mount idempotent; resetting it for the duration of
-    the test is what lets a second mount register on our own app.
-    ``monkeypatch`` restores it afterwards, so the real app's mount
-    state is untouched.
+    The idempotence guard is per app, so a fresh ``FastAPI`` needs no
+    reset to mount; mounting twice on the SAME app is pinned on its
+    own.
     """
     from fin.host import http as http_module
 
     dist = _build_fake_checkout(tmp_path)
-    monkeypatch.setattr(http_module, "_spa_mounted", False)
     app = FastAPI()
     http_module.mount_spa(app, dist_path=str(dist))
     return TestClient(app)
@@ -2638,12 +2652,12 @@ def test_send_message_refuse_emits_status_with_ordinary_person_copy(
 
     events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
 
-    # T1 (#33): the refused attempt's prose streams as an answer
+    # T1: the refused attempt's prose streams as an answer
     # delta BEFORE status; look the terminal frames up by name.
     status_event = next(d for n, d in events if n == "status")
     assert status_event["status"] == "refuse"
     assert status_event["reason"] == "unknown_locator"
-    assert "can't ground" in status_event["assistant_message"]
+    assert status_event["assistant_message"] == ORDINARY_PERSON_COPY["unknown_locator"]
     assert status_event["assistant_message"] != ""
 
     # Answer empty, citations [] (terminal frames after status).
@@ -2658,14 +2672,14 @@ def test_send_message_refuse_emits_status_with_ordinary_person_copy(
     run = detail["turns"][0]
     assert run["status"] == "refuse"
     assert run["citations"] == []
-    assert "can't ground" in run["assistant_message"]
+    assert run["assistant_message"] == ORDINARY_PERSON_COPY["unknown_locator"]
 
 
 def test_send_message_step_cap_emits_status_with_ordinary_person_copy(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
     """Step-cap scripted run -> ``status`` SSE frame carries the
-    32-step fuse explainer in ``assistant_message``; citations
+    step-cap explainer in ``assistant_message``; citations
     ``[]``; answer empty.
     """
     from fin.host.http import get_graph
@@ -2703,7 +2717,7 @@ def test_send_message_step_cap_emits_status_with_ordinary_person_copy(
     # the status frame up by name instead of by position.
     status_event = next(d for n, d in events if n == "status")
     assert status_event["status"] == "step_cap"
-    assert "32-step fuse" in status_event["assistant_message"]
+    assert status_event["assistant_message"] == STEP_CAP_COPY
     assert status_event["assistant_message"] != ""
 
     answer_event = next(d for n, d in events if n == "answer")
@@ -2715,7 +2729,7 @@ def test_send_message_step_cap_emits_status_with_ordinary_person_copy(
     run = detail["turns"][0]
     assert run["status"] == "step_cap"
     assert run["citations"] == []
-    assert "32-step fuse" in run["assistant_message"]
+    assert run["assistant_message"] == STEP_CAP_COPY
 
 
 def test_send_message_done_status_has_empty_assistant_message(
@@ -2794,7 +2808,7 @@ def test_follow_up_resets_answer_citations_status_in_checkpoint(
     assert state2.values.get("citations") in ((), [])
     assert state2.values.get("status") == "refuse"
 
-# ===== T4: crash resume from the last complete node (#31) =====
+# ===== T4: crash resume from the last complete node =====
 
 
 def _resume(client: TestClient, thread_id: str) -> tuple[int, Any]:
@@ -2922,7 +2936,7 @@ def test_resume_continues_from_last_complete_node_no_human_message_appended(
     human_ids = {m.id for m in msgs_after_crash if m.__class__.__name__ == "HumanMessage"}
     assert len(human_ids) == 1  # exactly one user turn so far
 
-    # the tracked change regression: a real crash (pending nodes, no terminal
+    # Regression: a real crash (pending nodes, no terminal
     # row) must still surface the Resume banner signal; mid-flight
     # refuse finalization must not clear this path.
     after_crash = client.get(f"/api/threads/{tid}").json()
@@ -3276,7 +3290,7 @@ def test_switching_threads_does_not_paint_deltas_to_other_thread(
 
 
 
-# ----- T1 (#33): token deltas reach the live turn -----
+# ----- T1: token deltas reach the live turn -----
 
 
 def _two_step_streaming_model(answer: str) -> "ScriptedChatModel":
@@ -3333,13 +3347,15 @@ def _two_step_streaming_model(answer: str) -> "ScriptedChatModel":
     )
 
 
-def test_send_message_token_deltas_stream_before_node_completion(
+def test_send_message_answer_deltas_release_after_admission_before_terminal(
     client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
 ) -> None:
-    """T1 (#33) binding acceptance: thinking and answer deltas reach
-    the wire as MULTIPLE frames per channel, DURING the model step —
-    before that step's node-complete values frame (whose checkpoint
-    holds the assembled ``AIMessage``) and before terminal status.
+    """Thinking streams live; admitted answer deltas grow before terminal.
+
+    Answer prose is released only after graph admission. It still arrives
+    in multiple frames before terminal status so the browser can paint the
+    complete, safe answer incrementally without ever seeing a rejected
+    draft.
     """
     from fin.host.http import get_graph
 
@@ -3366,9 +3382,12 @@ def test_send_message_token_deltas_stream_before_node_completion(
     # frame (``tool_call`` is synthesized from the values frame that
     # exists only after the checkpoint write).
     assert len([i for i in thinking_idx if i < tool_call_i]) >= 2
-    # Step 2's answer deltas (2+) precede terminal ``status``.
+    # Step 2's admitted answer deltas (2+) follow graph tool completion
+    # and precede terminal ``status``.
     deltas = [i for i in answer_idx if i < status_i]
     assert len(deltas) >= 2
+    tool_result_i = names.index("tool_result")
+    assert max(tool_call_i, tool_result_i) < min(deltas)
     # Citations stays terminal.
     assert names[-1] == "citations"
 
@@ -3632,7 +3651,7 @@ def test_soft_track_answer_deltas_match_the_persisted_row(
     assert streamed == persisted
 
 
-# ----- T2 (#36): resume streams the remainder on the same delta wire -----
+# ----- T2: resume streams the remainder on the same delta wire -----
 
 
 class _StreamCallCountingModel(ScriptedChatModel):
@@ -3653,7 +3672,7 @@ class _StreamCallCountingModel(ScriptedChatModel):
 def test_resume_streams_remainder_deltas_on_same_wire(
     client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
 ) -> None:
-    """T2 (#36) binding acceptance: after a crash between a complete
+    """T2 binding acceptance: after a crash between a complete
     tool-call ``AIMessage`` and ``tool_node``, ``POST /resume``
     continues the run and the SSE carries the REMAINDER's thinking /
     answer as per-chunk DELTAS (same live-turn behaviour as T1) —
@@ -3800,7 +3819,7 @@ def test_resume_does_not_replay_checkpointed_frames(
     assert tool_result_events[0]["tool_call_id"] == "c-read"
 
 
-# ----- T3 (#34): global thinking preference -----
+# ----- T3: global thinking preference -----
 
 
 def test_send_message_thinking_false_applies_disabled_extra_body(
@@ -3858,7 +3877,7 @@ def test_send_message_thinking_false_applies_disabled_extra_body(
     assert status_event.get("thinking_type") == "adaptive"
 
 
-# ----- T4 (#37): post-run collapse data (thinking duration) -----
+# ----- T4: post-run collapse data (thinking duration) -----
 
 
 def test_send_message_persists_thinking_duration_and_echoes_on_status(
@@ -3947,14 +3966,10 @@ def test_turn_row_includes_duration_zero_when_no_thinking(
     assert run["thinking_text"] == ""
 
 
-def test_bounce_retry_emits_answer_reset_between_attempts(
+def test_bounce_retry_publishes_only_the_admitted_attempt(
     client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
 ) -> None:
-    """When the citation gate BOUNCES an attempt (hidden
-    SystemMessage), the wire signals the retry boundary by attaching
-    ``reset: true`` to the NEXT non-empty answer delta — not a
-    standalone empty ``{"text": "", "reset": true}`` (that blanked
-    the SPA between draft and tool_call / retry prose)."""
+    """A bounced draft never reaches the wire; the admitted retry does."""
     from langchain_core.messages import AIMessageChunk
 
     from fin.host.http import get_graph
@@ -4011,23 +4026,18 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
     assert empty_resets == [], names
 
     answer_idx = [i for i, n in enumerate(names) if n == "answer"]
-    ungrounded_delta = next(
-        i for i in answer_idx if "handwaving" in events[i][1]["text"]
-    )
+    assert not any("handwaving" in events[i][1]["text"] for i in answer_idx)
     grounded_delta = next(
         i for i in answer_idx if "Per the filing" in events[i][1]["text"]
     )
-    assert ungrounded_delta < grounded_delta
     assert reset_i == grounded_delta
+    assert "".join(events[i][1]["text"] for i in answer_idx if i < names.index("status")) == grounded
 
 
 def test_bounce_then_tools_then_answer_has_no_empty_reset(
     client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
 ) -> None:
-    """Bounce → tool_call → grounded answer: the draft must stay on
-    the wire until the first retry answer chunk (with ``reset``).
-    An immediate empty reset after the bounce SystemMessage is what
-    operators read as "tools cleared my answer"."""
+    """Tools remain observable while the bounced draft remains private."""
     from langchain_core.messages import AIMessageChunk
 
     from fin.host.http import get_graph
@@ -4065,10 +4075,9 @@ def test_bounce_then_tools_then_answer_has_no_empty_reset(
 
     assert next(d for n, d in events if n == "status")["status"] == "done"
 
-    ungrounded_i = next(
-        i
-        for i, (n, d) in enumerate(events)
-        if n == "answer" and "handwaving" in d.get("text", "")
+    assert not any(
+        n == "answer" and "handwaving" in d.get("text", "")
+        for n, d in events
     )
     tool_call_i = next(i for i, n in enumerate(names) if n == "tool_call")
     grounded_i = next(
@@ -4076,12 +4085,13 @@ def test_bounce_then_tools_then_answer_has_no_empty_reset(
         for i, (n, d) in enumerate(events)
         if n == "answer" and "Per the filing" in d.get("text", "")
     )
-    assert ungrounded_i < tool_call_i < grounded_i, names
+    tool_result_i = next(i for i, n in enumerate(names) if n == "tool_result")
+    assert tool_call_i < tool_result_i < grounded_i, names
 
-    # No answer frame (empty or otherwise) between draft and tool_call.
+    # No answer frame precedes the admitted answer.
     mid_answers = [
         (i, events[i][1])
-        for i in range(ungrounded_i + 1, tool_call_i)
+        for i in range(grounded_i)
         if names[i] == "answer"
     ]
     assert mid_answers == [], mid_answers
@@ -4093,13 +4103,15 @@ def test_bounce_then_tools_then_answer_has_no_empty_reset(
         if n == "answer" and d.get("reset") is True and d.get("text") == ""
     ]
     assert empty_resets == []
+    assert "".join(
+        d["text"] for n, d in events[:names.index("status")] if n == "answer"
+    ) == grounded
 
 
-def test_multi_bounce_attaches_reset_to_each_retry_first_chunk(
+def test_multi_bounce_publishes_only_the_final_admitted_answer(
     client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
 ) -> None:
-    """Two recoverable bounces then a grounded answer: each retry's
-    first non-empty answer delta carries ``reset: true``."""
+    """Neither rejected attempt can appear before the admitted answer."""
     from langchain_core.messages import AIMessageChunk
 
     from fin.host.http import get_graph
@@ -4138,26 +4150,26 @@ def test_multi_bounce_attaches_reset_to_each_retry_first_chunk(
         for n, d in events
         if n == "answer" and d.get("reset") is True
     ]
-    assert len(resets) == 2, resets
-    assert resets[0]["text"] == "Second ungrounded attempt prose."
-    assert resets[1]["text"] == grounded[:40]
+    assert len(resets) == 1, resets
+    assert resets[0]["text"] == grounded[:40]
     assert all(d.get("text") for d in resets)
+    answer_frames = [d for n, d in events if n == "answer"]
+    assert not any("ungrounded attempt" in d["text"] for d in answer_frames)
+    status_i = next(i for i, (n, _) in enumerate(events) if n == "status")
+    assert "".join(d["text"] for n, d in events[:status_i] if n == "answer") == grounded
 
 
-def test_bounce_pending_reset_flushes_on_terminal_empty_refuse(
+def test_bounced_unadmitted_draft_refusal_has_no_terminal_reset(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
-    """After a bounce, if no non-empty retry answer arrives before
-    terminal refuse, the terminal empty answer carries ``reset: true``
-    so the SPA still clears the stale draft (only allowed empty+reset
-    case on the wire)."""
+    """A rejected draft that never reached the wire needs no terminal reset."""
     from langchain_core.messages import AIMessageChunk
 
     from fin.host.http import get_graph
 
-    # Draft once, then empty model turns: bounce SystemMessages set
-    # pending reset, but empty chunks never consume it. Cap refuse
-    # flushes pending on the terminal empty answer frame.
+    # The citation gate bounces this draft. Empty retries reach the cap
+    # without admitting answer prose, so only the ordinary terminal empty
+    # answer is visible and it must not carry a reset for hidden draft text.
     model = ScriptedChatModel(
         stream_responses=[
             [AIMessageChunk(content="Stale draft that will bounce.")],
@@ -4182,16 +4194,12 @@ def test_bounce_pending_reset_flushes_on_terminal_empty_refuse(
     assert status_event["status"] == "refuse"
     assert status_event["reason"] == "citation_repair_cap"
 
-    # Mid-run must not blank the draft with an empty reset.
-    mid_empty_resets = [
-        (i, d)
-        for i, (n, d) in enumerate(events[:-3])
-        if n == "answer" and d.get("reset") is True and d.get("text") == ""
-    ]
-    assert mid_empty_resets == [], mid_empty_resets
+    answer_events = [d for n, d in events if n == "answer"]
+    assert answer_events == [{"text": ""}]
+    assert not any("Stale draft" in d["text"] for d in answer_events)
 
     assert names[-3:] == ["status", "answer", "citations"], names
-    assert events[-2] == ("answer", {"text": "", "reset": True})
+    assert events[-2] == ("answer", {"text": ""})
 
 
 # ----- mid-stream exception boundary (code-review M1/M2) -----
@@ -4278,7 +4286,7 @@ def test_scripted_model_raises_emits_terminal_status(
     assert row["assistant_message"]
     assert row["in_flight"] is False
 
-    # the tracked change: mid-flight refuse must NOT leave a pending checkpoint
+    # Mid-flight refuse must NOT leave a pending checkpoint
     # — the CrashResume banner keys off ``pending_checkpoint``, not
     # ``in_flight``, and a terminal refuse turn must not show it.
     assert detail["pending_checkpoint"] is False
@@ -4342,10 +4350,14 @@ def test_send_message_soft_track_reply_streams_deltas_before_status(
     ``status``, and they concatenate to the authoritative answer.
     """
     from fin.host.http import get_graph
+    from jev_fake import FakeJevChoice
 
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=_soft_track_streaming_model(answer),
+        jev_client=(
+            FakeJevChoice([("clarify", 0.99)]) if track == "clarify" else None
+        ),
         known_document_ids=KNOWN_IDS,
         adapter=_tree_read_adapter(),
     )
@@ -4446,12 +4458,19 @@ def test_send_message_gray_zone_judge_output_never_reaches_the_wire(
 # payload keys must be exactly this set: a missing key blanks part of
 # the left corner, an extra key smuggles run telemetry onto a boot
 # surface.
+#
+# ``run_counts`` is the one run-aware key, admitted because the status
+# contract requires the three lifecycle counts and requires them to be
+# answered from local state: three integers with no thread, no run id and
+# no figure about one turn. The run-scoped facts they summarize are still
+# out, and ``STATUS_FORBIDDEN_FIELDS`` below is what keeps them out.
 STATUS_FIELDS = {
     "knowledge_mcp",
     "retrieve_adapter_kind",
     "model_identity",
     "corpus_filing_count",
     "bound_collection_name",
+    "run_counts",
 }
 
 # ADR 0033's OUT list plus the plan's explicit exclusions. Asserted
@@ -4496,7 +4515,14 @@ def test_status_reports_missing_knowledge_mcp_on_a_fake_adapter_boot(
 
     The ADR 0033 amendment: Fake is a test-only retrieve story, so a
     fake boot reports 缺 while ``retrieve_adapter_kind`` says ``fake``.
+
+    缺 is published EXPLICITLY rather than inherited from the never-probed
+    snapshot: a process that never probed reports 未探测, and this test is
+    about the fake lane's own 缺 (which ``publish_knowledge_mcp`` gives it).
     """
+    from fin.host.knowledge_mcp import publish_knowledge_mcp_state
+
+    publish_knowledge_mcp_state(KNOWLEDGE_MCP_MISSING)
     monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
     monkeypatch.setenv("PATH", _bin_dir_without_mcp(tmp_path))
 
@@ -4518,12 +4544,14 @@ def test_status_reports_missing_knowledge_mcp_as_payload_not_500(
     """A non-reachable MCP state is DATA (ADR 0033 amendment), never 500.
 
     Default adapter (``mcp``) with no ``iknow-memory`` on ``PATH`` is
-    the laptop boot. A process that never probed (this plain
-    ``TestClient`` test) reports 缺 — it has no confirmed reachable MCP
-    — and the route answers 200 so the left corner renders degraded
-    copy rather than blanking.
+    the laptop boot. This plain ``TestClient`` process never probed, so it
+    reports 未探测 — not 缺, which would assert a probe established an
+    absence that never happened — and the route answers 200 with the whole
+    payload so the left corner renders a neutral line rather than
+    blanking. The three probed states stay DATA on the same route.
     """
     monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+    monkeypatch.setenv("FIN_MODEL", "status-test-model")
     monkeypatch.setenv("PATH", _bin_dir_without_mcp(tmp_path))
 
     r = client.get("/api/status")
@@ -4532,11 +4560,12 @@ def test_status_reports_missing_knowledge_mcp_as_payload_not_500(
     assert r.headers["content-type"].startswith("application/json")
     body = r.json()
     assert set(body.keys()) == STATUS_FIELDS, body
-    assert body["knowledge_mcp"] == "missing"
+    assert body["knowledge_mcp"] == KNOWLEDGE_MCP_NOT_PROBED
+    assert body["knowledge_mcp"] != KNOWLEDGE_MCP_MISSING
     assert body["retrieve_adapter_kind"] == "mcp"
     # Still a full payload: the other three fields carry real values
     # so the left corner never renders a hole next to the degraded line.
-    assert body["model_identity"]
+    assert body["model_identity"] == "status-test-model"
     assert isinstance(body["corpus_filing_count"], int)
 
 
@@ -4568,26 +4597,24 @@ def test_status_model_identity_is_the_slug_only(
     client: TestClient, fresh_store, monkeypatch
 ) -> None:
     """``FIN_MODEL`` only — never ``FIN_BASE_URL``, never key material."""
-    monkeypatch.setenv("FIN_MODEL", "fin/MiniMax-M3")
+    monkeypatch.setenv("FIN_MODEL", "fin/synthetic-model")
     monkeypatch.setenv("FIN_BASE_URL", "http://operator-secret.invalid/v1")
     monkeypatch.setenv("FIN_API_KEY", "sk-do-not-leak")
 
     body = client.get("/api/status").json()
 
-    assert body["model_identity"] == "fin/MiniMax-M3"
+    assert body["model_identity"] == "fin/synthetic-model"
     serialized = json.dumps(body)
     assert "operator-secret" not in serialized
     assert "sk-do-not-leak" not in serialized
 
 
-def test_status_model_identity_falls_back_to_the_adr_0022_default(
+def test_status_model_identity_is_empty_without_configuration(
     client: TestClient, fresh_store, monkeypatch
 ) -> None:
-    from fin.host.compile import DEFAULT_MODEL
-
     monkeypatch.delenv("FIN_MODEL", raising=False)
 
-    assert client.get("/api/status").json()["model_identity"] == DEFAULT_MODEL
+    assert client.get("/api/status").json()["model_identity"] == ""
 
 
 def test_status_corpus_count_matches_the_corpus_route(

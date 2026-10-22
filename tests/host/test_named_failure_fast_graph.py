@@ -263,7 +263,9 @@ def test_a_default_fake_result_keeps_the_ordinary_shape() -> None:
     result = FakeRetrievePort().retrieve("what was revenue")
 
     assert RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY not in result
-    assert result == {"chunks": []}
+    # The distribution key is the T7 envelope's own mechanical fact and
+    # belongs here too; only the Fast-job fact must stay absent.
+    assert result == {"chunks": [], "distribution": "zero"}
 
 
 def test_the_fake_job_fact_reaches_the_host_exit_through_the_decision() -> None:

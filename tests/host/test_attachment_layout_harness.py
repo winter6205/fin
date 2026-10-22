@@ -25,7 +25,7 @@ from typing import Final
 
 import pytest
 
-from fin.host.attachment_layout import (
+from fin.host.attachment.attachment_layout import (
     PASS_FAILED,
     PASS_MEASURED,
     PASS_TIMED_OUT,

@@ -45,7 +45,7 @@ class _DegradedEmptyAdapter(MCPRetrieveAdapter):
 def test_degraded_empty_response_is_named_failure_not_empty_success() -> None:
     result = _DegradedEmptyAdapter().retrieve("operating revenue")
 
-    assert result["error"] == "retrieve_degraded_failure"
+    assert result["error"] == "retrieve_degraded"
     assert result["degraded"] is True
     assert "chunks" not in result
 
@@ -53,7 +53,15 @@ def test_degraded_empty_response_is_named_failure_not_empty_success() -> None:
 def test_compiled_product_retrieve_sends_no_capability_off_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The compiled host path sends only the retrieve contract fields."""
+    """The compiled host path sends only the retrieve contract fields —
+    plus the 档 this turn was ASSIGNED, and nothing else.
+
+    A routing residual is an ASSIGNMENT now (ADR 0104: the recorded
+    default ``graph``), so the retrieve call carries the 档 capability
+    filter the service reads (``filters.search_mode``). The prohibition
+    this test is named for is unchanged and is the one that matters: no
+    capability-OFF key ever reaches the wire.
+    """
 
     # The envelope-based wire matches the operator-console worktree
     # schema; the main-checkout ``push`` schema predates T1 and rejects
@@ -100,4 +108,8 @@ def test_compiled_product_retrieve_sends_no_capability_off_keys(
         assert len(retrieve_calls) == 1
         arguments = retrieve_calls[0]["params"]["arguments"]
         assert capability_switch_hits(arguments) == ()
-        assert set(arguments) == {"query", "limit"}
+        assert set(arguments) == {"query", "limit", "filters"}
+        # The 档 the cascade recorded for this turn is the one the service
+        # is told — the recorded default rides the wire like any other
+        # assigned 档.
+        assert arguments["filters"] == {"search_mode": "graph"}

@@ -223,7 +223,7 @@ def test_bounce_scenario_streams_the_draft_before_the_retry() -> None:
     joined = "".join(streamed)
     assert "eighty-three billion" in joined, "the refused draft must stream"
     assert joined.index("eighty-three billion") < joined.index(
-        f"Per {SCRIPTED_DOCUMENT_ID} page 1:"
+        f"Per {SCRIPTED_DOCUMENT_ID} page 4:"
     )
 
 
@@ -265,28 +265,32 @@ def test_compile_for_http_uses_scripted_graph_only_on_optin(monkeypatch) -> None
     """``compile_for_http`` picks the scripted graph when the operator
     opted in, and keeps the production boot otherwise."""
     import fin.host.compile as compile_module
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
     import fin.host.scripted_boot as scripted_module
+    from fin.host.application.lifetime import RuntimeHandle
 
     sentinel_runtime = object()
     sentinel_scripted = object()
     monkeypatch.setattr(
-        compile_module, "compile_for_runtime", lambda **_k: sentinel_runtime
+        compile_module,
+        "compile_runtime_handle",
+        lambda **_k: RuntimeHandle(sentinel_runtime),
     )
     monkeypatch.setattr(
         scripted_module, "compile_for_scripted_e2e", lambda **_k: sentinel_scripted
     )
 
-    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.setattr(composition_module, "_http_graph_singleton", None, raising=False)
     monkeypatch.delenv(SCRIPTED_BOOT_ENV_VAR, raising=False)
-    assert http_module.compile_for_http() is sentinel_runtime
+    assert composition_module.compile_for_http() is sentinel_runtime
 
-    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.setattr(composition_module, "_http_graph_singleton", None, raising=False)
     monkeypatch.setenv(SCRIPTED_BOOT_ENV_VAR, "1")
-    assert http_module.compile_for_http() is sentinel_scripted
+    assert composition_module.compile_for_http() is sentinel_scripted
 
     # Leave no scripted singleton behind for the rest of the session.
-    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.setattr(composition_module, "_http_graph_singleton", None, raising=False)
 
 
 def test_compile_for_http_unset_checkpoint_url_raises(
@@ -301,20 +305,21 @@ def test_compile_for_http_unset_checkpoint_url_raises(
     """
     from fin.host.compile import MissingCheckpointURLError
     import fin.host.compile as compile_module
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
 
     def _dev_must_not_run() -> None:
         raise AssertionError("InMemory fallback must not run")
 
-    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.setattr(composition_module, "_http_graph_singleton", None, raising=False)
     monkeypatch.delenv(SCRIPTED_BOOT_ENV_VAR, raising=False)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
     monkeypatch.setattr(compile_module, "compile_for_runtime_dev", _dev_must_not_run)
 
     with pytest.raises(MissingCheckpointURLError):
-        http_module.compile_for_http()
+        composition_module.compile_for_http()
 
-    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.setattr(composition_module, "_http_graph_singleton", None, raising=False)
 
 
 def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
@@ -325,21 +330,22 @@ def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
     checkpoint URL's, not a mis-declared byte cap's.
     """
     from fin.host.compile import MissingCheckpointURLError
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
     import uvicorn
 
     served: list[str] = []
-    monkeypatch.setattr(http_module, "apply_dotenv", lambda: None)
+    monkeypatch.setattr(composition_module, "apply_operator_settings", lambda: None)
     # The boot probe is not what this test exercises; stub it so the
     # assertion stays about the checkpoint-url refusal, not a handshake.
-    monkeypatch.setattr(http_module, "publish_knowledge_mcp", lambda: None)
+    monkeypatch.setattr(composition_module, "publish_knowledge_mcp", lambda: None)
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))
-    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.setattr(composition_module, "_http_graph_singleton", None, raising=False)
     # The bounds are read before the graph is compiled, so this boot's read
     # has to start from unset: otherwise whatever an earlier case cached
     # answers here and this test would not be deploying an env at all.
     monkeypatch.setattr(
-        http_module, "_http_attachment_budgets_singleton", None, raising=False
+        composition_module, "_http_attachment_budgets_singleton", None, raising=False
     )
     monkeypatch.delenv(SCRIPTED_BOOT_ENV_VAR, raising=False)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
@@ -347,7 +353,7 @@ def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
     # the page and crop counts staged below through the module that prices a
     # run, so this boot gets past its own config door and the refusal asserted
     # underneath stays the checkpoint URL's.
-    from fin.host.attachment_budgets import AttachmentBudgets, required_run_calls
+    from fin.host.attachment.attachment_budgets import AttachmentBudgets, required_run_calls
 
     fixture_max_bytes = 1_048_576
     fixture_pages = 8
@@ -373,7 +379,7 @@ def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
     with pytest.raises(MissingCheckpointURLError):
         http_module.serve()
     assert served == []
-    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.setattr(composition_module, "_http_graph_singleton", None, raising=False)
     monkeypatch.setattr(
-        http_module, "_http_attachment_budgets_singleton", None, raising=False
+        composition_module, "_http_attachment_budgets_singleton", None, raising=False
     )

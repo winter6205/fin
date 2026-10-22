@@ -10,7 +10,7 @@ import pytest
 
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
 from fin.retrieve.port import InvalidBusinessQueryError, new_database_rows
-from fin.host.structured_evidence import validate_structured_result
+from fin.host.evidence.structured_evidence import validate_structured_result
 
 
 STRUCTURED_QUERY = {
@@ -116,7 +116,11 @@ def test_structured_request_is_forwarded_as_an_object_under_the_only_wire_key() 
         structured_request=STRUCTURED_QUERY,
     )
 
-    assert result == {"chunks": [], "structured_result": STRUCTURED_RESULT}
+    assert result == {
+        "chunks": [],
+        "distribution": "zero",
+        "structured_result": STRUCTURED_RESULT,
+    }
     arguments = _arguments(adapter)
     assert arguments["filters"] == {
         "search_mode": "sql",
@@ -169,12 +173,11 @@ def test_structured_request_refuses_an_unbound_or_non_sql_mode(mode: str | None)
 @pytest.mark.parametrize(
     "outer_filter",
     [
-        {"document_id": "doc-1"},
         {"cik": "0000320193"},
         {"ticker": "AAPL"},
         {"filing_date": "2026-10-01"},
     ],
-    ids=["document-id", "cik", "ticker", "filing-date"],
+    ids=["cik", "ticker", "filing-date"],
 )
 def test_structured_request_refuses_outer_filters_that_change_its_scope(
     outer_filter: dict[str, str],
@@ -194,6 +197,99 @@ def test_structured_request_refuses_outer_filters_that_change_its_scope(
     assert adapter.payloads == []
 
 
+def test_a_structured_request_with_a_document_locator_is_a_scope_refusal() -> None:
+    """``document_id`` is the trusted scope locator, and a structured read
+    has no exact-match filter channel to carry it — so this is the spec's
+    ``unsupported_source_scope``, not one more malformed query."""
+    adapter = _CapturingAdapter()
+
+    result = adapter.retrieve(
+        "Find the entity",
+        search_mode="sql",
+        structured_request=STRUCTURED_QUERY,
+        document_id="doc-1",
+    )
+
+    assert result == {"error": "unsupported_source_scope"}
+    assert "chunks" not in result
+    assert adapter.payloads == []
+
+
+@pytest.mark.parametrize(
+    "generic_filter",
+    [
+        {"doc_type": "10-Q"},
+        {"company": "Northwind Logistics"},
+        {"title": "Annual report", "period": "2023 FY"},
+    ],
+    ids=["doc-type", "company", "title-and-period"],
+)
+def test_a_structured_request_refuses_a_generic_filter_it_cannot_bind(
+    generic_filter: dict[str, str],
+) -> None:
+    """The generic map is not translated into SQL predicates (spec
+    qa-chain-corpus-retrieval §"Trusted source scope and retrieval arms"),
+    and the upstream sql arm reads no ``metadata.<key>`` predicate — so a
+    call that combined them would silently drop the narrowing. The named
+    refusal keeps the drop impossible."""
+    adapter = _CapturingAdapter()
+
+    result = adapter.retrieve(
+        "Find the entity",
+        search_mode="sql",
+        structured_request=STRUCTURED_QUERY,
+        filters=generic_filter,
+    )
+
+    assert result == {"error": "unsupported_filter_mode"}
+    assert adapter.payloads == []
+
+
+def test_a_structured_request_alone_still_binds() -> None:
+    """Control: the refusal belongs to the COMBINATION, not to the
+    structured request alone."""
+    adapter = _CapturingAdapter([_success(STRUCTURED_RESULT)])
+
+    result = adapter.retrieve(
+        "Find the entity",
+        search_mode="sql",
+        structured_request=STRUCTURED_QUERY,
+    )
+
+    assert "error" not in result
+
+
+def test_a_whole_scope_generic_filter_leaves_the_structured_request_alone() -> None:
+    """A filter that normalizes to nothing narrows nothing, so it is not
+    the combination the refusal is about."""
+    adapter = _CapturingAdapter([_success(STRUCTURED_RESULT)])
+
+    result = adapter.retrieve(
+        "Find the entity",
+        search_mode="sql",
+        structured_request=STRUCTURED_QUERY,
+        filters={},
+    )
+
+    assert "error" not in result
+
+
+def test_an_invalid_generic_filter_is_refused_before_the_structured_one() -> None:
+    """``invalid_filter`` is the input contract and is checked before any
+    mode binding, so a bad map never reaches the combination."""
+    adapter = _CapturingAdapter()
+
+    result = adapter.retrieve(
+        "Find the entity",
+        search_mode="sql",
+        structured_request=STRUCTURED_QUERY,
+        filters={"cik": "0000320193"},
+    )
+
+    assert result == {"error": "invalid_filter"}
+    assert adapter.payloads == []
+
+
 def test_structured_sql_does_not_require_the_legacy_expiry_window() -> None:
     adapter = _CapturingAdapter([_success(STRUCTURED_RESULT)])
 
@@ -206,7 +302,11 @@ def test_structured_sql_does_not_require_the_legacy_expiry_window() -> None:
     except InvalidBusinessQueryError as exc:
         pytest.fail(f"structured sql must not require the legacy window: {exc}")
 
-    assert result == {"chunks": [], "structured_result": STRUCTURED_RESULT}
+    assert result == {
+        "chunks": [],
+        "distribution": "zero",
+        "structured_result": STRUCTURED_RESULT,
+    }
     assert "filters" in _arguments(adapter)
     assert adapter.payloads
 
@@ -234,7 +334,11 @@ def test_structured_result_sibling_is_preserved_as_a_success_value() -> None:
         structured_request=STRUCTURED_QUERY,
     )
 
-    assert result == {"chunks": [], "structured_result": STRUCTURED_RESULT}
+    assert result == {
+        "chunks": [],
+        "distribution": "zero",
+        "structured_result": STRUCTURED_RESULT,
+    }
 
 
 def test_named_structured_error_remains_typed_instead_of_becoming_a_miss() -> None:
@@ -262,8 +366,36 @@ def test_named_structured_error_remains_typed_instead_of_becoming_a_miss() -> No
         structured_request=STRUCTURED_QUERY,
     )
 
-    assert result == {"error": "unsupported_field"}
+    assert result == {"error": "unsupported_source_scope"}
     assert "chunks" not in result
+
+
+def test_the_structured_scope_refusal_is_never_recoded_as_a_filter_mode() -> None:
+    """The two refusals are different facts with different remedies: a
+    structured read that cannot carry the trusted scope, versus a filter
+    an arm cannot apply. Only the scope one is ``unsupported_source_scope``,
+    and the producer's own token never reaches the wire."""
+    adapter = _CapturingAdapter(
+        [
+            _mcp_error(
+                {
+                    "schema": "iknow.structured_error",
+                    "schema_version": 1,
+                    "error": {"code": "unsupported_field", "retryable": False},
+                }
+            )
+        ]
+    )
+
+    result = adapter.retrieve(
+        "List structured entities",
+        search_mode="sql",
+        structured_request=STRUCTURED_QUERY,
+    )
+
+    assert result["error"] == "unsupported_source_scope"
+    assert result["error"] != "unsupported_filter_mode"
+    assert set(result) == {"error"}
 
 
 def test_decoded_integral_float_schema_version_preserves_typed_error_code() -> None:
@@ -282,7 +414,7 @@ def test_decoded_integral_float_schema_version_preserves_typed_error_code() -> N
         structured_request=STRUCTURED_QUERY,
     )
 
-    assert result == {"error": "unsupported_field"}
+    assert result == {"error": "unsupported_source_scope"}
 
 
 @pytest.mark.parametrize("schema_version", [True, 1.5], ids=["boolean", "fractional"])

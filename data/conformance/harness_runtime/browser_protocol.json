@@ -1,0 +1,206 @@
+{
+  "schema_version": "1.0.0",
+  "lane": "browser",
+  "protocol_id": "p4-browser-1.0.0",
+  "dataset_manifest_version": null,
+  "frozen_on": "2026-10-21",
+  "authority": "specs/harness-runtime-acceptance.md#Contract (Browser evidence)",
+  "status": "frozen-protocol; no browser campaign has run or passed",
+  "foundation": {
+    "runner": "@playwright/test via playwright.config.mjs",
+    "dependency_state": "approved by the operator on 2026-10-21; @playwright/test 1.64.1 is a root devDependency (plans/harness-runtime-p4-playwright-dependency-plan.md)",
+    "product_setup_and_assertions": "tests/browser/fixtures.mjs (Fin-owned)",
+    "real_application_api": true,
+    "proxy_replay_allowed": false,
+    "scripted_model_as_evidence": false,
+    "no_second_browser_lifecycle": "the Playwright Test runner is the only browser lifecycle, artifact, and report path"
+  },
+  "execution": {
+    "command": "npx playwright test --config=playwright.config.mjs",
+    "reporters": "playwright.config.mjs owns the reporters: console list output plus the JSON report that is the campaign evidence. A --reporter flag on the command line replaces that whole array and suppresses the JSON report, so the recorded command carries no override and must be run as recorded.",
+    "artifact_root": "data/eval/acceptance/browser/ (git-ignored)",
+    "durable_readback": "each journey asserts persisted API state, not only rendered state",
+    "privacy": "no credentials, raw environment values, or private document contents in screenshots, reports, or artifacts; traces stay off",
+    "exit_contract": {
+      "0": "every selected journey passed in this run",
+      "1": "at least one journey failed or produced no verdict",
+      "2": "the lane could not run (preflight blocked, dependency absent, or server unavailable)"
+    }
+  },
+  "denominator_rule": "Every journey below is required and stays in the browser denominator. Missing, blocked, interrupted, not_run, and unscored journeys remain countable. A journey that passed only after an earlier failed attempt is flaky, which is not a clean pass.",
+  "attempt_rule": "A retry appends attempt+1 for the same journey_id and never removes the earlier attempt. Journeys, not HTTP requests or events, are the counted unit.",
+  "integration_gates": {
+    "P4": "this protocol and a passing browser-lane preflight",
+    "P5": "thread projection, snapshot/cursor, and event delivery (required by B01, B02, B03, B04, B05, B06, B07, B08, B09, B10, B11)",
+    "P6": "parser adoption and attachment readiness (required by B09)",
+    "P7": "Runtime API, targeted cancellation, and lifecycle (required by B01, B02, B03, B05, B06, B08, B09, B11)",
+    "P3": "only when a journey explicitly observes a tool outcome; none of the journeys below asserts one",
+    "P10_freeze": "only for a journey that opts into a P10 rubric; none of the journeys below declares one"
+  },
+  "journeys": [
+    {
+      "journey_id": "B01",
+      "journey_version": "1.0.0",
+      "primary_category": "continuity",
+      "action": "complete three consecutive turns, return home, reopen the same thread, complete three more turns",
+      "visible_observations": [
+        "all six answers and their citations remain visible after the home round trip and reopen",
+        "message order matches the order the turns were submitted"
+      ],
+      "durable_observations": [
+        "thread identity is the same before and after the home round trip",
+        "persisted messages match the rendered order and content"
+      ],
+      "integration_gates": ["P5", "P7"]
+    },
+    {
+      "journey_id": "B02",
+      "journey_version": "1.0.0",
+      "primary_category": "concurrency",
+      "action": "start two threads concurrently and let them finish in the reverse order from their start",
+      "visible_observations": [
+        "each thread shows only its own answer and loading state",
+        "the thread selected last keeps its projection while the other finishes"
+      ],
+      "durable_observations": [
+        "both threads reach terminal durable state",
+        "no late event for either thread overwrites the other"
+      ],
+      "integration_gates": ["P5", "P7"]
+    },
+    {
+      "journey_id": "B03",
+      "journey_version": "1.0.0",
+      "primary_category": "recovery",
+      "action": "refresh and reconnect during an in-flight run",
+      "visible_observations": [
+        "the run resumes from a retained replay or the current snapshot without losing committed content",
+        "partial token output is never rendered as a completed answer"
+      ],
+      "durable_observations": [
+        "the browser state after recovery matches the durable snapshot"
+      ],
+      "integration_gates": ["P5", "P7"]
+    },
+    {
+      "journey_id": "B04",
+      "journey_version": "1.0.0",
+      "primary_category": "recovery",
+      "action": "force a replay/reset path by requesting an unprovable event cursor",
+      "visible_observations": [
+        "the client replaces its projection only with a snapshot at least as new as its current revision",
+        "the view never regresses to older content after reset"
+      ],
+      "durable_observations": [
+        "the snapshot the client adopts matches the durable revision"
+      ],
+      "integration_gates": ["P5"]
+    },
+    {
+      "journey_id": "B05",
+      "journey_version": "1.0.0",
+      "primary_category": "intent",
+      "action": "double-activate send, press Enter plus click, and retry after a lost response",
+      "visible_observations": [
+        "the UI converges on the original outcome instead of showing two answers",
+        "a changed payload for the same intent reports a conflict"
+      ],
+      "durable_observations": [
+        "one durable accepted operation and one logical run exist for the intent",
+        "HTTP attempt count exceeds the logical operation count"
+      ],
+      "integration_gates": ["P5", "P7"]
+    },
+    {
+      "journey_id": "B06",
+      "journey_version": "1.0.0",
+      "primary_category": "cancellation",
+      "action": "request explicit cancellation of the active run while a late completion is released at a barrier",
+      "visible_observations": [
+        "the cancelled run shows its terminal cancelled state",
+        "the late completion does not replace the terminal state"
+      ],
+      "durable_observations": [
+        "cancellation ownership is recorded against the exact run",
+        "no second operation is created by the late completion"
+      ],
+      "integration_gates": ["P5", "P7"]
+    },
+    {
+      "journey_id": "B07",
+      "journey_version": "1.0.0",
+      "primary_category": "projection-guard",
+      "action": "corrupt the local snapshot, serve a stale GET for a newer thread, and resolve a genuinely absent thread",
+      "visible_observations": [
+        "a malformed local snapshot does not erase newer state",
+        "a stale GET response cannot overwrite a newer revision",
+        "an absent thread is shown as not found"
+      ],
+      "durable_observations": [
+        "the surviving rendered state matches the durable newest revision"
+      ],
+      "integration_gates": ["P5"]
+    },
+    {
+      "journey_id": "B08",
+      "journey_version": "1.0.0",
+      "primary_category": "typed-failure",
+      "action": "inject a transient 5xx and a timeout on thread read, then a real absent thread",
+      "visible_observations": [
+        "the 5xx and the timeout render as retryable error states",
+        "only the genuinely absent thread renders as not found"
+      ],
+      "durable_observations": [
+        "the retry after the transient failure reads the unchanged durable thread"
+      ],
+      "integration_gates": ["P5", "P7"]
+    },
+    {
+      "journey_id": "B09",
+      "journey_version": "1.0.0",
+      "primary_category": "attachments",
+      "action": "upload, prepare, reach ready, and produce a parser failure on one thread while another thread completes a turn",
+      "visible_observations": [
+        "upload failure, accepted/preparing, ready, and parser-failure states each render truthfully",
+        "ready appears only after the required adoption, indexing, and readiness work commits",
+        "the unrelated thread stays usable throughout"
+      ],
+      "durable_observations": [
+        "each displayed attachment state matches the durable lifecycle state after a refresh",
+        "a stale result never associates with replaced or deleted content"
+      ],
+      "integration_gates": ["P5", "P6", "P7"]
+    },
+    {
+      "journey_id": "B10",
+      "journey_version": "1.0.0",
+      "primary_category": "multi-tab",
+      "action": "subscribe two tabs to the same run",
+      "visible_observations": [
+        "each tab receives the complete event sequence",
+        "each tab keeps its own answer, loading state, attachment, and trace projection"
+      ],
+      "durable_observations": [
+        "both tabs converge on the same durable terminal state"
+      ],
+      "integration_gates": ["P5"]
+    },
+    {
+      "journey_id": "B11",
+      "journey_version": "1.0.0",
+      "primary_category": "trace-read",
+      "action": "exercise the existing TaskPanel trace read states: off, local, external, unreadable",
+      "visible_observations": [
+        "all four trace states remain distinct in the panel",
+        "an empty span list is not rendered as a failed turn"
+      ],
+      "durable_observations": [
+        "session records stay readable with tracing off",
+        "an exporter failure leaves the completed turn readable through the receipt fallback",
+        "no raw session text appears in trace artifacts",
+        "browser trace state never supplies a mechanism metric denominator"
+      ],
+      "integration_gates": ["P5", "P7"]
+    }
+  ]
+}

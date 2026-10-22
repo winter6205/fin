@@ -53,11 +53,13 @@ from fin.corpus.extracted import Locator
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.host import EvidenceItem, ScriptedChatModel, compile_graph
 from fin.host import workspace_http
-from fin.host.attachment_job_store import InMemoryThreadAttachmentJobStore
-from fin.host.attachment_prepare import AttachmentPreparationService
-from fin.host.attachment_store import InMemoryAttachmentStore
+from fin.host.attachment.attachment_job_store import InMemoryThreadAttachmentJobStore
+from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+from fin.host.attachment.attachment_store import InMemoryAttachmentStore
+from fin.host.application.lifetime import RuntimeHandle
 from fin.host.graph import ATTACHMENT_PREPARATION_INTERRUPT_KIND
 from fin.host.run_control import RunControl
+from fin.host.turn_receipts import TurnReceiptProjector
 from fin.host.state import reset_input_state
 from fin.host.thread_store import InMemoryThreadStore
 from fin.host.workspace_http import (
@@ -272,6 +274,8 @@ def _install_resume_recorder(
         run_id: str,
         resume_input: Any,
         resume_config: dict[str, Any],
+        receipts: Any = None,
+        attachments: Any = None,
     ) -> Iterator[str]:
         driven.append((thread_id, run_id, resume_input, resume_config))
         if thread_id == raises_for:
@@ -757,9 +761,12 @@ def test_serve_starts_the_resumer_before_binding_and_stops_it_first(
     reverse — no new resume is driven once its prep drain is gone. The
     resume worker must receive the SAME attachment service the prep
     drain runs (one settle-check authority) plus the graph, thread
-    store, and workspace root the boot resolved.
+    store, and workspace root the boot resolved — and the run control
+    the creating application owns, so the HTTP stop door can reach a run
+    the background resumed.
     """
     import fin.corpus.ingest_storage as ingest_storage
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
     import uvicorn
 
@@ -768,23 +775,33 @@ def test_serve_starts_the_resumer_before_binding_and_stops_it_first(
     store_stub = object()
     service_stub = object()
 
-    monkeypatch.setattr(http_module, "apply_dotenv", lambda: None)
-    monkeypatch.setattr(http_module, "get_attachment_budgets", lambda: None)
+    # The boot refuses an undeclared durable checkpointer before it opens
+    # anything, so this deployment has to state one. The compile itself is
+    # stubbed below, so the URL is a declared placeholder, not a connection.
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    monkeypatch.setattr(composition_module, "apply_operator_settings", lambda: None)
+    monkeypatch.setattr(composition_module, "attachment_budgets", lambda: None)
     monkeypatch.setattr(
         ingest_storage, "preflight_ingest_storage", lambda: None
     )
-    monkeypatch.setattr(http_module, "publish_knowledge_mcp", lambda: None)
-    monkeypatch.setattr(http_module, "compile_for_http", lambda: graph_stub)
-    monkeypatch.setattr(http_module, "default_thread_store", lambda: store_stub)
-    monkeypatch.setattr(http_module, "get_workspace_root", lambda: tmp_path)
+    monkeypatch.setattr(composition_module, "publish_knowledge_mcp", lambda: None)
+    # The boot seam is the closeable runtime handle, not the graph-only
+    # compile it delegates to, so that is what has to be stubbed here.
     monkeypatch.setattr(
-        http_module, "default_attachment_service", lambda: service_stub
+        composition_module,
+        "_compile_http_runtime",
+        lambda **_kwargs: RuntimeHandle(graph_stub),
     )
-    monkeypatch.setattr(http_module, "start_ingest_worker", lambda: events.append("ingest_start"))
+    monkeypatch.setattr(composition_module, "default_thread_store", lambda: store_stub)
+    monkeypatch.setattr(composition_module, "get_workspace_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        composition_module, "default_attachment_service", lambda: service_stub
+    )
+    monkeypatch.setattr(composition_module, "start_application_ingest_worker", lambda: events.append("ingest_start"))
     prep_calls: list[Any] = []
     monkeypatch.setattr(
-        http_module,
-        "start_attachment_prep_worker",
+        composition_module,
+        "start_application_attachment_prep_worker",
         lambda service: events.append("prep_start") or prep_calls.append(service),
     )
     resume_kwargs: dict[str, Any] = {}
@@ -793,18 +810,18 @@ def test_serve_starts_the_resumer_before_binding_and_stops_it_first(
         events.append("resume_start")
         resume_kwargs.update(kwargs)
 
-    monkeypatch.setattr(http_module, "start_attachment_resume_worker", _resume_start)
+    monkeypatch.setattr(composition_module, "start_application_attachment_resume_worker", _resume_start)
     monkeypatch.setattr(
         uvicorn, "run", lambda *a, **k: events.append("serve")
     )
     monkeypatch.setattr(
-        http_module, "stop_attachment_resume_worker", lambda: events.append("resume_stop")
+        composition_module, "stop_attachment_resume_worker", lambda: events.append("resume_stop")
     )
     monkeypatch.setattr(
-        http_module, "stop_attachment_prep_worker", lambda: events.append("prep_stop")
+        composition_module, "stop_attachment_prep_worker", lambda: events.append("prep_stop")
     )
     monkeypatch.setattr(
-        http_module, "stop_ingest_worker", lambda: events.append("ingest_stop")
+        composition_module, "stop_ingest_worker", lambda: events.append("ingest_stop")
     )
 
     http_module.serve()
@@ -819,9 +836,22 @@ def test_serve_starts_the_resumer_before_binding_and_stops_it_first(
         "ingest_stop",
     ]
     assert prep_calls == [service_stub]
-    assert resume_kwargs == {
-        "graph": graph_stub,
-        "store": store_stub,
-        "service": service_stub,
-        "workspace_root": tmp_path,
+    assert set(resume_kwargs) == {
+        "graph",
+        "store",
+        "service",
+        "workspace_root",
+        "run_control",
+        "receipts",
     }
+    assert resume_kwargs["graph"] is graph_stub
+    assert resume_kwargs["store"] is store_stub
+    assert resume_kwargs["service"] is service_stub
+    assert resume_kwargs["workspace_root"] == tmp_path
+    assert isinstance(resume_kwargs["run_control"], RunControl)
+    # The background resume reports on the receipts its own doors wrote,
+    # so it is handed the projection paired with the thread store.
+    assert isinstance(resume_kwargs["receipts"], TurnReceiptProjector)
+    assert (
+        resume_kwargs["run_control"] is http_module.app.state.fin_resources.run_control
+    )

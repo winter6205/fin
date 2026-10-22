@@ -76,6 +76,65 @@ def test_host_prompt_names_every_research_tool() -> None:
         assert tool_name in HOST_SYSTEM_PROMPT
 
 
+def test_the_prompts_speak_about_an_enterprise_corpus_not_filings() -> None:
+    """The model-facing instructions must describe an ORDINARY enterprise
+    corpus — policies, handbooks, product guides, meeting notes, reports,
+    contracts, structured records — and must not require a financial
+    company / form / metric for an ordinary question (spec
+    "Model-facing enterprise language").
+
+    Financial material stays legal as ONE source category (the XBRL tool
+    is exactly that), but it may not be the frame the whole corpus is
+    described in: a filing-only frame is a routing bug for a policy
+    question, and it is what this pins.
+    """
+    from fin.host.agent_instructions import (
+        CLARIFY_SYSTEM_PROMPT,
+        DIALOGUE_SYSTEM_PROMPT,
+        OFF_TOPIC_SYSTEM_PROMPT,
+        SEARCH_MODE_USAGE_COPY,
+    )
+
+    prompts = {
+        "host": HOST_SYSTEM_PROMPT,
+        "dialogue": DIALOGUE_SYSTEM_PROMPT,
+        "off_topic": OFF_TOPIC_SYSTEM_PROMPT,
+        "clarify": CLARIFY_SYSTEM_PROMPT,
+        **{f"档 {mode}": copy for mode, copy in SEARCH_MODE_USAGE_COPY.items()},
+    }
+    for name, prompt in prompts.items():
+        lowered = prompt.lower()
+        assert "10-q" not in lowered, name
+        assert "10-k" not in lowered, name
+        # The corpus is not characterized as filings anywhere.
+        assert "filing claim" not in lowered, name
+        assert "filing facts" not in lowered, name
+        assert "filings corpus" not in lowered, name
+    # The corpus the model is told about is the enterprise one.
+    assert "policies" in HOST_SYSTEM_PROMPT.lower()
+    assert "handbooks" in HOST_SYSTEM_PROMPT.lower()
+    # And an ordinary question about any of it is a normal research
+    # question — no financial company / form / metric is required.
+    assert "normal research question" in HOST_SYSTEM_PROMPT.lower()
+
+
+def test_the_prompts_keep_the_citation_and_refusal_discipline() -> None:
+    """Generalizing the corpus must NOT soften the discipline: the
+    tool-before-answer rule, the citation-span rule and the no-evidence
+    refusal sentence all stay."""
+    from fin.host.agent_instructions import NO_EVIDENCE_REFUSAL
+
+    assert "Use the research tools before you answer" in HOST_SYSTEM_PROMPT
+    assert "as a citation span" in HOST_SYSTEM_PROMPT
+    assert "do not paraphrase the span" in HOST_SYSTEM_PROMPT
+    assert NO_EVIDENCE_REFUSAL in HOST_SYSTEM_PROMPT
+    assert "do not present parametric memory as evidence" in HOST_SYSTEM_PROMPT
+    # The catalog stays discoverable: list_files is named and described,
+    # never banned, and not made a mandatory first call.
+    assert "- list_files: catalog over the 知识库" in HOST_SYSTEM_PROMPT
+    assert "Optional filters" in HOST_SYSTEM_PROMPT
+
+
 def test_host_prompt_drops_legacy_read_file_name() -> None:
     """``read_source`` replaces the model-facing ``read_file`` with no
     compatibility path (spec thread-attachment-source-read decision 5):
@@ -106,6 +165,23 @@ def test_host_prompt_drops_stale_bm25_mention() -> None:
 def test_host_prompt_describes_retrieve_as_the_retrieve_port() -> None:
     """The seam wording stays ``retrieve port`` (ADR 0032)."""
     assert "retrieve port" in HOST_SYSTEM_PROMPT
+
+
+def test_host_prompt_teaches_the_document_choice_wire_format() -> None:
+    """GE-4: the grounded track must be told the candidate-request shape.
+
+    Without this the ``choice`` branch is unreachable by a real model —
+    the marker and payload field would live only in the parser. The
+    prompt imports the SAME constants the parser reads, so the taught
+    shape and the accepted shape cannot drift.
+    """
+    from fin.host.grounded.grounded_decision import (
+        CANDIDATE_PAYLOAD_FIELD,
+        CANDIDATE_TERMINATOR,
+    )
+
+    assert CANDIDATE_TERMINATOR in HOST_SYSTEM_PROMPT
+    assert CANDIDATE_PAYLOAD_FIELD in HOST_SYSTEM_PROMPT
 
 
 # ----- corpus-serve-ingest T4: attachment context block -----

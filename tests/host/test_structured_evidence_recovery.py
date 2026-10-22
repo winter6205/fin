@@ -26,20 +26,20 @@ from typing import Any
 
 import pytest
 
-from fin.host.evidence_contract import (
+from fin.host.evidence.evidence_contract import (
     ACCESS_DENIED,
     EVIDENCE_EXPIRED,
     EVIDENCE_UNAVAILABLE,
     MALFORMED_EVIDENCE_CONTRACT,
     RETRIEVE_UNAVAILABLE,
 )
-from fin.host.structured_evidence import build_stored_record
-from fin.host.structured_evidence_admission import admit_structured_evidence
-from fin.host.structured_evidence_invalidation import (
+from fin.host.evidence.structured_evidence import build_stored_record
+from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
+from fin.host.evidence.structured_evidence_invalidation import (
     StructuredInvalidationRefusal,
     drain_invalidation_batch,
 )
-from fin.host.structured_evidence_recovery import (
+from fin.host.evidence.structured_evidence_recovery import (
     DENIED,
     UNREADABLE,
     UNRESOLVED,
@@ -49,7 +49,7 @@ from fin.host.structured_evidence_recovery import (
     sweep_recovered_evidence,
     withhold_retained_references,
 )
-from fin.host.structured_evidence_replay import find_replayable_record
+from fin.host.evidence.structured_evidence_replay import find_replayable_record
 from fin.host.thread_store import (
     EvidenceScrubOutcome,
     InMemoryThreadStore,

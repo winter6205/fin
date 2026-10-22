@@ -58,7 +58,16 @@ from fin.corpus.ingest_state_errors import InvalidStateError  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _MD_DIR = REPO_ROOT / "data/corpus/dataset/documents/md"
 V1_SOURCE = _MD_DIR / "0000320193-24-000006__table_dense__md__md.md"
-DOC = "0000320193-24-000006"
+_SCOPE = "fin-durable-worker"
+
+
+def _document_id(scope: str, data: bytes) -> str:
+    """The public upload's content-derived id, written out longhand."""
+    digest = hashlib.sha256(data).digest()
+    preimage = (
+        b"fin-corpus-document-v1\x00" + scope.encode("utf-8") + b"\x00" + digest
+    )
+    return "doc_" + hashlib.sha256(preimage).hexdigest()
 
 # Process A: the real accept door on the configured object store, then
 # the worker's claim edge — and the process dies there, mid-run.
@@ -73,17 +82,17 @@ from fin.retrieve.fake_push_port import FakePushPort
 
 dsn = os.environ["FIN_RESTART_DSN"]
 data = Path(sys.argv[1]).read_bytes()
-doc = sys.argv[2]
+scope = sys.argv[2]
 states = PostgresIngestStateStore(dsn)
 endpoint = IngestEndpoint(
     push_port=FakePushPort(),
     object_store=create_object_store(),
     metadata_store=PostgresMetadataStore(dsn),
     state_store=states,
+    corpus_scope_id=scope,
 )
-submission = endpoint.submit_durable(
-    data, declared_format="md", document_id=doc
-)
+submission = endpoint.submit_durable(data, declared_format="md")
+doc = submission.document_id
 states.transition(
     doc,
     "fetching",
@@ -94,7 +103,7 @@ states.transition(
 )
 print(json.dumps({
     "pid": os.getpid(),
-    "document_id": submission.document_id,
+    "document_id": doc,
     "accepted_state": submission.state.value,
     "state": states.get_job(doc).state.value,
     "version": submission.version,
@@ -199,13 +208,15 @@ def test_a_dead_workers_job_is_resumed_and_readied_by_a_fresh_process(
     """
     payload = V1_SOURCE.read_bytes()
     version = hashlib.sha256(payload).hexdigest()
-    object_key = f"filings/{DOC}/{version}"
+    doc = _document_id(_SCOPE, payload)
+    object_key = f"filings/{doc}/{version}"
     assert configured_object_store, "the object-store gate must name a bucket"
     journal_dir = tmp_path / "push-journal"
     try:
         accepted = _child(
-            clean_tables, _ACCEPT_AND_CLAIM_CHILD, str(V1_SOURCE), DOC
+            clean_tables, _ACCEPT_AND_CLAIM_CHILD, str(V1_SOURCE), _SCOPE
         )
+        assert accepted["document_id"] == doc, accepted
         assert accepted["accepted_state"] == "pending", accepted
         assert accepted["state"] == "fetching", accepted
         assert accepted["version"] == version, accepted
@@ -213,19 +224,19 @@ def test_a_dead_workers_job_is_resumed_and_readied_by_a_fresh_process(
         resumed = _child(
             clean_tables,
             _RESUME_WORKER_CHILD,
-            DOC,
+            doc,
             str(journal_dir),
         )
 
         # Discovery, not instruction: the worker found this one job
         # from durable state in a process that never accepted it.
-        assert resumed["found"] == [DOC], resumed
+        assert resumed["found"] == [doc], resumed
         assert resumed["ran"] == [True], resumed
         assert resumed["busy"] == [False], resumed
         assert resumed["states"] == ["ready"], resumed
         assert resumed["job_state"] == "ready", resumed
 
-        report = _child(clean_tables, _STATUS_CHILD, DOC)
+        report = _child(clean_tables, _STATUS_CHILD, doc)
         assert report["state"] == "ready", report
         assert report["version"] == version, report
         assert report["text_ready"] is True, report

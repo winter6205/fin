@@ -23,8 +23,8 @@ from typing import Any, Final, cast, get_args
 
 import pytest
 
-from fin.host.citation_gate import QUOTABLE_EVIDENCE_KINDS
-from fin.host.grounded_assessment import (
+from fin.host.grounded.citation_gate import QUOTABLE_EVIDENCE_KINDS
+from fin.host.grounded.grounded_assessment import (
     RECEIPT_SHAPED_FAILURE_CLASSES,
     Completion,
     Derivation,

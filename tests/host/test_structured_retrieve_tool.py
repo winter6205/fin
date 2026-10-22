@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.messages import ToolMessage
 
 from fin.host.graph import _make_retrieve_tool
-from fin.host.structured_evidence import validate_structured_result
+from fin.host.evidence.structured_evidence import validate_structured_result
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
 
 
@@ -116,7 +116,11 @@ def test_host_cascade_binds_sql_and_forwards_the_structured_result_sibling() -> 
     command, _tool = _call_host_retrieve(adapter, search_mode="sql")
 
     payload = _tool_message(command)
-    assert payload == {"chunks": [], "structured_result": STRUCTURED_RESULT}
+    assert payload == {
+        "chunks": [],
+        "distribution": "zero",
+        "structured_result": STRUCTURED_RESULT,
+    }
     arguments = adapter.payloads[0]["params"]["arguments"]
     assert arguments["filters"]["search_mode"] == "sql"
     assert arguments["filters"]["structured_query"] == STRUCTURED_QUERY

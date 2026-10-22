@@ -48,9 +48,9 @@ import pytest
 
 from fin.corpus.extracted import Locator
 from fin.corpus.facts import Fact, write_facts
-from fin.host.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
-from fin.host.jev_choice import JevChoiceClient
-from fin.host.jev_config import JevConfig
+from fin.host.attachment.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
+from fin.host.question.jev_choice import JevChoiceClient
+from fin.host.question.jev_config import JevConfig
 
 
 def pytest_collection_modifyitems(
@@ -63,7 +63,7 @@ def pytest_collection_modifyitems(
     * ``soft_track``: Soft-Track ship suites (spec Soft-Track ship gate).
     * ``memory_on``: cases that exercise the ON memory path under
       pytest (T3 / SC3). Default ``uv run pytest -q`` must stay OFF
-      even when the operator ``.env`` has ``FIN_MEMORY_ENABLED=true``
+      even when ``~/.fin/settings.yaml`` has ``memory.enabled: true``
       (ADR 0035); the marker is the opt-in switch the gold set uses.
     * ``mcp``: live boot acceptance that drives the real
       `fin up` stack (Docker + a sibling iknow-memory checkout +
@@ -132,7 +132,7 @@ def _memory_on_env_for_marked_tests(
     drops it again before each unmarked test. A test marked
     ``@pytest.mark.memory_on`` opts out of THAT autouse strip; this
     autouse fixture is the paired side, restoring the value the
-    operator's ``.env`` would have set so the test sees the real ON
+    operator settings would have set so the test sees the real ON
     path. monkeypatch teardown cleans up after the test, so subsequent
     unmarked tests still see a clean env.
     """
@@ -148,7 +148,7 @@ _ATTACHMENT_BOUND_KEYS = tuple(key for key, _ in _PRODUCT_ENV_BOUNDS)
 
 @pytest.fixture
 def deployed_attachment_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Deploy the four attachment bounds as ``.env.example`` ships them.
+    """Deploy the four attachment bounds as ``settings.example.yaml`` ships them.
 
     ``serve()`` reads the bounds before it binds, so any boot-level test that
     is about something else has to state a usable bound first or it aborts for
@@ -158,16 +158,17 @@ def deployed_attachment_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     caches one bound set per process, so a test that deploys an environ has to
     pin the cache with it.
     """
+    import fin.host.application.composition as composition_module
     import fin.host.http as http_module
-    from fin.host.operator_env import parse_env_file
+    from fin.host.operator_settings import shipped_attachment_bounds
 
-    deployed = parse_env_file(
-        (Path(__file__).resolve().parents[2] / ".env.example").read_text()
+    deployed = shipped_attachment_bounds(
+        repo_root=Path(__file__).resolve().parents[2]
     )
     missing = [key for key in _ATTACHMENT_BOUND_KEYS if key not in deployed]
-    assert not missing, f".env.example lost {missing}"
+    assert not missing, f"settings.example.yaml lost {missing}"
     monkeypatch.setattr(
-        http_module, "_http_attachment_budgets_singleton", None, raising=False
+        composition_module, "_http_attachment_budgets_singleton", None, raising=False
     )
     for key in _ATTACHMENT_BOUND_KEYS:
         monkeypatch.setenv(key, deployed[key])
@@ -338,3 +339,30 @@ def compare_seed(tmp_path: Path) -> CompareSeed:
             facts_root=seed.root,
         )
     return seed
+
+
+@pytest.fixture(autouse=True)
+def _reset_run_control_registry():
+    """Clear the process-wide ``RunControl`` registry around every host test.
+
+    ``create_app`` builds ONE ``RunControl`` per app and a run that PAUSED
+    keeps its entry by design — the operator owns that run's clock — so a
+    pause left behind by one test is counted by ``/api/status`` in a later
+    test's "an idle process publishes zero counts". Emptying the registry
+    after the case is that run's own cleanup and asserts nothing: it is
+    the lifecycle an abandoned or deleted thread gets, and no test
+    observes the registry mid-pause on purpose. The registry is touched
+    directly because ``RunControl`` exposes ``forget(thread_id)`` but no
+    bulk clear, and adding a production method for test cleanup would put
+    a seam only a test can reach in the product.
+    """
+    from fin.host.http import app as workspace_app
+    from fin.host.run_control import RunControl
+
+    yield
+    resources = getattr(getattr(workspace_app, "state", None), "fin_resources", None)
+    control = getattr(resources, "run_control", None)
+    if isinstance(control, RunControl):
+        with control._lock:
+            control._runs.clear()
+            control._tokens.clear()

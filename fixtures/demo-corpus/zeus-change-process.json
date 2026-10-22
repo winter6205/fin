@@ -1,0 +1,24 @@
+{
+  "source_ref": "zeus-change-process",
+  "title": "ZEUS Change Management Process",
+  "content": "ZEUS Change Management Process · Page 1\nSection 1 covers change request intake and triage.\nEvery production change is triaged in exactly four steps:\n  Step 1: the requester files the change request in the\n          CR-Tracker queue.\n  Step 2: the requester attaches a written rollback plan to the\n          same queue entry. A change request submitted without a\n          written rollback plan is rejected at triage and is not\n          carried forward to the Change Advisory Board.\n  Step 3: the Change Manager assigns a severity within 1\n          business day of the queue entry. The four severities\n          are S1 Critical, S2 Major, S3 Minor and S4 Standard.\n  Step 4: triage closes the queue entry with the assigned\n          severity and the earliest implementation window.\nProcess owner: Ingrid Vasquez, Change Manager.\n\nZEUS Change Management Process · Page 2\nSection 2 covers Change Advisory Board review and the change\nfreeze.\nThe Change Advisory Board meets every Tuesday at 15:00 UTC. A\nchange is approved only when at least 4 of the 5 voting members\nare present and at least 4 of them vote in favour. The Chair\ndoes not hold a casting vote.\nThe ZEUS change freeze runs from 2024-12-20T00:00:00Z to\n2025-01-06T00:00:00Z inclusive. No non-emergency change may be\nimplemented inside that window.\nAn S1 Critical change may bypass the Change Advisory Board. It\nrequires the written approval of Tomas Lindqvist, Vice\nPresident of Engineering, before implementation, and it must be\nretro-reviewed by the board at its next meeting or within 2\nbusiness days, whichever is earlier.",
+  "chunks": [
+    {
+      "content": "ZEUS Change Management Process · Page 1\nSection 1 covers change request intake and triage.\nEvery production change is triaged in exactly four steps:\n  Step 1: the requester files the change request in the\n          CR-Tracker queue.\n  Step 2: the requester attaches a written rollback plan to the\n          same queue entry. A change request submitted without a\n          written rollback plan is rejected at triage and is not\n          carried forward to the Change Advisory Board.\n  Step 3: the Change Manager assigns a severity within 1\n          business day of the queue entry. The four severities\n          are S1 Critical, S2 Major, S3 Minor and S4 Standard.\n  Step 4: triage closes the queue entry with the assigned\n          severity and the earliest implementation window.\nProcess owner: Ingrid Vasquez, Change Manager.",
+      "index": 0
+    },
+    {
+      "content": "ZEUS Change Management Process · Page 2\nSection 2 covers Change Advisory Board review and the change\nfreeze.\nThe Change Advisory Board meets every Tuesday at 15:00 UTC. A\nchange is approved only when at least 4 of the 5 voting members\nare present and at least 4 of them vote in favour. The Chair\ndoes not hold a casting vote.\nThe ZEUS change freeze runs from 2024-12-20T00:00:00Z to\n2025-01-06T00:00:00Z inclusive. No non-emergency change may be\nimplemented inside that window.\nAn S1 Critical change may bypass the Change Advisory Board. It\nrequires the written approval of Tomas Lindqvist, Vice\nPresident of Engineering, before implementation, and it must be\nretro-reviewed by the board at its next meeting or within 2\nbusiness days, whichever is earlier.",
+      "index": 1
+    }
+  ],
+  "metadata": {
+    "document_type": "policy_process",
+    "page_count": 2,
+    "company": "ZEUS",
+    "form": "10-Q",
+    "period": "2024 Q2",
+    "filing_date": "2024-07-22"
+  },
+  "valid_from": "2024-07-22T00:00:00Z"
+}

@@ -45,7 +45,7 @@ from fin.eval.concurrency.supplements import (
     refusal_rate_dimension_report,
     validate_supplement_report,
 )
-from fin.host.citation_gate import DoneResult, EvidenceItem, verify_citations
+from fin.host.grounded.citation_gate import DoneResult, EvidenceItem, verify_citations
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.push_port import push_records
 

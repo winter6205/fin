@@ -4,7 +4,7 @@ The in-process suite (``test_structured_evidence_recovery.py``) proves the
 sweep's decisions. It cannot prove the boundary, because a fixture holds no
 database and no child. This lane does, in the shape T13 and P2-I2 established: a
 **real built iknow child process** over stdio, driven through the **real**
-:class:`~fin.host.evidence_session_registry.EvidenceSessionRegistry`, against
+:class:`~fin.host.evidence.evidence_session_registry.EvidenceSessionRegistry`, against
 **real PostgreSQL**.
 
 What crosses a real boundary here, and would not cross one in a fixture:
@@ -59,19 +59,19 @@ from typing import Any, Iterator
 import psycopg
 import pytest
 
-from fin.host.evidence_contract import (
+from fin.host.evidence.evidence_contract import (
     ACCESS_DENIED,
     EVIDENCE_UNAVAILABLE,
     RETRIEVE_UNAVAILABLE,
 )
-from fin.host.evidence_session_registry import EvidenceSessionRegistry
-from fin.host.structured_evidence import build_stored_record
-from fin.host.structured_evidence_admission import admit_structured_evidence
-from fin.host.structured_evidence_invalidation import (
+from fin.host.evidence.evidence_session_registry import EvidenceSessionRegistry
+from fin.host.evidence.structured_evidence import build_stored_record
+from fin.host.evidence.structured_evidence_admission import admit_structured_evidence
+from fin.host.evidence.structured_evidence_invalidation import (
     StructuredInvalidationRefusal,
     drain_invalidation_batch,
 )
-from fin.host.structured_evidence_recovery import (
+from fin.host.evidence.structured_evidence_recovery import (
     DENIED,
     UNREADABLE,
     VERIFIED,
@@ -80,7 +80,7 @@ from fin.host.structured_evidence_recovery import (
     revalidate_retained_references,
     sweep_recovered_evidence,
 )
-from fin.host.structured_evidence_replay import find_replayable_record
+from fin.host.evidence.structured_evidence_replay import find_replayable_record
 from fin.host.thread_store import PostgresThreadStore, RunRecord
 from fin.retrieve.evidence_route import (
     EvidenceIdentityBinding,
@@ -757,7 +757,7 @@ def _open_gap(env: dict[str, Any], consumer_id: str) -> Any:
     would make this case's ``scrubbed_entries`` a count of what earlier cases
     happened to retain. Yielding one thread per case and dropping it afterwards
     is what keeps those counts exact. It also keeps
-    :func:`~fin.host.structured_evidence_replay.find_replayable_record` honest,
+    :func:`~fin.host.evidence.structured_evidence_replay.find_replayable_record` honest,
     which refuses two records naming one reference.
 
     Yields the thread id, so a case can read the column back with SQL.
@@ -953,7 +953,7 @@ def test_a_denied_reference_is_refused_by_the_store_even_without_the_gate(
     thing standing between a denial and a payload.
     """
 
-    from fin.host.structured_evidence_replay import replay_stored_evidence
+    from fin.host.evidence.structured_evidence_replay import replay_stored_evidence
 
     with _stored_only(recovery_env) as thread_id:
         records = _stored_records(recovery_env["db_url"], thread_id)

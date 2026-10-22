@@ -5,7 +5,9 @@ Calls the iknow-memory MCP tools ``submit_index_job`` and
 ``specs/mcp-tool-surface.md`` §Index-job tool contract). The arguments
 are exactly the pair ``{source_ref, content_identity}`` for submit and
 ``{job_id}`` for poll — fin sends the identity it read back from the
-push response and never recomputes one.
+push response and never recomputes one. A poll's
+``community_index_state`` passes through verbatim, including an explicit
+``null`` meaning the corpus-wide C singleton was never written.
 
 Failure translation
 -------------------
@@ -48,6 +50,7 @@ from fin.retrieve.mcp_session import (
     default_mcp_timeout_seconds,
     build_handshake_wire,
     build_tools_call_frame,
+    exchange_sync_oneshot_mcp,
     parse_jsonrpc_response_lines,
     validate_initialize_response,
 )
@@ -156,34 +159,23 @@ class MCPIndexJobPort:
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
         """One-shot stdio exchange: spawn, handshake, call, read two
-        responses. Raises ``OSError`` / ``subprocess.TimeoutExpired``
-        on any transport failure, which the caller translates.
+        responses. Raises ``OSError`` on any transport failure, which
+        the caller translates.
 
         The notification has no response, so the two response lines
-        must be initialize first, then tools/call.
+        must be initialize first, then tools/call. A conforming MCP
+        stdio server answers and then keeps serving, so the exchange
+        reads those two frames rather than waiting for the child to
+        exit — the transport it used to use (``communicate()``) could
+        only ever succeed against a server that closes on stdin EOF.
         """
         if not self._command:
             raise OSError("no MCP command configured")
-        process = subprocess.Popen(
+        stdout = exchange_sync_oneshot_mcp(
             self._command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            build_handshake_wire(payload, client_name=_MCP_CLIENT_NAME),
+            timeout=self._timeout,
         )
-        try:
-            stdout, stderr = process.communicate(
-                build_handshake_wire(payload, client_name=_MCP_CLIENT_NAME),
-                timeout=self._timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            process.kill()
-            process.communicate()
-            raise OSError(f"MCP index-job call timed out: {exc}") from exc
-        if process.returncode != 0:
-            raise OSError(
-                f"MCP server exited {process.returncode}: "
-                f"{stderr.decode(errors='replace')!r}"
-            )
         try:
             responses = parse_jsonrpc_response_lines(stdout)
         except MCPStdioProtocolError as exc:
@@ -371,14 +363,29 @@ def _record_from_body(body: Mapping[str, Any], *, where: str) -> IndexJobRecord:
 
 def _community_state_from_body(
     body: Mapping[str, Any],
-) -> CommunityIndexState:
-    """The separate corpus-wide sub-object a poll must carry; its
-    absence is off-contract, not a silent ``None`` ready claim."""
-    state = body.get("community_index_state")
-    if not isinstance(state, Mapping):
+) -> CommunityIndexState | None:
+    """The separate corpus-wide sub-object a poll must carry.
+
+    The key is required either way: a body that omits it is
+    off-contract and stays an unavailable error. An explicit
+    ``null`` is different — it is the service's honest "the C
+    singleton has never been written" answer, which fin passes
+    through as ``None`` rather than mistaking for a
+    readiness claim. Everything else must still be a
+    well-formed sub-object.
+    """
+    if "community_index_state" not in body:
         raise IndexJobUnavailableError(
             "poll_index_job response carries no community_index_state "
             "sub-object"
+        )
+    state = body["community_index_state"]
+    if state is None:
+        return None
+    if not isinstance(state, Mapping):
+        raise IndexJobUnavailableError(
+            "poll_index_job response community_index_state is "
+            f"{state!r}, expected a sub-object or null"
         )
     status = state.get("status")
     if not isinstance(status, str) or not status:

@@ -476,7 +476,10 @@ def test_adapter_over_real_transport_no_match_is_the_miss_shape() -> None:
         locator_map={"fixture-1": _loc("DOC-2023Q1")},
         timeout_seconds=20.0,
     )
-    assert adapter.retrieve("zzzz-no-such-term") == {"chunks": []}
+    assert adapter.retrieve("zzzz-no-such-term") == {
+        "chunks": [],
+        "distribution": "zero",
+    }
 
 
 def test_adapter_over_real_transport_forwards_document_id_filter() -> None:

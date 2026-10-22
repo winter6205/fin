@@ -35,6 +35,11 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from fin.corpus.extracted import ExtractedPage, Locator
+from fin.retrieve.metadata_filters import (
+    InvalidFilterError,
+    invalid_filter,
+    normalized_metadata_filters,
+)
 from fin.retrieve.input_validation import (
     InputValidationLedger,
     validate_filters,
@@ -42,10 +47,13 @@ from fin.retrieve.input_validation import (
 )
 from fin.retrieve.port import (
     DATABASE_ROWS_KEY,
+    DocumentScope,
     Chunk,
     STRUCTURED_SEARCH_UNAVAILABLE_CODE,
     _structured_query_refusal_code,
+    distribution_of,
     new_database_rows,
+    prepare_document_scope,
     resolve_search_mode,
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY,
@@ -254,6 +262,8 @@ class FakeRetrievePort:
         structured_request: Mapping[str, Any] | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
+        filters: Mapping[str, Any] | None = None,
+        document_scope: DocumentScope | None = None,
     ) -> dict[str, Any]:
         """Return ``{"chunks": [...]}`` or ``{"chunks": []}``.
 
@@ -311,7 +321,18 @@ class FakeRetrievePort:
         # shape.
         ledger = self.input_validation_failures
         validate_query(query, ledger=ledger)
+        # The generic metadata filter: same boundary as the MCP adapter —
+        # validated before anything is recorded or answered.
+        try:
+            effective_filters = normalized_metadata_filters(filters)
+        except InvalidFilterError:
+            return invalid_filter()
         effective_search_mode = resolve_search_mode(search_mode)
+        effective_document_scope, scope_refusal = prepare_document_scope(
+            document_scope, document_id, effective_search_mode
+        )
+        if scope_refusal is not None:
+            return {"error": scope_refusal}
         refusal = _structured_query_refusal_code(
             structured_request,
             search_mode=effective_search_mode,
@@ -327,6 +348,9 @@ class FakeRetrievePort:
                     sql_window_end,
                 )
             ),
+            has_generic_filters=effective_filters is not None,
+            has_scope_locator=document_id is not None,
+            has_document_scope=effective_document_scope is not None,
         )
         if refusal is not None:
             return {"error": refusal}
@@ -341,20 +365,22 @@ class FakeRetrievePort:
             manifest_docs=self._manifest_docs,
             ledger=ledger,
         )
-        self.calls.append(
-            {
-                "query": query,
-                "document_id": document_id,
-                "cik": cik,
-                "form": form,
-                "ticker": ticker,
-                "filing_date": filing_date,
-                "limit": limit,
-                "search_mode": effective_search_mode,
-                "sql_window_start": sql_window_start,
-                "sql_window_end": sql_window_end,
-            }
-        )
+        call: dict[str, Any] = {
+            "query": query,
+            "document_id": document_id,
+            "cik": cik,
+            "form": form,
+            "ticker": ticker,
+            "filing_date": filing_date,
+            "limit": limit,
+            "search_mode": effective_search_mode,
+            "sql_window_start": sql_window_start,
+            "sql_window_end": sql_window_end,
+            "filters": effective_filters,
+        }
+        if effective_document_scope is not None:
+            call["document_scope"] = effective_document_scope
+        self.calls.append(call)
 
         configured = self._configured_outcome(query, effective_search_mode)
         if configured is not None:
@@ -364,6 +390,7 @@ class FakeRetrievePort:
             {"document_id": document_id, "cik": cik, "form": form,
              "ticker": ticker, "filing_date": filing_date},
             limit,
+            effective_document_scope,
         )
 
     def _configured_outcome(
@@ -417,6 +444,7 @@ class FakeRetrievePort:
         query: str,
         filters: Mapping[str, str | None],
         limit: int,
+        document_scope: DocumentScope | None,
     ) -> dict[str, Any]:
         document_id = filters.get("document_id")
         cik, form = filters.get("cik"), filters.get("form")
@@ -452,9 +480,23 @@ class FakeRetrievePort:
                     filing_date=filing_date,
                 )
             ]
+        if document_scope is not None:
+            allowed_sources = {
+                (entry.document_id, entry.version) for entry in document_scope
+            }
+            chunks = [
+                chunk
+                for chunk in chunks
+                if (
+                    chunk.source_ref.document_id,
+                    chunk.source_ref.version,
+                )
+                in allowed_sources
+            ]
         # Truncate to the resolved limit; the underlying list
         # is not mutated so the next call sees the same corpus.
-        return {"chunks": list(chunks[:effective_limit])}
+        returned = list(chunks[:effective_limit])
+        return {"chunks": returned, "distribution": distribution_of(returned)}
 
     def read_slice(
         self,

@@ -16,9 +16,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import ExtractedPage, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
-from fin.host.jev_choice import JEV_CHOICE_EXIT_TRANSPORT, JevChoiceError
-from fin.host.track_decision import decide_track
+from fin.host.grounded.citation_gate import HIDDEN_BOUNCE_MARKER
+from fin.host.question.jev_choice import JEV_CHOICE_EXIT_TRANSPORT, JevChoiceError
+from fin.host.grounded.track_decision import decide_track
 from fin.retrieve import FakeRetrievePort
 from jev_fake import FakeJevChoice
 
@@ -167,13 +167,18 @@ def test_sc_ambiguous_high_conf_grounded_binds_tools(
     assert "read_file" not in tool_names
 
 
-def test_sc_low_conf_any_label_clarifies_no_tools() -> None:
-    """SC3: any label + low confidence → clarify, no tools."""
+def test_sc_low_conf_any_label_reaches_grounded_no_tools() -> None:
+    """SC3 (GE-1): any label + sub-threshold confidence means the judge
+    decided nothing — the turn reaches the grounded leaf rather than a
+    pre-retrieval clarify. The scripted model makes no tool call, so the
+    leaf runs no tools; with no retrieval the gate bounces the
+    uncited answer."""
     fake = FakeJevChoice([("grounded", 0.3)])
     decision = decide_track(
         [HumanMessage(content="dig into the numbers?")], jev_client=fake
     )
-    assert decision.track == "clarify"
+    assert decision.track == "grounded"
+    assert decision.decision_tier == "jev_fallback"
     assert decision.signals.get("jev_exit") == "low_confidence"
 
     model = ScriptedChatModel(
@@ -195,15 +200,20 @@ def test_sc_low_conf_any_label_clarifies_no_tools() -> None:
         },
         config=_cfg("jev-sc3"),
     )
-    assert out["track"] == "clarify"
-    assert out["status"] == "done"
+    assert out["track"] == "grounded"
+    assert out["track_decision"]["decision_tier"] == "jev_fallback"
+    assert out["track_decision"]["signals"].get("jev_exit") == "low_confidence"
+    assert out["status"] == "refuse"
     for message in out["messages"]:
         if isinstance(message, AIMessage):
             assert not message.tool_calls
 
 
-def test_sc_judge_throw_clarifies_not_grounded() -> None:
-    """SC4: a judge throw fail-closes to clarify — never silent grounded."""
+def test_sc_judge_throw_reaches_grounded_not_clarify() -> None:
+    """SC4 (GE-1): a judge throw reaches the grounded leaf — never a
+    pre-retrieval clarify and never a crash. The throw is contained at
+    the cascade boundary; the receipt records the typed exit. With no
+    retrieval the gate bounces the uncited answer."""
     fake = FakeJevChoice(
         [JevChoiceError("down", exit_code=JEV_CHOICE_EXIT_TRANSPORT)]
     )
@@ -223,9 +233,10 @@ def test_sc_judge_throw_clarifies_not_grounded() -> None:
         },
         config=_cfg("jev-sc4"),
     )
-    assert out["track"] == "clarify"
+    assert out["track"] == "grounded"
+    assert out["track_decision"]["decision_tier"] == "jev_fallback"
     assert out["track_decision"]["signals"]["jev_exit"] == "transport"
-    assert out["status"] == "done"
+    assert out["status"] == "refuse"
 
 
 def test_gray_zone_ask_carries_leaf_semantics() -> None:

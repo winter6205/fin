@@ -24,7 +24,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.evidence_contract import AdmissionContext, validate_evidence
+from fin.host.evidence.evidence_contract import AdmissionContext, validate_evidence
 from fin.host.state import reset_input_state
 from fin.host.tools.compare_facts import COMPARISON_SCHEMA
 from fin.retrieve import FakeRetrievePort

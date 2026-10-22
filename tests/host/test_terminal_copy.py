@@ -32,7 +32,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.citation_gate import UNSUPPORTED_DATABASE_CLAIM
+from fin.host.grounded.citation_gate import UNSUPPORTED_DATABASE_CLAIM
+from fin.host.grounded.readable_projection import (
+    EVIDENCE_REFUSAL_REASONS,
+    FAILURE_CLASS_BY_REASON,
+    POLICY_REFUSAL_COPY,
+)
 from fin.host.run_payload import (
     ORDINARY_PERSON_COPY,
     _run_to_response_payload,
@@ -43,7 +48,7 @@ from fin.host.run_payload import (
 # Every ``status_reason`` a refusing terminal state can carry:
 # ``unknown_locator`` / ``citation_repair_cap`` /
 # ``unsupported_database_claim`` from the citation gate
-# (``fin.host.citation_gate``) and ``numeric_gate_fail`` from
+# (``fin.host.grounded.citation_gate``) and ``numeric_gate_fail`` from
 # the numeric gate (``fin.host.graph.citation_gate_node``).
 REFUSE_REASONS = (
     "unknown_locator",
@@ -87,6 +92,27 @@ def test_every_refuse_reason_has_non_blank_copy() -> None:
     """No refusal reason may fall through to the empty string."""
     blank = [r for r in REFUSE_REASONS if not ordinary_person_copy("refuse", r).strip()]
     assert blank == []
+
+
+def test_policy_refusal_has_safe_copy_without_joining_failure_vocabulary() -> None:
+    """Provider policy disposition has copy, but is not an evidence failure."""
+    assert ordinary_person_copy("refuse", "policy_refuse") == POLICY_REFUSAL_COPY
+    assert POLICY_REFUSAL_COPY.strip()
+    assert "policy_refuse" not in FAILURE_CLASS_BY_REASON
+    assert "policy_refuse" not in EVIDENCE_REFUSAL_REASONS
+
+    payload = _run_to_response_payload(
+        {
+            "status": "refuse",
+            "status_reason": "policy_refuse",
+            "answer": "PRIVATE PROVIDER REFUSAL PROSE",
+            "citations": ({"document_id": "private"},),
+        }
+    )
+    assert payload["status"] == "refuse"
+    assert payload["answer"] == ""
+    assert payload["citations"] == []
+    assert payload["assistant_message"] == POLICY_REFUSAL_COPY
 
 
 # ----- wire payload (SSE status frame + persisted turn row) -----

@@ -1,8 +1,8 @@
 # fin
 
-fin is an enterprise knowledge-QA agent for questions over an operator-provided corpus. The operator asks in a research thread on the workspace, and Soft-Track orchestration on a durable LangGraph host graph routes each turn to one of four tracks: `dialogue`, `clarify`, `off_topic`, or `grounded`. Corpus tools and the code-level citation verifier bind only to the `grounded` track, and the verifier accepts cited evidence only when it was returned during the current run. The corpus is served through fin's retrieve port by the `iknow-memory` MCP server.
+fin is an enterprise knowledge-QA agent for questions over an operator-provided corpus. Its durable LangGraph host graph routes research threads through retrieval and source-reading tools. A code-level citation verifier accepts cited evidence only when it was returned during the current run. fin is the operator-facing entry point; the configured retrieval backend holds and serves the corpus.
 
-The host uses LangChain `ChatOpenAI` with a configurable model (`FIN_MODEL`, default `MiniMax-M3`) and a LangGraph `PostgresSaver` for durable runs. The workspace UI is served locally by the same FastAPI process as the host API.
+The host uses LangChain `ChatOpenAI` with a configurable model (`FIN_MODEL`, default `MiniMax-M3`) and a LangGraph `PostgresSaver` for durable runs. Retrieval can use the `iknow-memory` MCP server behind fin's retrieve port. The workspace UI is served locally by the same FastAPI process as the host API.
 
 ## Repository map
 

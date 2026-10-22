@@ -2,19 +2,19 @@
 
 The contract under test is two-part:
 
-1. **Default pytest stays OFF** even when the operator ``.env`` (or any
+1. **Default pytest stays OFF** even when ``~/.fin/settings.yaml`` (or any
    other source) sets ``FIN_MEMORY_ENABLED=true``. This is enforced by
    ``tests/conftest.py`` clearing the env var at session start AND by an
    autouse fixture that strips it before each unmarked test. Memory
    cases opt in via ``@pytest.mark.memory_on``; the paired fixture in
    ``tests/host/conftest.py`` re-installs ``true`` so an opt-in test
-   sees the same ON path the operator's ``.env`` produces.
+   sees the same ON path operator settings produce.
 2. **The OFF behavior still works** when the operator explicitly sets
    the var to ``false`` (SC4 second half) or omits it entirely while
    ``FIN_CHECKPOINT_URL`` is present (SC2). Garbage stays typed
    (``MemoryConfigError``), so a typo is a loud failure, not silent OFF.
 
-The operator leak scenario — operator ``.env`` has
+The operator leak scenario — settings would project
 ``FIN_MEMORY_ENABLED=true`` and that value would otherwise be picked up
 by ``build_memory_port`` — is simulated in-process by setting the env
 var directly. The conftest mechanism is what guarantees the default
@@ -34,7 +34,7 @@ from fin.host.memory_port import (
 )
 
 
-# ----- SC3: default pytest stays OFF even if operator .env set ON -----
+# ----- SC3: default pytest stays OFF even if operator settings set ON -----
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +52,7 @@ def _strip_operator_memory_env(
 
     Tests marked ``memory_on`` opt out of the strip — the paired
     ``memory_on_env`` fixture in ``tests/host/conftest.py`` re-installs
-    the value the operator's ``.env`` would have set.
+    the value operator settings would have set.
     """
     if request.node.get_closest_marker("memory_on") is not None:
         return
@@ -64,7 +64,7 @@ def test_unmarked_pytest_does_not_inherit_operator_memory_on() -> None:
 
     This test is itself unmarked, so its own setup has already run
     ``monkeypatch.delenv("FIN_MEMORY_ENABLED", raising=False)``. Even if
-    the operator's ``.env`` had leaked the var in via ``apply_dotenv``,
+    operator settings had leaked the var in via ``apply_operator_settings``,
     the autouse fixture above would have stripped it before this test's
     body ran.
     """
@@ -86,7 +86,7 @@ def test_session_level_clear_wiped_the_operator_env_value() -> None:
     ``build_memory_port`` resolves OFF.
 
     This test fails loudly if a future change restores the operator
-    value (for example by re-applying the dotenv mid-session, or by
+    value (for example by re-applying operator settings mid-session, or by
     moving the strip behind a feature flag): the env var would be
     visible to the fixture and the port would attempt to open
     Postgres.

@@ -8,12 +8,12 @@ reused with no re-upload and no vision call, and a missing detail
 inspects the stored original and mints a new observation version charged
 against the run's ceiling.
 
-:func:`fin.host.attachment_vision_inspect.inspect_for_details` already
+:func:`fin.host.attachment.attachment_vision_inspect.inspect_for_details` already
 decides reuse-or-inspect; these cases pin the caller that wraps it — the
 host-bound scope, the rendered-page hash proof, the write-back, the token's
 provenance, and the typed refusals. The store is the real
-:class:`~fin.host.attachment_store.InMemoryAttachmentStore`, the trust
-faces are the real :class:`~fin.host.attachment_source_read.AttachmentSourceReader`,
+:class:`~fin.host.attachment.attachment_store.InMemoryAttachmentStore`, the trust
+faces are the real :class:`~fin.host.attachment.attachment_source_read.AttachmentSourceReader`,
 and the provider is a fake: no network, no credentials, no live model.
 """
 
@@ -32,30 +32,30 @@ from fin.corpus.parsers._pages import (
     PdfplumberPageSource,
     Pypdfium2PageRenderer,
 )
-from fin.host.attachment_budgets import AttachmentBudgets, VisionCallLedger
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_observations import (
+from fin.host.attachment.attachment_budgets import AttachmentBudgets, VisionCallLedger
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_observations import (
     COVERAGE_SCHEMA_VERSION,
     CoveredDetail,
     DetailKey,
     ObservationEnvelope,
     plotted_value_key,
 )
-from fin.host.attachment_source_read import AttachmentSourceReader
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_source_read import AttachmentSourceReader
+from fin.host.attachment.attachment_store import (
     AttachmentStoreError,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
     StoredPageRegion,
 )
-from fin.host.attachment_vision import (
+from fin.host.attachment.attachment_vision import (
     VisionCallFailedError,
     VisionCallResult,
     VisionCrop,
     VisionErrorClass,
     VisionUsage,
 )
-from fin.host.attachment_visual_read import (
+from fin.host.attachment.attachment_visual_read import (
     VisualDetail,
     VisualReadFaces,
     VisualReadRequest,
@@ -63,7 +63,7 @@ from fin.host.attachment_visual_read import (
     read_visual_detail,
 )
 from fin.host.thread_store import InMemoryThreadStore
-from fin.host.visual_evidence import (
+from fin.host.evidence.visual_evidence import (
     VISUAL_BUDGET_EXCEEDED,
     VISUAL_DETAIL_INVALID,
     VISUAL_LANE_UNWIRED,
@@ -1107,7 +1107,7 @@ def test_a_media_box_disagreement_is_logged_before_it_is_refused(
 
     faces = _faces(store, thread_id, rasterizer=halved, gold=True)
 
-    with caplog.at_level("WARNING", logger="fin.host.attachment_visual_read"):
+    with caplog.at_level("WARNING", logger="fin.host.attachment.attachment_visual_read"):
         outcome = read_visual_detail(faces, _request(page=3))
 
     # WHY this must be loud: the refusal is indistinguishable from "this
@@ -1132,7 +1132,7 @@ def test_a_named_store_fault_falls_back_to_the_whole_page_and_says_why(
     port = FakeVisionPort()
     faces = _faces(failing, thread_id, vision=port, gold=True)
 
-    with caplog.at_level("WARNING", logger="fin.host.attachment_visual_read"):
+    with caplog.at_level("WARNING", logger="fin.host.attachment.attachment_visual_read"):
         outcome = read_visual_detail(faces, _request(page=3))
 
     # A named store failure is a fallback, not a refusal — the run still has

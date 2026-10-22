@@ -14,18 +14,18 @@ from typing import Any, Callable
 
 import pytest
 
-from fin.host.evidence_contract import (
+from fin.host.evidence.evidence_contract import (
     CONTRACT_REFUSAL_CODES,
     EVIDENCE_UNAVAILABLE,
     MALFORMED_EVIDENCE_CONTRACT,
     RETRIEVE_UNAVAILABLE,
     UNSUPPORTED_EVIDENCE_CONTRACT,
 )
-from fin.host.structured_evidence import (
+from fin.host.evidence.structured_evidence import (
     build_stored_record,
     structured_snapshots_of,
 )
-from fin.host.structured_evidence_invalidation import (
+from fin.host.evidence.structured_evidence_invalidation import (
     INVALIDATION_EVENT_FIELDS,
     MAX_EVIDENCE_REF_CHARS,
     MAX_INVALIDATION_EVENTS,

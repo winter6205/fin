@@ -296,7 +296,7 @@ def test_valid_query_without_hits_is_a_legal_empty_result() -> None:
     )
 
     assert outcome.kind == OUTCOME_LEGAL_EMPTY
-    assert outcome.result == {"chunks": []}
+    assert outcome.result == {"chunks": [], "distribution": "zero"}
     assert outcome.degraded is False
     assert ledger.count() == 0, "a legal empty result is not a failure"
 

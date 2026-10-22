@@ -19,9 +19,14 @@ import { decodeComparison } from "./comparison";
 import {
   CITATION_CHANNEL_SCHEMA,
   DATABASE_ROW_SNAPSHOT_SCHEMA,
+  EVIDENCE_REFUSAL_CODES,
   EVIDENCE_SCHEMA_VERSION,
+  FORBIDDEN_DEFAULT_LABELS,
   VISUAL_CLAIM_SCHEMA,
   canonicalSnapshotBytes,
+  databaseRowFieldLines,
+  databaseRowFreshnessNote,
+  databaseRowIdentityLabel,
   decodeCitationRow,
   decodeCitationsArray,
   decodeCitationsEnvelope,
@@ -32,13 +37,14 @@ import {
   decodeThreadDetail,
   decodeVisualClaimRow,
   evidenceRefusalRowText,
-  databaseRowIdentityLabel,
-  databaseRowFieldLines,
+  forbiddenDefaultLabels,
   mergeEvidenceRefusals,
   schemaVersionRefusal,
   snapshotValueText,
 } from "./evidenceContract";
-import type { EvidenceRefusal } from "./types";
+import { citationSourceLabel, formatCitationLocator } from "./sourceLocator";
+import { SOURCES_MATCH_NOTE } from "./capabilities/evidence/components/CitationChips";
+import type { Citation, EvidenceRefusal } from "./types";
 
 const FIXTURES = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -374,6 +380,29 @@ describe("decodeCitationRow", () => {
   it("decodes a valid company row", () => {
     const out = decodeCitationRow(companyRow(), 0);
     expect(out.status).toBe("ok");
+  });
+
+  it("keeps a display-only section on active citations and rejects it in stored rows", () => {
+    const active = decodeCitationRow(companyRow({ section: "Section 3" }), 0);
+    const stored = decodeCitationRow(
+      companyRow({ section: "Section 3" }),
+      0,
+      "stored-replay",
+    );
+
+    expect(active.status).toBe("ok");
+    if (active.status === "ok") expect(active.citation.section).toBe("Section 3");
+    expect(stored.status).toBe("refusal");
+    if (stored.status === "refusal")
+      expect(stored.refusal.error).toBe("malformed_evidence_contract");
+  });
+
+  it("refuses a malformed display section", () => {
+    const out = decodeCitationRow(companyRow({ section: 3 }), 0);
+
+    expect(out.status).toBe("refusal");
+    if (out.status === "refusal")
+      expect(out.refusal.error).toBe("malformed_evidence_contract");
   });
 
   it("refuses an unknown key as malformed, never a silent drop of the field", () => {
@@ -1773,40 +1802,240 @@ describe("mergeEvidenceRefusals", () => {
 // ----- presentation copy (visible named-code indicator) -----
 
 describe("refusal / snapshot presentation text", () => {
-  it("names the code and the row in the visible indicator", () => {
-    const text = evidenceRefusalRowText({
+  it("names the row in ordinary Chinese and keeps the code for developer mode", () => {
+    // PREMISE CHANGED: this asserted the §6 code string in the DEFAULT
+    // indicator, which is exactly what T10 removes — the codes name wire
+    // shapes and tool lanes a reader cannot act on. The raw code is now
+    // developer-mode copy, asserted on the same entry below.
+    const entry: EvidenceRefusal = {
       citation_index: 2,
       error: "unsupported_evidence_contract",
-    });
-    expect(text).toContain("unsupported_evidence_contract");
+    };
+    const text = evidenceRefusalRowText(entry);
     expect(text).toContain("3"); // 1-based row the operator counts
+    expect(text).not.toContain("unsupported_evidence_contract");
+    expect(evidenceRefusalRowText(entry, true)).toContain(
+      "unsupported_evidence_contract",
+    );
   });
 
-  it("the database identity line shows source and record key as text", () => {
-    const label = databaseRowIdentityLabel({
+  it.each(EVIDENCE_REFUSAL_CODES)(
+    "gives every §6 code one honest Chinese sentence (%s)",
+    (code) => {
+      // WHY exhaustive: a new code added to the closed set must not be
+      // able to reach the default view as an unmapped `undefined`.
+      const text = evidenceRefusalRowText({ citation_index: 0, error: code });
+      expect(text).not.toContain(code);
+      expect(text).not.toContain("undefined");
+      expect(text.length).toBeGreaterThan(6);
+    },
+  );
+
+  it("the database identity line reads as ordinary Chinese by default", () => {
+    // PREMISE CHANGED: this asserted the SQL view name and the
+    // ``key=value`` record key in the default view.
+    const snapshot = {
       source: "ledger_ro.contract_expiry",
       record_key: { contract_id: "C-2291", part: 7 },
       queried_at: "2026-03-01T09:14:22Z",
       fields: { notice_days: 30, counterparty: "Northwind Logistics" },
       summary: "s",
-    });
-    expect(label).toContain("ledger_ro.contract_expiry");
-    expect(label).toContain("C-2291");
-    expect(label).toContain("7");
+    };
+    expect(databaseRowIdentityLabel(snapshot)).toBe(
+      "一条记录 · 数据截至 2026年03月01日",
+    );
+    // The raw identity is developer-mode copy, not deleted information.
+    const raw = databaseRowIdentityLabel(snapshot, true);
+    expect(raw).toContain("ledger_ro.contract_expiry");
+    expect(raw).toContain("contract_id=C-2291");
+    expect(raw).toContain("part=7");
   });
 
-  it("field lines render scalar values as text", () => {
-    const lines = databaseRowFieldLines({
+  it("field lines keep every value, dropping only the column name", () => {
+    // PREMISE CHANGED: the default lines now carry the VALUES alone. The
+    // values are the evidence — a reader can still check C-2291 against
+    // the answer — so only the snake_case column names move to developer
+    // mode.
+    const snapshot = {
       source: "v",
       record_key: { id: "1" },
       queried_at: "2026-03-01T09:14:22Z",
       fields: { notice_days: 30, flag: true, missing: null, name: "N" },
       summary: "s",
-    });
-    expect(lines).toContain("notice_days: 30");
-    expect(lines).toContain("flag: true");
-    expect(lines).toContain("missing: ");
-    expect(lines).toContain("name: N");
+    };
+    expect(databaseRowFieldLines(snapshot)).toEqual(["true", "", "N", "30"]);
+    expect(databaseRowFieldLines(snapshot, true)).toEqual([
+      "flag: true",
+      "missing: ",
+      "name: N",
+      "notice_days: 30",
+    ]);
+  });
+
+  it("says in Chinese that the values are a past query, not a live read", () => {
+    const snapshot = {
+      source: "v",
+      record_key: { id: "1" },
+      queried_at: "2026-03-01T09:14:22Z",
+      fields: {},
+      summary: "s",
+    };
+    const note = databaseRowFreshnessNote(snapshot);
+    expect(note).toContain("数据截至 2026年03月01日");
+    expect(note).toContain("不是实时读取");
+    expect(databaseRowFreshnessNote(snapshot, true)).toContain(
+      "a snapshot of that query, not a live read",
+    );
+  });
+
+  it("passes an unparseable timestamp through rather than reformatting it", () => {
+    // A wrong-looking valid date is worse than an unfamiliar one, so a
+    // value the strict decoder could not accept is shown verbatim.
+    const snapshot = {
+      source: "v",
+      record_key: { id: "1" },
+      queried_at: "not-a-timestamp",
+      fields: {},
+      summary: "s",
+    };
+    expect(databaseRowFreshnessNote(snapshot)).toContain("not-a-timestamp");
+  });
+});
+
+// ----- the default-view forbidden-label guard -----
+
+const SNAPSHOT = {
+  source: "ledger_ro.contract_expiry",
+  record_key: { contract_id: "C-2291" },
+  queried_at: "2026-03-01T09:14:22Z",
+  fields: {
+    counterparty: "Northwind Logistics",
+    expiry_date: "2026-03-14",
+    notice_by: "2026-02-12",
+  },
+  summary: "C-2291 Northwind Logistics, expires 2026-03-14",
+};
+
+const COMPANY: Citation = {
+  kind: "company",
+  document_id: "AAPL-10Q-2024Q3",
+  attachment_id: "",
+  version: "a".repeat(64),
+  unit: 3,
+  display: "page",
+  filename: "",
+  quote: "Our quarterly revenue rose 8% year over year.",
+};
+
+const ATTACHMENT: Citation = {
+  kind: "attachment",
+  document_id: "",
+  attachment_id: "att-1",
+  version: "b".repeat(64),
+  unit: 4,
+  display: "unit",
+  filename: "",
+  quote: "渠道库存较上季度下降。",
+};
+
+const LEDGER: Citation = {
+  kind: "database-row",
+  document_id: "",
+  attachment_id: "",
+  version: "2026-03-01T09:14:22Z",
+  unit: 1,
+  display: "record",
+  filename: "",
+  quote: SNAPSHOT.summary,
+  database_row: SNAPSHOT,
+};
+
+/** Every string one rendering of this turn could put in front of a
+ * reader, for one developer-mode value. The sources-list row label is
+ * assembled the same way the component assembles it. */
+function renderedStrings(developerMode: boolean): string[] {
+  return [
+    citationSourceLabel(COMPANY, 1),
+    formatCitationLocator(COMPANY),
+    citationSourceLabel(ATTACHMENT, 2),
+    formatCitationLocator(ATTACHMENT),
+    citationSourceLabel(LEDGER, 3),
+    formatCitationLocator(LEDGER),
+    SOURCES_MATCH_NOTE,
+    databaseRowIdentityLabel(SNAPSHOT, developerMode),
+    databaseRowFreshnessNote(SNAPSHOT, developerMode),
+    ...databaseRowFieldLines(SNAPSHOT, developerMode),
+    evidenceRefusalRowText(
+      { citation_index: 0, error: "insufficient_evidence" },
+      developerMode,
+    ),
+  ];
+}
+
+describe("forbiddenDefaultLabels", () => {
+  it("reports nothing for the DEFAULT rendering of every source kind", () => {
+    // The contract this whole guard exists to hold: a company citation, an
+    // attachment citation, a ledger-row citation and an evidence refusal
+    // all render with no internal field name, tool name, filing format,
+    // hex version, snake_case record key, or the internal component name.
+    expect(forbiddenDefaultLabels(renderedStrings(false))).toEqual([]);
+  });
+
+  it("DOES surface the raw identity in developer mode, so the guard cannot be passed by deletion", () => {
+    // The counterpart. If the default view were clean because the
+    // information were gone, a developer could not diagnose a producer
+    // bug — so the SAME inputs under developer mode must still carry the
+    // view name, the record key, the column names and the §6 code.
+    const raw = renderedStrings(true);
+    expect(forbiddenDefaultLabels(raw).length).toBeGreaterThan(0);
+    expect(raw.join("\n")).toContain("ledger_ro.contract_expiry");
+    expect(raw.join("\n")).toContain("contract_id=C-2291");
+    expect(raw.join("\n")).toContain("counterparty: Northwind Logistics");
+    expect(raw.join("\n")).toContain("insufficient_evidence");
+  });
+
+  it.each([
+    ["a wire field name", "来源 document_id=zeus-handbook"],
+    ["a tool name", "list_files 找到了 3 个文件"],
+    ["a filing format", "这是 10-Q 里的数字"],
+    ["an XBRL tag", "XBRL us-gaap:Revenues"],
+    ["a 64-hex version", `版本 ${"f".repeat(64)}`],
+    ["a 32-hex run", `摘要 ${"a".repeat(32)}`],
+    ["a snake_case record key", "记录 contract_id=C-2291"],
+    ["a snake_case column pair", "notice_days: 30"],
+    ["the internal component name", "citation gate 匹配片段"],
+  ])("catches %s", (_label, text) => {
+    expect(forbiddenDefaultLabels([text])).not.toEqual([]);
+  });
+
+  it("accepts ordinary Chinese copy, filenames and plain values", () => {
+    const clean = [
+      SOURCES_MATCH_NOTE,
+      citationSourceLabel(COMPANY, 1),
+      "季度复盘.docx",
+      "第 3 页",
+      databaseRowFieldLines(SNAPSHOT, false),
+      "数据截至 2026年03月01日",
+    ].flat();
+    expect(forbiddenDefaultLabels(clean)).toEqual([]);
+  });
+
+  it("names the five literal fragments it checks, so the list is pinned", () => {
+    expect([...FORBIDDEN_DEFAULT_LABELS]).toEqual([
+      "document_id",
+      "list_files",
+      "10-Q",
+      "XBRL",
+      "citation gate",
+    ]);
+  });
+
+  it("is not fooled by the ordinary copy that merely mentions a number", () => {
+    // A 12-digit contract id, a 4-digit year and a value with a colon
+    // are all data, not leaks: only 32+ hex runs and snake_case KEYS fire.
+    expect(
+      forbiddenDefaultLabels(["合同 C-2291 到期于 2026 年 3 月 14 日"]),
+    ).toEqual([]);
   });
 });
 

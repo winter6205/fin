@@ -19,9 +19,11 @@ other turn — not a parallel router.
   reaches grounded ``read_source`` and cites the filing unit.
 
 All runs are hermetic: ``ScriptedChatModel`` + ``FakeRetrievePort`` +
-``InMemorySaver`` (no live LLM, no MCP, no network), and the policy
-text is the committed, versioned corpus fixture registered in
-``data/corpus/dataset/t1_manifest.json``.
+``InMemorySaver`` (no live LLM, no MCP, no network). The default suite
+points ``HOME`` at an empty directory, so this file plants the policy
+text and one filing unit under that home's corpus
+(``<HOME>/.fin/corpus``) instead of reading the checkout
+``data/corpus`` path.
 """
 
 from __future__ import annotations
@@ -35,17 +37,41 @@ import pytest
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+import fin.host.graph as host_graph
 from fin.corpus.extracted import Locator, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host.fin_home import corpus_dir
+from fin.host.named_failures import CORPUS_NOT_READY
 from fin.host.state import reset_input_state
 from fin.retrieve import Chunk
 from fin.retrieve.fake_port import FakeRetrievePort
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-T1_MANIFEST_PATH = REPO_ROOT / "data" / "corpus" / "dataset" / "t1_manifest.json"
-T1_TEXT_DIR = REPO_ROOT / "data" / "corpus" / "dataset" / "t1"
+
+def _corpus_root() -> Path:
+    """The operator corpus, resolved the same way the fin home does."""
+    return corpus_dir()
+
+
+def _t1_manifest_path() -> Path:
+    return _corpus_root() / "dataset" / "t1_manifest.json"
+
+
+def _t1_text_dir() -> Path:
+    return _corpus_root() / "dataset" / "t1"
 
 EXPENSE_DOCUMENT_ID = "t1-expense-001"
+EXPENSE_POLICY_SHA = "9c0216d90a3c4cf61af7c76875ce466022ff08df63da7a58246eba9cd665b489"
+_POLICY_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "expense-policy-001.md"
+)
+
+# One frozen filing unit. The question still routes on the AAPL/2022 Q3
+# rule; the page only has to be the unit ``read_source`` cites.
+FILING_UNIT_TEXT = (
+    "Net sales for the quarter are stated in this frozen filing unit "
+    "so the citation can quote them verbatim."
+)
+FILING_VERSION = hashlib.sha256(FILING_UNIT_TEXT.encode()).hexdigest()
 
 # The quotable present rule, verbatim from the committed fixture.
 MEALS_SENTENCE = (
@@ -85,17 +111,83 @@ AAPL_2022Q3 = "AAPL-2022Q3"
 FINANCIAL_QUESTION = "What was AAPL net sales in 2022 Q3?"
 
 
+@pytest.fixture(autouse=True)
+def _home_corpus(
+    _redirect_home_off_operator: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Path:
+    """Plant the fixtures under this test's own fin-home corpus.
+
+    The suite fixture already points ``HOME`` at an empty directory.
+    Override it after that redirect so the planted corpus cannot leak
+    into the shared hermetic home.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FIN_HOME", str(home / ".fin"))
+    root = corpus_dir()
+    policy = _POLICY_FIXTURE.read_bytes()
+    assert hashlib.sha256(policy).hexdigest() == EXPENSE_POLICY_SHA
+    text_dir = root / "dataset" / "t1"
+    text_dir.mkdir(parents=True)
+    (text_dir / "expense-policy-001.md").write_bytes(policy)
+    (root / "dataset" / "t1_manifest.json").write_text(
+        json.dumps(
+            {
+                "samples": [
+                    {
+                        "document_id": EXPENSE_DOCUMENT_ID,
+                        "path": "expense-policy-001.md",
+                        "sha256": EXPENSE_POLICY_SHA,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    doc_dir = root / "extracted" / AAPL_2022Q3
+    doc_dir.mkdir(parents=True)
+    (doc_dir / "page-001.json").write_text(
+        json.dumps(
+            {
+                "document_id": AAPL_2022Q3,
+                "version": FILING_VERSION,
+                "page": 1,
+                "text": FILING_UNIT_TEXT,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (doc_dir / "passages-001.json").write_text(
+        json.dumps({"passages": []}),
+        encoding="utf-8",
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "documents": [
+                    {"document_id": AAPL_2022Q3, "sha256": FILING_VERSION}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
 # ----- fixture readers (independent of the implementation under test) -----
 
 
 def _registered_expense_sample() -> dict[str, Any]:
-    manifest = json.loads(T1_MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest = json.loads(_t1_manifest_path().read_text(encoding="utf-8"))
     for sample in manifest["samples"]:
         if sample.get("document_id") == EXPENSE_DOCUMENT_ID:
             return sample
     raise AssertionError(
         f"expense-policy fixture {EXPENSE_DOCUMENT_ID!r} is not registered"
-        " in data/corpus/dataset/t1_manifest.json"
+        " in the fin-home corpus t1_manifest.json"
     )
 
 
@@ -107,7 +199,7 @@ def _expense_text_and_version() -> tuple[str, str]:
     live identity, not a copy the test invented.
     """
     sample = _registered_expense_sample()
-    path = T1_TEXT_DIR / sample["path"]
+    path = _t1_text_dir() / sample["path"]
     text = path.read_text(encoding="utf-8")
     disk_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     assert disk_sha == sample["sha256"], (
@@ -155,12 +247,12 @@ def _run(graph: Any, question: str, thread_id: str) -> dict[str, Any]:
     )
 
 
-@pytest.fixture(scope="module")
-def extracted_tree() -> dict[str, tuple[Any, ...]]:
-    """The committed extracted filing tree (representative fin data)."""
+@pytest.fixture
+def extracted_tree(_home_corpus: Path) -> dict[str, tuple[Any, ...]]:
+    """The one filing unit planted in this run's home corpus."""
     return load_extracted_tree(
-        REPO_ROOT / "data" / "corpus" / "manifest.json",
-        REPO_ROOT / "data" / "corpus" / "extracted",
+        _home_corpus / "manifest.json",
+        _home_corpus / "extracted",
     )
 
 
@@ -337,9 +429,7 @@ def test_filing_question_still_routes_grounded_and_cites_the_filing_unit(
     filing's document/version/unit with a verbatim quote."""
     pages = extracted_tree[AAPL_2022Q3]
     manifest = json.loads(
-        (REPO_ROOT / "data" / "corpus" / "manifest.json").read_text(
-            encoding="utf-8"
-        )
+        (_corpus_root() / "manifest.json").read_text(encoding="utf-8")
     )
     version = next(
         doc["sha256"]
@@ -388,3 +478,103 @@ def test_filing_question_still_routes_grounded_and_cites_the_filing_unit(
     assert citation.version == version
     assert citation.unit == 1
     assert citation.quote == quoted
+
+
+# ----- R8: Chinese question, bound material already retrievable -----
+
+CHINESE_ENTERPRISE_QUESTION = "差旅报销制度里，工作晚餐每人最多可以报销多少？"
+
+
+def test_chinese_enterprise_question_with_retrievable_material_is_grounded_and_cites(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No company token and no English policy words. A retrievable
+    bound material routes the turn grounded, then the existing host
+    graph completes with a citation. Nothing retrieves before the
+    track decision returns."""
+    text, version = _expense_text_and_version()
+    port = FakeRetrievePort(
+        hits_by_query={
+            CHINESE_ENTERPRISE_QUESTION: [
+                Chunk(
+                    text=text,
+                    source_ref=Locator(
+                        document_id=EXPENSE_DOCUMENT_ID,
+                        version=version,
+                        unit=1,
+                    ),
+                    score=1.0,
+                )
+            ]
+        },
+        known_document_ids={EXPENSE_DOCUMENT_ID},
+    )
+    calls_at_return: list[list[dict[str, Any]]] = []
+    real_decide_track = host_graph.decide_track
+
+    def _recording_decide_track(*args: Any, **kwargs: Any) -> Any:
+        decision = real_decide_track(*args, **kwargs)
+        calls_at_return.append(list(port.calls))
+        return decision
+
+    monkeypatch.setattr(host_graph, "decide_track", _recording_decide_track)
+    graph = _compile(
+        script=_retrieve_script(
+            CHINESE_ENTERPRISE_QUESTION,
+            f"Per the expense policy: {MEALS_SENTENCE}",
+        ),
+        port=port,
+        known_document_ids={EXPENSE_DOCUMENT_ID},
+    )
+    out = graph.invoke(
+        reset_input_state(
+            CHINESE_ENTERPRISE_QUESTION,
+            attachments=[
+                {
+                    "attachment_id": "att-expense",
+                    "filename": "expense-policy.txt",
+                    "text": text,
+                }
+            ],
+        ),
+        config={"configurable": {"thread_id": "t-expense-zh"}},
+    )
+
+    assert out["track"] == "grounded", (
+        "a Chinese enterprise question with a retrievable bound"
+        f" material must be grounded, got track={out['track']!r}"
+        f" tier={out['track_decision'].get('decision_tier')!r}"
+    )
+    assert out["track"] not in ("clarify", "off_topic")
+    assert calls_at_return == [[]]
+    assert port.calls, "the grounded turn still reaches retrieve after the decision"
+    assert out["status"] == "done", out.get("status_reason")
+    citation = tuple(out["citations"])[0]
+    assert citation.document_id == EXPENSE_DOCUMENT_ID
+    assert citation.version == version
+    assert citation.unit == 1
+    assert citation.quote == MEALS_SENTENCE
+
+
+def test_chinese_enterprise_question_with_zero_bound_materials_retrieves_before_index_failure() -> (
+    None
+):
+    """An ordinary question still retrieves when no bound material is known."""
+    port = FakeRetrievePort(known_document_ids=set())
+    graph = _compile(
+        script=_retrieve_script(
+            CHINESE_ENTERPRISE_QUESTION, "没有找到支持这项制度的资料。"
+        ),
+        port=port,
+        known_document_ids=set(),
+    )
+    out = graph.invoke(
+        reset_input_state(CHINESE_ENTERPRISE_QUESTION),
+        config={"configurable": {"thread_id": "t-expense-zh-zero"}},
+    )
+    assert out["track"] == "grounded"
+    assert out["route_intent"] == "retrieve"
+    assert port.calls, "an empty catalog cannot replace the retrieval attempt"
+    assert out["status"] == "refuse"
+    assert out["status_reason"] == CORPUS_NOT_READY
+    assert not out["citations"]

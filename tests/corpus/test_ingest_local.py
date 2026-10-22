@@ -514,7 +514,13 @@ def test_catalog_fields_land_in_list_filings_filters(tmp_path: Path) -> None:
     """The fields ingest writes are the ones ``list_filings`` filters
     on — the ingest side registers them via the ``record_filings``
     seam (T3), carrying the EDGAR-shaped fields as catalog metadata."""
-    from fin.corpus.catalog import list_filings, record_filings
+    from fin.corpus.catalog import (
+        list_catalog_entries,
+        list_filings,
+        record_filings,
+    )
+    from fin.corpus.ingest_endpoint import _LEGACY_REPLAY_ROW_TITLE
+    from fin.corpus.upload_metadata import UNKNOWN_DOC_TYPE
 
     manifest_path, pdf_dir = _stage_aapl_2023q3(tmp_path)
     extracted_root = tmp_path / "extracted"
@@ -528,6 +534,8 @@ def test_catalog_fields_land_in_list_filings_filters(tmp_path: Path) -> None:
 
     doc = json.loads(manifest_path.read_text())["documents"][0]
     index = json.loads((extracted_root / "_index.json").read_text())
+    page_count = index["documents"][doc["document_id"]]["page_count"]
+    catalog_path = tmp_path / "catalog.json"
     record_filings(
         [
             {
@@ -535,26 +543,45 @@ def test_catalog_fields_land_in_list_filings_filters(tmp_path: Path) -> None:
                 "company": doc["company"],
                 "period": doc["period"],
                 "version": doc["sha256"],
-                "page_count": index["documents"][doc["document_id"]][
-                    "page_count"
-                ],
+                "page_count": page_count,
+                # A financial row has no upload name, so its title is the
+                # same fallback the ingest endpoint gives a nameless
+                # financial run. This hand-built row resolves no type, so
+                # it carries the product's "no reliable type" member.
+                "title": _LEGACY_REPLAY_ROW_TITLE,
+                "doc_type": UNKNOWN_DOC_TYPE,
                 "cik": doc.get("cik"),
                 "form": doc.get("form"),
                 "ticker": doc.get("ticker"),
                 "filing_date": doc.get("filing_date"),
             }
         ],
-        catalog_path=tmp_path / "catalog.json",
+        catalog_path=catalog_path,
     )
 
     hits = list_filings(
         cik="0000320193",
         form="10-Q",
         filing_date="2023-08-04",
-        catalog_path=tmp_path / "catalog.json",
+        catalog_path=catalog_path,
     )
 
     assert [hit["document_id"] for hit in hits["filings"]] == ["AAPL-2023Q3"]
+
+    # The two fields T6 made required round-trip through the seam and
+    # reach the generic read model, rather than being dropped as
+    # unasserted keys.
+    assert list_catalog_entries(catalog_path=catalog_path) == [
+        {
+            "document_id": "AAPL-2023Q3",
+            "title": _LEGACY_REPLAY_ROW_TITLE,
+            "doc_type": UNKNOWN_DOC_TYPE,
+            "version": doc["sha256"],
+            "page_count": page_count,
+            "company": "AAPL",
+            "period": "2023 Q3",
+        }
+    ]
 
 
 # ---------- helpers ----------

@@ -20,9 +20,9 @@ from typing import Any, Iterator
 import pytest
 
 from fin.corpus.object_store import InMemoryObjectStore
-from fin.host.attachment_index import search
-from fin.host.attachment_prepare import AttachmentPreparationService
-from fin.host.attachment_store import PostgresAttachmentStore
+from fin.host.attachment.attachment_index import search
+from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+from fin.host.attachment.attachment_store import PostgresAttachmentStore
 from fin.host.thread_store import PostgresThreadStore
 
 POSTGRES_URL_ENV = "FIN_CHECKPOINT_URL"

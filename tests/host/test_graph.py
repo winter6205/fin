@@ -698,8 +698,12 @@ def test_list_files_tool_does_not_contribute_evidence():
 
 
 def _catalog_row() -> dict[str, object]:
+    # ``title`` and ``doc_type`` are required non-empty fields of the T6
+    # row contract.
     return {
         "document_id": "INJECTED-2023Q1",
+        "title": "Injected filing",
+        "doc_type": "narrative",
         "company": "INJECTED",
         "period": "2023 Q1",
         "version": "a" * 64,
@@ -1248,7 +1252,7 @@ def reset_input_state_for_test(question: str) -> dict:
     }
 
 
-# ----- T3 (#34): thinking preference reaches the model binding -----
+# ----- T3: thinking preference reaches the model binding -----
 
 
 class _ExtraBodyRecordingModel(ScriptedChatModel):

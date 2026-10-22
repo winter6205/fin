@@ -46,10 +46,10 @@ import pytest
 from fin.corpus.catalog import record_filings
 from fin.corpus.extracted import Locator
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.attachment_index import build_postings
-from fin.host.attachment_retrieval import AttachmentChunk, AttachmentLocator
-from fin.host.attachment_source_read import AttachmentSourceReader
-from fin.host.attachment_store import (
+from fin.host.attachment.attachment_index import build_postings
+from fin.host.attachment.attachment_retrieval import AttachmentChunk, AttachmentLocator
+from fin.host.attachment.attachment_source_read import AttachmentSourceReader
+from fin.host.attachment.attachment_store import (
     AttachmentRecord,
     AttachmentStoreError,
     InMemoryAttachmentStore,
@@ -461,6 +461,8 @@ def _catalog_row() -> dict[str, Any]:
     """One catalog row the corpus enumeration WOULD answer with."""
     return {
         "document_id": "INJECTED-2023Q1",
+        "title": "Injected filing",
+        "doc_type": "narrative",
         "company": "INJECTED",
         "period": "2023 Q1",
         "version": "a" * 64,
@@ -1360,13 +1362,18 @@ def test_read_visual_detail_refuses_a_not_ready_id_before_any_vision_call() -> N
 # ---------------------------------------------------------------------------
 
 
-def test_a_locator_tool_authorize_refusal_short_circuits_the_impl() -> None:
+def test_a_locator_tool_gate_refusal_short_circuits_the_impl() -> None:
     """The company seam gates BEFORE the implementation is even imported.
 
-    A refusal from ``authorize`` must return without any read. The spec below
-    names an implementation attribute that does not exist: if the wrapper had
-    read before gating, it would raise ``AttributeError``; it must instead
-    return the refusal untouched.
+    A refusal from ``gate`` must return without any read. The spec below names
+    an implementation attribute that does not exist: if the wrapper had read
+    before gating, it would raise ``AttributeError``; it must instead return the
+    refusal untouched.
+
+    The gate also decides on the request and answers a narrowing beside the
+    refusal, so it is invoked with both and this probe returns the permitted
+    shape — the refusal with no corpus narrowing — which is what the wrapper
+    forwards unchanged.
     """
     spec = _LocatorToolSpec(
         name="probe_scope",
@@ -1375,7 +1382,7 @@ def test_a_locator_tool_authorize_refusal_short_circuits_the_impl() -> None:
         impl_module="fin.host.tools.compare_facts",
         impl_attr="__no_such_impl_so_a_read_would_raise__",
         factory_kwargs={},
-        authorize=lambda: {"error": SCOPE_DEPENDENCY_FAILED},
+        gate=lambda _config, _request: ({"error": SCOPE_DEPENDENCY_FAILED}, None),
     )
 
     tool = _make_locator_tool(spec)

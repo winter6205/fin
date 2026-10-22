@@ -18,11 +18,19 @@ const FORMAT_HINT = "支持 pdf / docx / xlsx / pptx / html / md / txt。";
 const UNSUPPORTED_FORMAT_COPY = `这种格式不支持入库。${FORMAT_HINT}`;
 const FORMAT_UNSPECIFIED_COPY = `认不出这份文件的格式（文件名没有可识别的扩展名）。请改用带扩展名的文件名再试。${FORMAT_HINT}`;
 const UPLOAD_TOO_LARGE_COPY = "这份文件超过入库大小上限，请拆分后再入库。";
-// The form requires company and period and the filename never
-// participates in the identity, so the fix is always the two fields —
-// telling the operator to rename the file would be a false lead.
-const DOCUMENT_ID_MISSING_COPY =
-  "没有确定这份文件的编号（document_id）：请填写公司（如 aapl）和期间（如 2022q3）。文件名不参与编号。";
+// The identity is derived server-side and the client has no field that
+// supplies one, so the only recovery is another submission.
+const DOCUMENT_ID_MISSING_COPY = "服务器没有给出这份文件的编号，请重试。";
+// The identity is derived from the trusted corpus scope and the content
+// digest, so a caller-chosen id cannot be honored — the fix is to send the
+// upload WITHOUT an id.
+const DOCUMENT_ID_NOT_ALLOWED_COPY =
+  "这份文件的编号由内容自动确定，不接受手动指定编号。请去掉编号后重新提交。";
+// Explicit upload metadata is validated, not edited: a wildcard or an
+// overlong value is refused before anything is written, so the operator
+// fixes the field rather than retrying.
+const INVALID_UPLOAD_METADATA_COPY =
+  "填写的标题、公司或期间不符合要求（不支持 * ? 通配符，且长度需在 1–256 字节内）。请修改后重新提交。";
 const INVALID_DOC_TYPE_COPY =
   "指定的文档场景（doc_type）不在参数表内。清空场景让它自动分类，或改用受支持的场景再试。";
 const MISSING_FILE_COPY = "没有选中任何文件，未执行入库。";
@@ -68,6 +76,8 @@ const STATIC_COPY: Record<string, string> = {
   unsupported_format: UNSUPPORTED_FORMAT_COPY,
   ingest_upload_too_large: UPLOAD_TOO_LARGE_COPY,
   document_id_missing: DOCUMENT_ID_MISSING_COPY,
+  document_id_not_allowed: DOCUMENT_ID_NOT_ALLOWED_COPY,
+  invalid_upload_metadata: INVALID_UPLOAD_METADATA_COPY,
   concurrent_run: CONCURRENT_RUN_COPY,
   unknown_job: UNKNOWN_JOB_COPY,
   invalid_doc_type: INVALID_DOC_TYPE_COPY,
