@@ -53,7 +53,11 @@ Campaign drivers, probes, and the plans that exist to record measured runs:
 - `plans/structured-corpus-p3-prerequisites.md`
 - `plans/2026-10-07-p3-prerequisites-closeout.md`
 
-Product code, specs, ADRs, and ordinary unit tests still sync. Specs and ADRs that state a design decision stay publishable.
+The operator's private release procedure:
+
+- `.claude/rules/open-source-publish.md`
+
+Product code, specs, ADRs, and ordinary unit tests still sync. Specs and ADRs that state a design decision stay publishable. The other development rules stay publishable as well: they state how this repository is developed, which is part of the project.
 
 ## Already in the release history
 

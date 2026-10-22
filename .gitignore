@@ -165,3 +165,8 @@ scripts/mutate_structured_evidence_recovery.py
 scripts/mutate_structured_evidence_replay.py
 scripts/structured-env-check.sh
 scripts/structured-live-env.sh
+
+# The operator's private release procedure. It describes how this mirror is
+# maintained, which is not part of the product. It stays in the private source
+# checkout and must not be restored here.
+.claude/rules/open-source-publish.md

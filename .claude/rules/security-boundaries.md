@@ -15,7 +15,7 @@
 
 ## 公开镜像
 
-- 开发在私有仓（`origin`）；公开镜像 `winter6205/fin` 只在用户对该次同步明确授权后，从 `${RELEASES_DIR:?}` 下的发布工作区推送，不在开发仓加镜像 remote。`.claude/`、`CLAUDE.md`、`AGENTS.md` 会进镜像：规则、代码、文档里不写内部名称和本机路径；内部名称清单只在 `${RELEASES_DIR:?}/internal-patterns.txt`（与 iknow 共用；文件尚未建立，见 CHANGES 落地项），不进仓库，命中时只报文件和行号。
+- 开发在私有仓（`origin`）；公开镜像 `winter6205/fin` 只在用户对该次同步明确授权后，从 `${RELEASES_DIR:?}` 下的发布工作区推送，不在开发仓加镜像 remote。`.claude/`、`CLAUDE.md`、`AGENTS.md` 会进镜像（发布流程规则 `.claude/rules/open-source-publish.md` 是内部流程，不进镜像）：规则、代码、文档里不写内部名称和本机路径；内部名称清单只在 `${RELEASES_DIR:?}/internal-patterns.txt`（与 iknow 共用；文件尚未建立，见 CHANGES 落地项），不进仓库，命中时只报文件和行号。
 - 自检（仓库根目录，只读，输出为空才通过）。占位形式 `/home/operator/` 与 `/mnt/c/` 是公开仓的既定匿名写法，不是本机路径，不计为命中：
 
 ```bash
