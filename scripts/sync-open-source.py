@@ -24,11 +24,10 @@ source sync must not restore.
 
 Three properties matter more than convenience:
 
-- The published tree must never lose content that is already public. A
-  deleted or relocated source file is a move, not a deletion, so the sync
-  keeps the published copy when the source no longer carries that path. A
-  path the operator removed from the mirror on purpose is the exception, and
-  it is reported rather than dropped in silence.
+- The source revision is the baseline. The public tree must show the tree the
+  source shows, so a path the source no longer carries leaves the public tree:
+  a file the source moved or dropped is not public any more. Every removal is
+  reported, so it never happens in silence.
 - The published world's own files win. Where the published tree and the
   source revision both carry a path, the published copy is the one that
   reaches the mirror: the published README is the public-facing variant.
@@ -246,7 +245,6 @@ class Report:
     published_new: list[str] = field(default_factory=list)
     excluded: list[str] = field(default_factory=list)
     removed_from_published: list[str] = field(default_factory=list)
-    kept_from_published: list[str] = field(default_factory=list)
     overlay: list[str] = field(default_factory=list)
     violations: list[str] = field(default_factory=list)
 
@@ -593,33 +591,18 @@ def build_candidate(
         copy_file(origin, destination)
         report.overlay.append(path)
 
-    # Content that is public today but absent from the source revision. A
-    # relocated source file keeps its published copy, because deleting it
-    # would remove content the public repository already carries. A path the
-    # operator removed from the mirror is not carried over: it leaves the
-    # candidate and is reported, so the removal is visible instead of silent.
+    # The source revision is the baseline. A path the public tree carries but
+    # the source revision does not is stale: the source moved it or dropped
+    # it, and the public tree must show the tree the source shows. The path
+    # leaves the candidate and is reported as a removal, never dropped in
+    # silence.
     for path in sorted(published_files):
         if is_removed_from_published(path):
             report.removed_from_published.append(path)
             continue
-        if is_overlay(path):
-            continue
         if (candidate / path).exists():
             continue
-        if (
-            policy.excludes(path)
-            or is_secret_path(path)
-            or release_rules.excludes(path)
-        ):
-            report.removed_from_published.append(path)
-            continue
-        origin = published_root / path
-        if not origin.is_file():
-            continue
-        destination = candidate / path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        copy_file(origin, destination)
-        report.kept_from_published.append(path)
+        report.removed_from_published.append(path)
 
     # The published `.gitignore` already carries the source rules plus the
     # release-side block; keeping it keeps a private path out of a later sync.
@@ -987,8 +970,6 @@ def render_inventory(report: Report) -> list[str]:
     lines.extend(report.removed_from_published)
     lines.append(f"=== excluded ({len(report.excluded)}) ===")
     lines.extend(report.excluded)
-    lines.append(f"=== kept from the published tree ({len(report.kept_from_published)}) ===")
-    lines.extend(report.kept_from_published)
     lines.append(f"=== overlay ({len(report.overlay)}) ===")
     lines.extend(report.overlay)
     return lines
@@ -1173,7 +1154,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"published files:  {len(report.published)}",
             f"excluded paths:   {len(report.excluded)}",
             f"removed from the published tree: {len(report.removed_from_published)}",
-            f"kept from published tree: {len(report.kept_from_published)}",
             f"overlay files:    {len(report.overlay)}",
             f"violations:       {len(report.violations)}",
         ]
